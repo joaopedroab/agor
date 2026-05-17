@@ -11,8 +11,9 @@
  * @see context/guides/rbac-and-unix-isolation.md
  */
 
-import { formatShortId } from '../lib/ids.js';
+import { toShortId } from '../lib/ids.js';
 import type { RepoID, UUID, WorktreeID } from '../types/index.js';
+import { UNIX_NAME_SHORT_ID_LENGTH } from './short-id-naming.js';
 
 /**
  * Generate Unix group name for a worktree
@@ -24,8 +25,7 @@ import type { RepoID, UUID, WorktreeID } from '../types/index.js';
  * @returns Unix group name (e.g., 'agor_wt_03b62447')
  */
 export function generateWorktreeGroupName(worktreeId: WorktreeID): string {
-  const shortId = formatShortId(worktreeId as UUID);
-  return `agor_wt_${shortId}`;
+  return `agor_wt_${toShortId(worktreeId as UUID, UNIX_NAME_SHORT_ID_LENGTH)}`;
 }
 
 /**
@@ -68,8 +68,7 @@ export function isValidWorktreeGroupName(groupName: string): boolean {
  * @returns Unix group name (e.g., 'agor_rp_03b62447')
  */
 export function generateRepoGroupName(repoId: RepoID): string {
-  const shortId = formatShortId(repoId as UUID);
-  return `agor_rp_${shortId}`;
+  return `agor_rp_${toShortId(repoId as UUID, UNIX_NAME_SHORT_ID_LENGTH)}`;
 }
 
 /**

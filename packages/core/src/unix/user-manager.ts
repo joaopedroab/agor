@@ -9,8 +9,9 @@
 
 import { execSync } from 'node:child_process';
 import type { UnixUserMode } from '../config/types.js';
-import { formatShortId } from '../lib/ids.js';
+import { toShortId } from '../lib/ids.js';
 import type { UserID, UUID } from '../types/index.js';
+import { UNIX_NAME_SHORT_ID_LENGTH } from './short-id-naming.js';
 
 /**
  * Default home directory base for Agor users
@@ -37,8 +38,7 @@ export const AGOR_WORKTREES_DIR = 'agor/worktrees';
  * @returns Unix username (e.g., 'agor_03b62447')
  */
 export function generateUnixUsername(userId: UserID): string {
-  const shortId = formatShortId(userId as UUID);
-  return `agor_${shortId}`;
+  return `agor_${toShortId(userId as UUID, UNIX_NAME_SHORT_ID_LENGTH)}`;
 }
 
 /**

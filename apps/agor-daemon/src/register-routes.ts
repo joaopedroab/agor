@@ -15,6 +15,7 @@ import {
   RepoRepository,
   SessionMCPServerRepository,
   SessionRepository,
+  shortId,
   TaskRepository,
   UsersRepository,
   WorktreeRepository,
@@ -650,9 +651,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       async create(data: { prompt: string; task_id?: string }, params: RouteParams) {
         const id = params.route?.id;
         if (!id) throw new Error('Session ID required');
-        console.log(`🔀 Forking session: ${id.substring(0, 8)}`);
+        console.log(`🔀 Forking session: ${shortId(id)}`);
         const forkedSession = await sessionsService.fork(id, data, params);
-        console.log(`✅ Fork created: ${forkedSession.session_id.substring(0, 8)}`);
+        console.log(`✅ Fork created: ${shortId(forkedSession.session_id)}`);
 
         console.log('📡 [FORK] Manually broadcasting created event to all clients');
 
@@ -676,9 +677,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       async create(data: Partial<import('@agor/core/types').SpawnConfig>, params: RouteParams) {
         const id = params.route?.id;
         if (!id) throw new Error('Session ID required');
-        console.log(`🌱 Spawning session from: ${id.substring(0, 8)}`);
+        console.log(`🌱 Spawning session from: ${shortId(id)}`);
         const spawnedSession = await sessionsService.spawn(id, data, params);
-        console.log(`✅ Spawn created: ${spawnedSession.session_id.substring(0, 8)}`);
+        console.log(`✅ Spawn created: ${shortId(spawnedSession.session_id)}`);
 
         console.log('📡 [SPAWN] Manually broadcasting created event to all clients');
 
@@ -741,7 +742,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         const targetUserId = session.created_by;
         if (!targetUserId) throw new Error('Session has no created_by — cannot route restart');
 
-        const tabName = `cli-${session.session_id.slice(0, 8)}`;
+        const tabName = `cli-${shortId(session.session_id)}`;
         const channel = `user/${targetUserId}/terminal`;
 
         // 1) Hard-kill any live `claude` process bound to this session.
@@ -857,9 +858,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         error instanceof NotFoundError ||
         (error instanceof Error && error.message.includes('No record found'))
       ) {
-        console.log(
-          `⚠️  ${entityType} ${id.substring(0, 8)} was deleted mid-execution - skipping update`
-        );
+        console.log(`⚠️  ${entityType} ${shortId(id)} was deleted mid-execution - skipping update`);
         return false;
       }
       throw error;
@@ -988,7 +987,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         // Don't fail the spawn — the executor's createUserMessage fallback
         // (with skip-if-exists) will write the row when it connects.
         console.warn(
-          `⚠️  [Daemon] Failed to write initial user-message row for task ${task.task_id.substring(0, 8)} (executor will retry):`,
+          `⚠️  [Daemon] Failed to write initial user-message row for task ${shortId(task.task_id)} (executor will retry):`,
           msgErr
         );
       }
@@ -1027,10 +1026,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           promptForExecutor = `[Prompted by: ${prompterName} (${prompterEmail})]\n\n${task.full_prompt}`;
         }
       } catch (err) {
-        console.warn(
-          `[Prompt] Failed to look up prompter user ${prompterUserId.substring(0, 8)}:`,
-          err
-        );
+        console.warn(`[Prompt] Failed to look up prompter user ${shortId(prompterUserId)}:`, err);
       }
     }
 
@@ -1067,7 +1063,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             throw new Error('CLI session has no created_by — cannot route PTY injection');
           }
           const channel = `user/${targetUserId}/terminal`;
-          const tabName = `cli-${session.session_id.slice(0, 8)}`;
+          const tabName = `cli-${shortId(session.session_id)}`;
           const io = (
             app as unknown as {
               io?: { to(r: string): { emit(ev: string, p: unknown): void } };
@@ -1096,16 +1092,14 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           const payload = `${promptForExecutor}\r`;
           io?.to(channel).emit('terminal:input', { userId: targetUserId, input: payload });
           console.log(
-            `[claude-cli] PTY-injected prompt into ${channel} → tab ${tabName} (task ${taskId.substring(0, 8)}, ${promptForExecutor.length} chars)`
+            `[claude-cli] PTY-injected prompt into ${channel} → tab ${tabName} (task ${shortId(taskId)}, ${promptForExecutor.length} chars)`
           );
           // Task lifecycle is now owned by the watcher's sink: it closes
           // the task and patches the session back to IDLE on `turn_end`.
           // We deliberately do NOT pre-complete here.
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(
-            `[claude-cli] PTY injection failed for task ${taskId.substring(0, 8)}: ${msg}`
-          );
+          console.error(`[claude-cli] PTY injection failed for task ${shortId(taskId)}: ${msg}`);
           await safePatch(
             'tasks',
             taskId,
@@ -1137,7 +1131,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     setImmediate(async () => {
       try {
         console.log(
-          `🚀 [Daemon] Routing ${session.agentic_tool} to Feathers/WebSocket executor (task ${taskId.substring(0, 8)})`
+          `🚀 [Daemon] Routing ${session.agentic_tool} to Feathers/WebSocket executor (task ${shortId(taskId)})`
         );
 
         await sessionsService.executeTask(
@@ -1153,12 +1147,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         );
 
         console.log(
-          `✅ [Daemon] Executor spawned for session ${sessionId.substring(0, 8)}, waiting for task completion`
+          `✅ [Daemon] Executor spawned for session ${shortId(sessionId)}, waiting for task completion`
         );
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         console.error(
-          `❌ [Daemon] Executor spawn failed for session=${sessionId.substring(0, 8)} task=${taskId.substring(0, 8)} agent=${session.agentic_tool} unix_username=${session.unix_username ?? 'null'}: ${errorMessage}`,
+          `❌ [Daemon] Executor spawn failed for session=${shortId(sessionId)} task=${shortId(taskId)} agent=${session.agentic_tool} unix_username=${session.unix_username ?? 'null'}: ${errorMessage}`,
           error
         );
         await safePatch(
@@ -1233,7 +1227,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         },
         params: RouteParams
       ) {
-        console.log(`📨 [Daemon] Prompt request for session ${params.route?.id?.substring(0, 8)}`);
+        console.log(
+          `📨 [Daemon] Prompt request for session ${params.route?.id ? shortId(params.route.id) : 'unknown'}`
+        );
         console.log(`   Permission mode: ${data.permissionMode || 'not specified'}`);
         console.log(`   Streaming: ${data.stream !== false}`);
         console.log(`   Message source: ${data.messageSource || 'not specified'}`);
@@ -1271,7 +1267,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         // Auto-unarchive on prompt
         if (session.archived) {
           console.log(
-            `📦 [Prompt] Auto-unarchiving session ${id.substring(0, 8)} (was archived: ${session.archived_reason || 'unknown reason'})`
+            `📦 [Prompt] Auto-unarchiving session ${shortId(id)} (was archived: ${session.archived_reason || 'unknown reason'})`
           );
           session = (await sessionsService.patch(
             id,
@@ -1325,7 +1321,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             });
 
             console.log(
-              `📬 [Prompt] Auto-queued task for session ${id.substring(0, 8)} at position ${queuedTask.queue_position} ` +
+              `📬 [Prompt] Auto-queued task for session ${shortId(id)} at position ${queuedTask.queue_position} ` +
                 `(session status: ${lockedSession.status}, existing queue items: ${queuedTasks.length})`
             );
 
@@ -1444,7 +1440,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
                 `currently running task to free the queue.`
               : `Only 'created' tasks may be triggered.`;
           throw new Conflict(
-            `Task ${taskId.substring(0, 8)} cannot be run: status is '${task.status}'. ${hint}`
+            `Task ${shortId(taskId)} cannot be run: status is '${task.status}'. ${hint}`
           );
         }
 
@@ -1507,7 +1503,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           }
           if (session.status !== SessionStatus.IDLE) {
             throw new Conflict(
-              `Cannot run task ${taskId.substring(0, 8)}: session is '${session.status}'. ` +
+              `Cannot run task ${shortId(taskId)}: session is '${session.status}'. ` +
                 `To enqueue a prompt on a busy session, POST to /sessions/:id/prompt instead — ` +
                 `it creates and queues a task atomically.`
             );
@@ -1702,7 +1698,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       const files = req.files as Express.Multer.File[];
 
       if (DEBUG_UPLOAD) {
-        console.log(`📎 [Upload Handler] Processing for session ${sessionId?.substring(0, 8)}`);
+        console.log(
+          `📎 [Upload Handler] Processing for session ${sessionId ? shortId(sessionId) : 'unknown'}`
+        );
         console.log(`   Destination: ${destination || 'worktree'}`);
         console.log(`   Notify agent: ${notifyAgent === 'true' || notifyAgent === true}`);
         console.log(`   Files received: ${files?.length || 0}`);
@@ -1712,7 +1710,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       if (DEBUG_UPLOAD) {
         console.log(`   Auth params:`, {
           hasUser: !!params?.user,
-          userId: params?.user?.user_id?.substring(0, 8),
+          userId: params?.user?.user_id ? shortId(params.user.user_id) : undefined,
           provider: params?.provider,
         });
       }
@@ -1721,7 +1719,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
       const session = await sessionsService.get(sessionId, params);
       if (!session) {
-        console.error(`❌ [Upload Handler] Session not found: ${sessionId.substring(0, 8)}`);
+        console.error(`❌ [Upload Handler] Session not found: ${shortId(sessionId)}`);
         return res.status(404).json({ error: 'Session not found' });
       }
 
@@ -1755,7 +1753,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         if (!canUpload) {
           console.error(
-            `❌ [Upload Handler] User ${userId.substring(0, 8)} has '${effectiveLevel}' permission, cannot upload to worktree ${wt.worktree_id.substring(0, 8)}`
+            `❌ [Upload Handler] User ${shortId(userId)} has '${effectiveLevel}' permission, cannot upload to worktree ${shortId(wt.worktree_id)}`
           );
           return res.status(403).json({ error: 'Not authorized to upload to this session' });
         }
@@ -1833,7 +1831,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       console.log('   URL:', req.url);
       console.log('   Content-Type:', req.headers['content-type']);
       console.log('   Has auth header:', !!req.headers.authorization);
-      console.log('   Session ID param:', req.params.sessionId?.substring(0, 8));
+      console.log(
+        '   Session ID param:',
+        req.params.sessionId ? shortId(req.params.sessionId) : 'unknown'
+      );
     }
     next();
   };
@@ -1870,7 +1871,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
       if (DEBUG_UPLOAD) {
         console.log('✅ [Upload Auth] Authentication successful');
-        console.log('   User:', result.user?.user_id?.substring(0, 8));
+        console.log('   User:', result.user?.user_id ? shortId(result.user.user_id) : 'unknown');
       }
 
       req.feathers = {
@@ -1895,7 +1896,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     ((req: any, res: any, next: any) => {
       if (DEBUG_UPLOAD) {
         console.log('✅ [Upload Route] Authentication passed');
-        console.log('   User:', req.feathers?.user?.user_id?.substring(0, 8) ?? 'unknown');
+        console.log(
+          '   User:',
+          req.feathers?.user?.user_id ? shortId(req.feathers.user.user_id) : 'unknown'
+        );
       }
       next();
       // biome-ignore lint/suspicious/noExplicitAny: Express 5 type compatibility
@@ -1979,7 +1983,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         if (targetTasksArray.length === 0) {
           console.warn(
-            `⚠️  [Stop] No active tasks for session ${id.substring(0, 8)}, resetting to IDLE${stopReason ? ` (reason: ${stopReason})` : ''}`
+            `⚠️  [Stop] No active tasks for session ${shortId(id)}, resetting to IDLE${stopReason ? ` (reason: ${stopReason})` : ''}`
           );
           // ready_for_prompt: true so the post-patch hook drains any QUEUED tasks.
           // Stop is "skip current", not "wipe everything" — queued prompts represent
@@ -2007,13 +2011,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         const latestTask = targetTasksArray[0];
 
         console.log(
-          `🛑 [Stop] Stopping task ${latestTask.task_id.substring(0, 8)} for session ${id.substring(0, 8)}${stopReason ? ` (reason: ${stopReason})` : ''}`
+          `🛑 [Stop] Stopping task ${shortId(latestTask.task_id)} for session ${shortId(id)}${stopReason ? ` (reason: ${stopReason})` : ''}`
         );
 
         const processKilled = killExecutorProcess(id);
         if (!processKilled) {
           console.warn(
-            `⚠️  [Stop] No tracked process for session ${id.substring(0, 8)} — executor may have already exited`
+            `⚠️  [Stop] No tracked process for session ${shortId(id)} — executor may have already exited`
           );
         }
 
@@ -2098,9 +2102,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   async function processNextQueuedTask(sessionId: SessionID, params: RouteParams): Promise<void> {
     const existingLock = sessionTurnLocks.get(sessionId);
     if (existingLock) {
-      console.log(
-        `⏳ [Queue] Session turn in progress for ${sessionId.substring(0, 8)}, waiting...`
-      );
+      console.log(`⏳ [Queue] Session turn in progress for ${shortId(sessionId)}, waiting...`);
       await existingLock.catch(() => undefined);
       if (!queueRetryScheduled.has(sessionId)) {
         queueRetryScheduled.add(sessionId);
@@ -2109,10 +2111,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           try {
             await processNextQueuedTask(sessionId, params);
           } catch (error) {
-            console.error(
-              `❌ [Queue] Retry failed for session ${sessionId.substring(0, 8)}:`,
-              error
-            );
+            console.error(`❌ [Queue] Retry failed for session ${shortId(sessionId)}:`, error);
           }
         });
       }
@@ -2141,7 +2140,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     const nextTask = await taskRepo.getNextQueued(sessionId);
 
     if (!nextTask) {
-      console.log(`📭 No queued tasks for session ${sessionId.substring(0, 8)}`);
+      console.log(`📭 No queued tasks for session ${shortId(sessionId)}`);
       return;
     }
 
@@ -2157,16 +2156,16 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       : params;
 
     console.log(
-      `📬 Processing queued task ${nextTask.task_id.substring(0, 8)} ` +
+      `📬 Processing queued task ${shortId(nextTask.task_id)} ` +
         `(position ${nextTask.queue_position}) ` +
-        `with user context: ${queuedByUser ? queuedByUser.user_id.substring(0, 8) : 'none'}`
+        `with user context: ${queuedByUser ? shortId(queuedByUser.user_id) : 'none'}`
     );
 
     const session = await sessionsService.get(sessionId, taskParams);
 
     if (session.status !== SessionStatus.IDLE) {
       console.log(
-        `⏸️  [Queue] Session ${sessionId.substring(0, 8)} is ${session.status}, task ${nextTask.task_id.substring(0, 8)} waiting in queue ` +
+        `⏸️  [Queue] Session ${shortId(sessionId)} is ${session.status}, task ${shortId(nextTask.task_id)} waiting in queue ` +
           `(will be processed when session becomes IDLE via patch hook)`
       );
       return;
@@ -2176,7 +2175,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     // by a concurrent caller, or removed by an admin via DELETE /tasks/:id.
     const stillQueued = await taskRepo.findById(nextTask.task_id);
     if (!stillQueued || stillQueued.status !== TaskStatus.QUEUED) {
-      console.log(`⚠️  Queued task ${nextTask.task_id.substring(0, 8)} no longer queued, skipping`);
+      console.log(`⚠️  Queued task ${shortId(nextTask.task_id)} no longer queued, skipping`);
       return;
     }
 
@@ -2194,7 +2193,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       taskParams
     );
 
-    console.log(`✅ Queued task drained for session ${sessionId.substring(0, 8)}`);
+    console.log(`✅ Queued task drained for session ${shortId(sessionId)}`);
   }
 
   // Inject queue processor into sessions service.
