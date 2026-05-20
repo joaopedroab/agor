@@ -47,7 +47,8 @@ import { FileUpload, FileUploadButton } from '../FileUpload';
 import { MCPServerPill } from '../MCPServer';
 import { CreatedByTag } from '../metadata';
 import { PermissionModeSelector } from '../PermissionModeSelector';
-import { ContextWindowPill, ModelPill, SessionIdPill, TimerPill, TokenCountPill } from '../Pill';
+import { ContextWindowPill, ModelPill, TimerPill, TokenCountPill } from '../Pill';
+import { SessionIdsButton } from '../SessionIds';
 import { ToolIcon } from '../ToolIcon';
 import { SessionPanelContent } from './SessionPanelContent';
 
@@ -795,12 +796,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                 durationMs={footerTimerTask.duration_ms}
               />
             )}
-            <SessionIdPill
-              sessionId={session.session_id}
-              sdkSessionId={session.sdk_session_id}
-              agenticTool={session.agentic_tool}
-              showCopy={true}
-            />
+            <SessionIdsButton session={session} />
             {session.model_config?.model && (
               <ModelPill
                 model={
