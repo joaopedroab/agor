@@ -21,10 +21,11 @@
  * argv / /proc/<pid>/cmdline.
  */
 
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { AgorExecutionSettings } from '@agor/core/config';
 import {
   attachEnvFileCleanup,
   buildSpawnArgs,
@@ -34,92 +35,61 @@ import {
 import jwt from 'jsonwebtoken';
 import { withResolvedConfig } from './build-resolved-config-slice.js';
 
-/**
- * Module-level daemon URL configuration.
- * Set once at daemon startup via configureDaemonUrl().
- * Used by getDaemonUrl() for all executor payloads.
- */
 let configuredDaemonUrl: string | null = null;
 
-/**
- * Configure the daemon URL for executor payloads.
- * Call this once at daemon startup.
- *
- * @param url - The URL executors should use to reach the daemon
- *              (e.g., "http://agor-daemon.agor.svc.cluster.local:3030" for k8s)
- */
+/** Set the daemon URL for executor payloads. Call once at daemon startup. */
 export function configureDaemonUrl(url: string): void {
   configuredDaemonUrl = url;
   console.log(`[Executor] Daemon URL configured: ${url}`);
 }
 
-/**
- * Template variables for executor command template substitution.
- * These are substituted into the executor_command_template at spawn time.
- */
+let configuredExecutorDefaults: ExecutorSpawnDefaults = {};
+
+/** Set default executor template + impersonation user from config. Call once at daemon startup. */
+export function configureExecutor(config?: ExecutorConfig | null): void {
+  configuredExecutorDefaults = {
+    executorCommandTemplate: config?.executor_command_template || undefined,
+    asUser: config?.executor_unix_user || undefined,
+  };
+
+  if (configuredExecutorDefaults.executorCommandTemplate) {
+    const preview =
+      configuredExecutorDefaults.executorCommandTemplate.split('\n')[0]?.slice(0, 80) ?? '';
+    console.log(
+      `[Executor] Command template configured (first line): ${preview}${preview.length === 80 ? '…' : ''}`
+    );
+  }
+  if (configuredExecutorDefaults.asUser) {
+    console.log(`[Executor] Default impersonation user: ${configuredExecutorDefaults.asUser}`);
+  }
+}
+
 export interface ExecutorTemplateVariables {
-  /** Unique task identifier (for pod/container naming) */
   task_id?: string;
-
-  /** Executor command (prompt, git.clone, etc.) */
   command?: string;
-
-  /** Target Unix username */
   unix_user?: string;
-
-  /** Target Unix UID (for runAsUser in k8s) */
   unix_user_uid?: number;
-
-  /** Target Unix GID (for fsGroup in k8s) */
   unix_user_gid?: number;
-
-  /** Session ID (if available) */
   session_id?: string;
-
-  /** Worktree ID (if available) */
   worktree_id?: string;
 }
 
-/**
- * Options for spawning executor
- */
 export interface SpawnExecutorOptions {
-  /** Working directory for executor process */
   cwd?: string;
-
-  /** Environment variables for executor process */
   env?: Record<string, string>;
-
-  /** Log prefix for console output */
   logPrefix?: string;
-
-  /**
-   * Unix user to run executor as (impersonation)
-   * When set, spawns via `sudo -n -u $asUser bash -c '...'` so the executor
-   * gets fresh group memberships for the target user. Secret env vars are
-   * routed through a 0600 env-file owned by `asUser` so their values stay
-   * out of argv / /proc/<pid>/cmdline.
-   */
-  asUser?: string;
-
-  /**
-   * Executor command template for remote/containerized execution.
-   * When provided, uses template substitution instead of local subprocess.
-   * Takes precedence over local spawning.
-   */
-  executorCommandTemplate?: string;
-
-  /**
-   * Template variables for substitution in executor_command_template.
-   * Used when executorCommandTemplate is provided.
-   */
+  /** When set, spawns via `sudo -n -u $asUser`. Secrets go through a 0600 env-file. */
+  asUser?: string | null;
+  /** When set, uses template substitution instead of local subprocess. */
+  executorCommandTemplate?: string | null;
   templateVariables?: ExecutorTemplateVariables;
-
-  /**
-   * Callback when executor process exits.
-   * Used to clean up resources when executor terminates.
-   */
   onExit?: (code: number | null) => void;
+  /** Fired after spawn, before stdin is written. Works for both local and templated paths. */
+  onSpawn?: (child: ChildProcess) => void;
+  /** Caller-assembled env; bypasses internal curation. Ignored by templated path. */
+  preparedEnv?: Record<string, string>;
+  /** Pre-written 0600 env file; bypasses prepareImpersonationEnv(). Only with asUser. */
+  preparedEnvFilePath?: string;
 }
 
 /**
@@ -138,7 +108,6 @@ export function substituteTemplateVariables(
 ): string {
   let result = template;
 
-  // Substitute each known variable
   const substitutions: Record<string, string | number | undefined> = {
     task_id: variables.task_id,
     command: variables.command,
@@ -151,7 +120,6 @@ export function substituteTemplateVariables(
 
   for (const [key, value] of Object.entries(substitutions)) {
     if (value !== undefined) {
-      // Replace all occurrences of {key} with the value
       const placeholder = new RegExp(`\\{${key}\\}`, 'g');
       result = result.replace(placeholder, String(value));
     }
@@ -160,12 +128,7 @@ export function substituteTemplateVariables(
   return result;
 }
 
-/**
- * Generate a unique task ID for executor pod/container naming.
- * Uses a short random string that's safe for k8s resource names.
- */
 export function generateTaskId(): string {
-  // Generate 8 character hex string (32 bits of entropy)
   const bytes = new Uint8Array(4);
   crypto.getRandomValues(bytes);
   return Array.from(bytes)
@@ -173,14 +136,6 @@ export function generateTaskId(): string {
     .join('');
 }
 
-/**
- * Find the executor binary path
- *
- * Searches multiple possible locations for development and production:
- * - Bundled in agor-live package
- * - Development bin script
- * - Built dist directory
- */
 export function findExecutorPath(): string {
   const dirname =
     typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
@@ -225,27 +180,32 @@ export function spawnExecutor(
   payload: Record<string, unknown>,
   options: SpawnExecutorOptions = {}
 ): void {
-  const { executorCommandTemplate, templateVariables, logPrefix = '[Executor]' } = options;
+  const { templateVariables, logPrefix = '[Executor]' } = options;
 
-  // Daemon resolves the small config slice the executor needs (permission
-  // timeout, opencode URL, host IP override) so the executor never has to
-  // read config.yaml itself. See build-resolved-config-slice.ts.
+  const executorCommandTemplate =
+    options.executorCommandTemplate !== undefined
+      ? options.executorCommandTemplate || undefined
+      : configuredExecutorDefaults.executorCommandTemplate;
+  const asUser =
+    options.asUser !== undefined ? options.asUser || undefined : configuredExecutorDefaults.asUser;
+
   const payloadWithConfig = withResolvedConfig(payload);
 
-  // Decide execution mode: templated or local
   if (executorCommandTemplate) {
     spawnExecutorWithTemplate(payloadWithConfig, {
       ...options,
+      asUser,
       executorCommandTemplate,
       templateVariables: {
         command: payloadWithConfig.command as string,
         task_id: generateTaskId(),
+        unix_user: asUser,
         ...templateVariables,
       },
       logPrefix,
     });
   } else {
-    spawnExecutorLocal(payloadWithConfig, options);
+    spawnExecutorLocal(payloadWithConfig, { ...options, asUser });
   }
 }
 
@@ -265,49 +225,50 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
     cwd = executorDir,
     env = process.env as Record<string, string>,
     logPrefix = '[Executor]',
-    asUser,
+    asUser: rawAsUser,
+    onSpawn,
+    preparedEnv,
+    preparedEnvFilePath,
   } = options;
+  const asUser = rawAsUser || undefined;
 
-  // Add DAEMON_URL to env so the executor can connect back via Feathers.
-  // The executor itself never reads config.yaml — all config values it
-  // needs are pre-resolved by the daemon and embedded in the payload as
-  // `resolvedConfig` (see buildResolvedConfigSlice).
   const daemonUrl = getDaemonUrl();
 
-  // When impersonating, pass minimal env vars and let sudo set HOME correctly
-  const essentialEnv: Record<string, string> = asUser
-    ? Object.fromEntries(
-        Object.entries({
-          DAEMON_URL: daemonUrl,
-          PATH: env.PATH || '/usr/local/bin:/usr/bin:/bin',
-          NODE_ENV: env.NODE_ENV,
-          // HOME: not set - sudo will set it to the target user's home directory
-          ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY,
-          ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN,
-          ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL,
-          CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN,
-          OPENAI_API_KEY: env.OPENAI_API_KEY,
-          OPENAI_BASE_URL: env.OPENAI_BASE_URL,
-          GEMINI_API_KEY: env.GEMINI_API_KEY,
-          GOOGLE_API_KEY: env.GOOGLE_API_KEY,
-          // Forward git hardening pairs across the sudo boundary (sudoers
-          // env_keep is the belt; this is the suspenders for this path).
-          GIT_CONFIG_PARAMETERS: env.GIT_CONFIG_PARAMETERS,
-        }).filter(([_, v]) => v !== undefined)
-      )
-    : { ...env, DAEMON_URL: daemonUrl };
+  const envWithDaemonUrl: Record<string, string> = preparedEnv
+    ? { DAEMON_URL: daemonUrl, ...preparedEnv }
+    : asUser
+      ? Object.fromEntries(
+          Object.entries({
+            DAEMON_URL: daemonUrl,
+            PATH: env.PATH || '/usr/local/bin:/usr/bin:/bin',
+            NODE_ENV: env.NODE_ENV,
+            // HOME: not set - sudo will set it to the target user's home directory
+            ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY,
+            ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN,
+            ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL,
+            CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN,
+            OPENAI_API_KEY: env.OPENAI_API_KEY,
+            OPENAI_BASE_URL: env.OPENAI_BASE_URL,
+            GEMINI_API_KEY: env.GEMINI_API_KEY,
+            GOOGLE_API_KEY: env.GOOGLE_API_KEY,
+            // Forward git hardening pairs across the sudo boundary (sudoers
+            // env_keep is the belt; this is the suspenders for this path).
+            GIT_CONFIG_PARAMETERS: env.GIT_CONFIG_PARAMETERS,
+          }).filter(([_, v]) => v !== undefined)
+        )
+      : { ...env, DAEMON_URL: daemonUrl };
 
-  const envWithDaemonUrl = essentialEnv;
-
-  // Route secret-looking env vars through an on-disk env file owned by the
-  // target user (mode 0600). This keeps API keys/tokens out of argv and out
-  // of /proc/<pid>/cmdline. Non-secret vars (PATH, DAEMON_URL, NODE_ENV)
-  // are still inlined for simplicity.
   const prepared = asUser
-    ? prepareImpersonationEnv({ asUser, env: envWithDaemonUrl })
+    ? preparedEnvFilePath
+      ? {
+          inlineEnv: Object.fromEntries(
+            Object.entries(envWithDaemonUrl).filter(([k]) => !isSecretEnvKey(k))
+          ),
+          envFilePath: preparedEnvFilePath,
+        }
+      : prepareImpersonationEnv({ asUser, env: envWithDaemonUrl })
     : { inlineEnv: undefined, envFilePath: undefined };
 
-  // Build spawn command - handles impersonation via sudo -u when asUser is set
   const { cmd, args } = buildSpawnArgs('node', [executorPath, '--stdin'], {
     asUser,
     env: asUser ? prepared.inlineEnv : undefined, // Non-secret env only; secrets are sourced from envFilePath
@@ -363,41 +324,25 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
   // uses `sudo -u <asUser> rm -f` so it works under sticky /tmp.
   attachEnvFileCleanup(executorProcess, { envFilePath: prepared.envFilePath, asUser });
 
-  // Log if process fails to spawn
+  onSpawn?.(executorProcess);
+
   executorProcess.on('error', (error) => {
     console.error(`${logPrefix} Spawn error:`, error.message);
   });
 
-  // Log when process exits (for debugging) and call onExit callback
   executorProcess.on('exit', (code) => {
     if (code === 0) {
       console.log(`${logPrefix} Executor completed successfully`);
     } else {
       console.error(`${logPrefix} Executor exited with code ${code}`);
     }
-    // Call onExit callback if provided (for cleanup)
     options.onExit?.(code);
   });
 
-  // Write JSON payload to stdin and close it
   executorProcess.stdin?.write(JSON.stringify(payload));
   executorProcess.stdin?.end();
 }
 
-/**
- * Spawn executor using a command template (for k8s, docker, etc.).
- *
- * The template is executed via `sh -c` with the JSON payload piped to stdin.
- * stdout/stderr are captured and logged (since kubectl needs to pipe them back).
- *
- * @example kubectl template
- * ```
- * kubectl run executor-{task_id} \
- *   --image=ghcr.io/preset-io/agor-executor:latest \
- *   --rm -i --restart=Never \
- *   -- agor-executor --stdin
- * ```
- */
 function spawnExecutorWithTemplate(
   payload: Record<string, unknown>,
   options: SpawnExecutorOptions & {
@@ -407,7 +352,6 @@ function spawnExecutorWithTemplate(
 ): void {
   const { executorCommandTemplate, templateVariables, logPrefix = '[Executor]' } = options;
 
-  // Substitute template variables
   const command = substituteTemplateVariables(executorCommandTemplate, templateVariables);
 
   console.log(`${logPrefix} Templated execution mode`);
@@ -415,28 +359,24 @@ function spawnExecutorWithTemplate(
   console.log(`${logPrefix} Command: ${payload.command}`);
   console.log(`${logPrefix} Template command (first 200 chars): ${command.slice(0, 200)}...`);
 
-  // Execute the template command via sh -c
-  // Use pipe for stdout/stderr so we can capture kubectl output and log it
   const executorProcess = spawn('sh', ['-c', command], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-  // Log stdout in real-time
+  options.onSpawn?.(executorProcess);
+
   executorProcess.stdout?.on('data', (data) => {
     console.log(`${logPrefix} ${data.toString().trim()}`);
   });
 
-  // Log stderr in real-time
   executorProcess.stderr?.on('data', (data) => {
     console.error(`${logPrefix} ${data.toString().trim()}`);
   });
 
-  // Log if process fails to spawn
   executorProcess.on('error', (error) => {
     console.error(`${logPrefix} Spawn error:`, error.message);
   });
 
-  // Log when process exits
   executorProcess.on('exit', (code) => {
     if (code === 0) {
       console.log(
@@ -447,33 +387,16 @@ function spawnExecutorWithTemplate(
         `${logPrefix} Executor exited with code ${code} (task: ${templateVariables.task_id})`
       );
     }
+    options.onExit?.(code);
   });
 
-  // Write JSON payload to stdin and close it
   executorProcess.stdin?.write(JSON.stringify(payload));
   executorProcess.stdin?.end();
 }
 
-/**
- * Get daemon URL for executor communication.
- *
- * Priority:
- * 1. Module-level configured URL (set via configureDaemonUrl at startup)
- * 2. Environment variable PORT with localhost
- * 3. Default localhost:3030
- *
- * In containerized (k8s) mode, configureDaemonUrl() should be called at startup
- * with the internal service URL (e.g., http://agor-daemon.agor.svc.cluster.local:3030)
- */
 export function getDaemonUrl(): string {
-  // Use configured URL if set (for k8s/containerized mode)
-  if (configuredDaemonUrl) {
-    return configuredDaemonUrl;
-  }
-
-  // Otherwise, use localhost with port from env or default
-  const effectivePort = process.env.PORT || '3030';
-  return `http://localhost:${effectivePort}`;
+  if (configuredDaemonUrl) return configuredDaemonUrl;
+  return `http://localhost:${process.env.PORT || '3030'}`;
 }
 
 /**
@@ -534,29 +457,19 @@ export function generateSessionToken(app: {
  * Configuration for executor spawning.
  * Loaded from ~/.agor/config.yaml execution section.
  */
-export interface ExecutorConfig {
+export type ExecutorConfig = Pick<
+  AgorExecutionSettings,
+  'executor_command_template' | 'executor_unix_user'
+>;
+
+interface ExecutorSpawnDefaults {
   /** Executor command template for containerized execution */
-  executor_command_template?: string;
+  executorCommandTemplate?: string;
   /** Unix user to run executors as */
-  executor_unix_user?: string;
+  asUser?: string;
 }
 
-/**
- * Create a configured spawn function with execution settings baked in.
- *
- * This factory creates a spawn function that automatically includes
- * the executor_command_template from config. Use this when you have
- * access to config at initialization time.
- *
- * @example
- * ```typescript
- * const config = await loadConfig();
- * const spawn = createConfiguredSpawner(config.execution);
- *
- * // Now spawn automatically uses template if configured
- * spawn({ command: 'prompt', ... }, { logPrefix: '[Task]' });
- * ```
- */
+/** DI-based factory that bakes execution config into a spawner, independent of module-level defaults. */
 export function createConfiguredSpawner(executionConfig?: ExecutorConfig) {
   return function configuredSpawnExecutor(
     payload: Record<string, unknown>,
@@ -564,8 +477,14 @@ export function createConfiguredSpawner(executionConfig?: ExecutorConfig) {
   ): void {
     spawnExecutor(payload, {
       ...options,
-      executorCommandTemplate: executionConfig?.executor_command_template,
-      asUser: options.asUser ?? executionConfig?.executor_unix_user,
+      // `null` intentionally suppresses module-level defaults so this
+      // factory remains an explicit dependency-injection variant rather than
+      // accidentally inheriting whatever configureExecutor() last installed.
+      executorCommandTemplate: executionConfig?.executor_command_template ?? null,
+      asUser:
+        options.asUser !== undefined
+          ? options.asUser
+          : (executionConfig?.executor_unix_user ?? null),
     });
   };
 }
