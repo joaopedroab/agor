@@ -62,7 +62,6 @@ import {
 } from '../../contexts/CanvasNavigationContext';
 import { useMutationGate } from '../../contexts/ConnectionContext';
 import { useCursorTracking } from '../../hooks/useCursorTracking';
-import { usePresence } from '../../hooks/usePresence';
 import type { AgenticToolOption } from '../../types';
 import { sanitizeBoardCss } from '../../utils/sanitizeCss';
 import { isDarkTheme } from '../../utils/theme';
@@ -76,8 +75,8 @@ import SessionCard from '../SessionCard';
 import { AppNode } from './canvas/AppNode';
 import { ArtifactNode } from './canvas/ArtifactNode';
 import { CommentNode, ZoneNode } from './canvas/BoardObjectNodes';
-import { CursorNode } from './canvas/CursorNode';
 import { MarkdownNode } from './canvas/MarkdownNode';
+import { RemoteCursorLayer } from './canvas/RemoteCursorLayer';
 import { useBoardObjects } from './canvas/useBoardObjects';
 import { findIntersectingObjects, findZoneAtPosition } from './canvas/utils/collisionDetection';
 import { getBranchParentInfo, getZoneParentInfo } from './canvas/utils/commentUtils';
@@ -325,7 +324,6 @@ const nodeTypes = {
   branchNode: BranchNode,
   cardNode: CardNodeWrapper,
   zone: ZoneNode,
-  cursor: CursorNode,
   comment: CommentNode,
   markdown: MarkdownNode,
   appNode: AppNode,
@@ -584,7 +582,7 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
         // Find the board_object for this branch
         const boardObject = boardObjectByBranch.get(branchId);
 
-        if (!boardObject || !boardObject.zone_id) {
+        if (!boardObject?.zone_id) {
           return;
         }
 
@@ -767,7 +765,7 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
       async (cardId: string) => {
         if (!board || !client) return;
         const boardObject = boardObjectByCard.get(cardId);
-        if (!boardObject || !boardObject.zone_id) return;
+        if (!boardObject?.zone_id) return;
 
         const zone = board.objects?.[boardObject.zone_id];
         if (!zone) return;
@@ -918,41 +916,6 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
       reactFlowInstance: reactFlowInstanceRef.current,
       enabled: !!board && !!client,
     });
-
-    // Presence tracking hook (get remote cursors)
-    const { remoteCursors } = usePresence({
-      client,
-      boardId: board?.board_id as BoardID | null,
-      users: mapToArray(userById),
-      enabled: !!board && !!client,
-    });
-
-    // Create cursor nodes from remote cursors (for minimap visibility)
-    // Large dimensions ensure good visibility in minimap (visual size controlled by inverse scaling)
-    const cursorNodes: Node[] = useMemo(() => {
-      const nodes: Node[] = [];
-
-      for (const [userId, { x, y, user }] of remoteCursors.entries()) {
-        nodes.push({
-          id: `cursor-${userId}`,
-          type: 'cursor',
-          position: { x, y },
-          draggable: false,
-          selectable: false,
-          focusable: false,
-          zIndex: 2000, // Cursors always on top (live presence)
-          data: { user },
-          width: 150,
-          height: 150,
-          style: {
-            pointerEvents: 'none',
-            transition: 'transform 0.1s ease-out',
-          },
-        });
-      }
-
-      return nodes;
-    }, [remoteCursors]);
 
     // Create comment nodes from spatial comments
     const commentNodes: Node[] = useMemo(() => {
@@ -1142,7 +1105,6 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
     // Memoized MiniMap nodeColor callback to prevent MiniMap canvas repaints on every render
     const miniMapNodeColor = useCallback(
       (node: Node) => {
-        if (node.type === 'cursor') return token.colorWarning;
         if (node.type === 'comment') return token.colorText;
         if (node.type === 'markdown') return `${token.colorText}B3`;
         if (node.type === 'zone') return `${token.colorText}66`;
@@ -1164,7 +1126,6 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
         }
       },
       [
-        token.colorWarning,
         token.colorText,
         token.colorPrimaryBorder,
         token.colorPrimary,
@@ -1182,12 +1143,11 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
         cards: nodes.filter((n) => n.type === 'cardNode'),
         apps: nodes.filter((n) => n.type === 'appNode' || n.type === 'artifactNode'),
         comments: nodes.filter((n) => n.type === 'comment'),
-        cursors: nodes.filter((n) => n.type === 'cursor'),
       };
     }, []);
 
     // Helper: Apply consistent z-ordering to nodes
-    // Z-order: zones < branches/cards < apps/artifacts < markdown < comments < cursors
+    // Z-order: zones < branches/cards < apps/artifacts < markdown < comments
     const applyZOrder = useCallback(
       (
         zones: Node[],
@@ -1195,7 +1155,6 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
         branches: Node[],
         cards: Node[],
         comments: Node[],
-        cursors: Node[],
         apps: Node[] = []
       ) => {
         return sanitizeOrphanedParents([
@@ -1205,7 +1164,6 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
           ...apps,
           ...markdown,
           ...comments,
-          ...cursors,
         ]);
       },
       [sanitizeOrphanedParents]
@@ -1224,7 +1182,7 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
       const boardObjectNodes = getBoardObjectNodes();
 
       setNodes((currentNodes) => {
-        const { cursors, comments } = partitionNodesByType(currentNodes);
+        const { comments } = partitionNodesByType(currentNodes);
 
         const zones = boardObjectNodes
           .filter((n) => n.type === 'zone' && !deletedObjectsRef.current.has(n.id))
@@ -1254,7 +1212,7 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
         const updatedBranches = applyLocalPositions(initialNodes, currentNodes, zones);
         const updatedCards = applyLocalPositions(cardNodes, currentNodes, zones);
 
-        return applyZOrder(zones, markdown, updatedBranches, updatedCards, comments, cursors, apps);
+        return applyZOrder(zones, markdown, updatedBranches, updatedCards, comments, apps);
       });
     }, [
       initialNodes,
@@ -1266,27 +1224,12 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
       partitionNodesByType,
     ]);
 
-    // Sync CURSOR nodes separately - optimized to avoid re-partitioning all nodes
-    useEffect(() => {
-      if (isDraggingRef.current) return;
-
-      setNodes((currentNodes) => {
-        // Remove old cursor nodes and append new ones (cursors are always last for z-order)
-        const nonCursorNodes = currentNodes.filter((n) => n.type !== 'cursor');
-        if (cursorNodes.length === 0 && nonCursorNodes.length === currentNodes.length) {
-          return currentNodes; // No change needed - avoid creating new array
-        }
-        return [...nonCursorNodes, ...cursorNodes];
-      });
-    }, [cursorNodes, setNodes]);
-
     // Sync COMMENT nodes separately
     useEffect(() => {
       if (isDraggingRef.current) return;
 
       setNodes((currentNodes) => {
-        const { zones, markdown, branches, cards, apps, cursors } =
-          partitionNodesByType(currentNodes);
+        const { zones, markdown, branches, cards, apps } = partitionNodesByType(currentNodes);
 
         // Apply local position overrides to comment nodes (to prevent flicker during drag)
         const commentsWithLocalPositions = commentNodes.map((newNode) => {
@@ -1333,15 +1276,7 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
           return newNode;
         });
 
-        return applyZOrder(
-          zones,
-          markdown,
-          branches,
-          cards,
-          commentsWithLocalPositions,
-          cursors,
-          apps
-        );
+        return applyZOrder(zones, markdown, branches, cards, commentsWithLocalPositions, apps);
       });
     }, [commentNodes, setNodes, applyZOrder, partitionNodesByType]);
 
@@ -1352,7 +1287,7 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
 
     // Fit view ONCE when entering a board (not on every node change)
     // This ensures nodes are visible when navigating between boards or on initial load,
-    // but doesn't disrupt the user's zoom level when comments/cursors/zones change
+    // but doesn't disrupt the user's zoom level when comments/zones change
     useEffect(() => {
       // Wait for ReactFlow to be ready and nodes to be loaded
       if (!isReactFlowReady || !reactFlowInstanceRef.current || nodes.length === 0) return;
@@ -2231,7 +2166,7 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
           if (!mutationGate.canMutate) {
             return;
           }
-          // Only delete board objects (zones, markdown), not branches or cursors
+          // Only delete board objects (zones, markdown), not branches
           if (node.type === 'zone' || node.type === 'markdown') {
             deleteObject(node.id);
           }
@@ -2538,6 +2473,12 @@ const SessionCanvas = forwardRef<SessionCanvasRef, SessionCanvasProps>(
               maskColor="rgba(0, 0, 0, 0.5)"
               maskStrokeColor={token.colorPrimary}
               maskStrokeWidth={2}
+            />
+            <RemoteCursorLayer
+              client={client}
+              boardId={(board?.board_id as BoardID | null) ?? null}
+              users={mapToArray(userById)}
+              enabled={!!board && !!client}
             />
           </ReactFlow>
         </div>
