@@ -525,9 +525,10 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
    * Uses LEFT JOIN to check ownership in one query instead of N+1.
    * Returns branches where user is an owner OR others_can allows at least 'view' access.
    *
-   * NOTE: This method should only be called when RBAC is enabled. When RBAC is disabled,
-   * the scopeBranchQuery hook is not registered, so default Feathers query is used
-   * (which returns all branches without filtering).
+   * NOTE: This method should only be called when RBAC is enabled. The branch
+   * find RBAC hook uses it to resolve accessible branch IDs and compose them
+   * into the service query; when RBAC is disabled, default Feathers query
+   * handling returns all branches without access filtering.
    *
    * @param userId - User ID to check access for
    * @param filter - Optional filters
@@ -563,6 +564,34 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
 
     const baseUrl = await getBaseUrl();
     return rows.map((row: BranchRow) => this.rowToBranch(row, baseUrl));
+  }
+
+  /**
+   * Find branch IDs pinned to a specific board zone.
+   *
+   * Zone membership lives on board_objects.data.zone_id, not on the branches
+   * table. BranchesService.find() uses this helper to turn a zone_id query into
+   * a branch_id filter before the generic adapter applies pagination.
+   */
+  async findBranchIdsByZone(zoneId: string): Promise<BranchID[]> {
+    const { boardObjects: boardObjectsTable } = await import('../schema');
+    const { jsonExtract } = await import('../database-wrapper');
+
+    const rows = await select(this.db, {
+      branch_id: boardObjectsTable.branch_id,
+    })
+      .from(boardObjectsTable)
+      .where(sql`${jsonExtract(this.db, boardObjectsTable.data, 'zone_id')} = ${zoneId}`)
+      .all();
+
+    const uniqueIds = new Set<BranchID>();
+    for (const row of rows as { branch_id: string | null }[]) {
+      if (row.branch_id) {
+        uniqueIds.add(row.branch_id as BranchID);
+      }
+    }
+
+    return Array.from(uniqueIds);
   }
 
   /**
