@@ -14,7 +14,28 @@ import {
 } from '@agor/core/config';
 import type { Database } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import type { AgenticToolName, Params, TaskID, UserID } from '@agor/core/types';
+import { BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
+import type {
+  AgenticToolName,
+  AuthenticatedParams,
+  Params,
+  TaskID,
+  UserID,
+} from '@agor/core/types';
+
+const RESOLVABLE_API_KEY_NAMES: Record<ApiKeyName, true> = {
+  ANTHROPIC_API_KEY: true,
+  ANTHROPIC_AUTH_TOKEN: true,
+  CLAUDE_CODE_OAUTH_TOKEN: true,
+  OPENAI_API_KEY: true,
+  GEMINI_API_KEY: true,
+  COPILOT_GITHUB_TOKEN: true,
+  CURSOR_API_KEY: true,
+};
+
+function isResolvableApiKeyName(value: string): value is ApiKeyName {
+  return Object.hasOwn(RESOLVABLE_API_KEY_NAMES, value);
+}
 
 /**
  * Mask API keys for secure display
@@ -91,24 +112,44 @@ export class ConfigService {
    * This allows executors to request API key resolution without direct database access.
    * The service handles the precedence: user-level > config > env > native auth.
    *
-   * Called via: client.service('config').resolveApiKey({ taskId, keyName })
+   * Called via: client.service('config/resolve-api-key').create({ taskId, keyName })
    */
-  async resolveApiKey(data: {
-    taskId: TaskID;
-    keyName: string;
-    /**
-     * Restrict the per-user lookup to this tool's credential bucket. Executors
-     * always pass this; absent it, the resolver falls back to a cross-tool
-     * sweep (legacy behavior preserved for non-SDK callers).
-     */
-    tool?: AgenticToolName;
-  }): Promise<{
+  async resolveApiKey(
+    data: {
+      taskId: TaskID;
+      keyName: string;
+      /**
+       * Restrict the per-user lookup to this tool's credential bucket. Executors
+       * always pass this; absent it, the resolver falls back to a cross-tool
+       * sweep (legacy behavior preserved for non-SDK callers).
+       */
+      tool?: AgenticToolName;
+    },
+    params?: Params
+  ): Promise<{
     apiKey: string | null;
     source: 'user' | 'config' | 'env' | 'native';
     useNativeAuth: boolean;
     decryptionFailed?: boolean;
   }> {
+    // This method returns plaintext secret material and is only for trusted
+    // daemon/executor flows. External callers must authenticate with an
+    // executor service JWT; normal user/API-key auth may read masked config via
+    // /config but must not resolve raw configured keys.
+    if (params?.provider) {
+      const caller = (params as AuthenticatedParams | undefined)?.user;
+      if (!caller) {
+        throw new NotAuthenticated('Authentication required');
+      }
+      if (caller._isServiceAccount !== true) {
+        throw new Forbidden('Only the executor service account may resolve API keys');
+      }
+    }
+
     const { taskId, keyName, tool } = data;
+    if (!isResolvableApiKeyName(keyName)) {
+      throw new BadRequest('Unsupported API key name');
+    }
 
     // Fetch task to get creator user ID
     let userId: UserID | undefined;
@@ -123,7 +164,7 @@ export class ConfigService {
     }
 
     // Use core resolveApiKey with database access
-    const result = await resolveApiKey(keyName as ApiKeyName, {
+    const result = await resolveApiKey(keyName, {
       userId,
       db: this.db,
       tool,
