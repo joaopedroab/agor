@@ -17,6 +17,7 @@ import {
   eq,
   inArray,
   MCPServerRepository,
+  SessionMCPServerRepository,
   type SessionMCPServerRow,
   select,
   sessionMcpServers,
@@ -24,7 +25,7 @@ import {
   UserMCPOAuthTokenRepository,
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import { NotAuthenticated } from '@agor/core/feathers';
+import { Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import type {
   AuthenticatedParams,
   HookContext,
@@ -100,6 +101,10 @@ import { createUsersService } from './services/users.js';
 import { userRoomName } from './setup/socketio.js';
 import { appendSystemMessage } from './utils/append-system-message.js';
 import { escapeHtml } from './utils/html.js';
+import {
+  shouldExposeMCPServerSecrets,
+  shouldExposeMCPServerSecretsForSessionToken,
+} from './utils/mcp-header-secrets.js';
 import {
   computeFileHash,
   findCodexSessionFile,
@@ -1991,7 +1996,7 @@ async function registerMCPServices(
       headers: Record<string, { authorization?: string; error?: string }>;
     }> {
       const userId = params?.user?.user_id;
-      if (!userId) {
+      if (!userId && params?.provider) {
         throw new NotAuthenticated('oauth-auth-headers requires authentication');
       }
 
@@ -2002,14 +2007,39 @@ async function registerMCPServices(
         return { headers };
       }
 
+      const sessionId = (params as (AuthenticatedParams & { session_id?: string }) | undefined)
+        ?.session_id;
+      const trustedInternalOrService = shouldExposeMCPServerSecrets(params);
+      const trustedSessionExecutor = shouldExposeMCPServerSecretsForSessionToken(params, {
+        sessionId,
+      });
+      if (!trustedInternalOrService && !trustedSessionExecutor) {
+        throw new Forbidden('oauth-auth-headers is only available to trusted executor paths');
+      }
+
       const userTokenRepo = new UserMCPOAuthTokenRepository(db);
       const mcpServerRepo = new MCPServerRepository(db);
+      if (trustedSessionExecutor) {
+        const sessionMcpRepo = new SessionMCPServerRepository(db);
+        const attachedServers = await sessionMcpRepo.listServers(sessionId as SessionID, true);
+        const globalServers = await mcpServerRepo.findAll({ scope: 'global', enabled: true });
+        const allowedServerIds = new Set([
+          ...globalServers.map((server) => server.mcp_server_id),
+          ...attachedServers.map((server) => server.mcp_server_id),
+        ]);
+        for (const serverId of serverIds) {
+          if (!allowedServerIds.has(serverId as MCPServerID)) {
+            headers[serverId] = { error: 'server_not_in_session_scope' };
+          }
+        }
+      }
       const { needsRefresh, refreshAndPersistToken, InvalidGrantError } = await import(
         '@agor/core/tools/mcp/oauth-refresh'
       );
 
       await Promise.all(
         serverIds.map(async (serverId) => {
+          if (headers[serverId]) return;
           try {
             const server = await mcpServerRepo.findById(serverId);
             if (!server) {
@@ -2022,6 +2052,10 @@ async function registerMCPServices(
             }
 
             const mode = server.auth.oauth_mode ?? 'per_user';
+            if (mode === 'per_user' && !userId) {
+              headers[serverId] = { error: 'needs_user_context' };
+              return;
+            }
             const tokenUserId: UserID | null = mode === 'per_user' ? (userId as UserID) : null;
 
             const row = await userTokenRepo.getToken(tokenUserId, serverId as MCPServerID);
@@ -2060,10 +2094,11 @@ async function registerMCPServices(
 
             headers[serverId] = { authorization: `Bearer ${accessToken}` };
           } catch (err) {
-            console.error(`[OAuth AuthHeaders] Error for ${serverId}:`, err);
-            headers[serverId] = {
-              error: err instanceof Error ? err.message : 'unknown_error',
-            };
+            console.error(
+              `[OAuth AuthHeaders] Error for ${serverId}:`,
+              err instanceof Error ? err.name : 'unknown_error'
+            );
+            headers[serverId] = { error: 'unknown_error' };
           }
         })
       );
@@ -2136,10 +2171,13 @@ async function registerMCPServices(
         if (err instanceof InvalidGrantError || err instanceof MissingRefreshTokenError) {
           return { success: false, error: 'needs_reauth' };
         }
-        console.error(`[OAuth Refresh] ${serverId}:`, err);
+        console.error(
+          `[OAuth Refresh] ${serverId}:`,
+          err instanceof Error ? err.name : 'unknown_error'
+        );
         return {
           success: false,
-          error: err instanceof Error ? err.message : 'unknown_error',
+          error: 'unknown_error',
         };
       }
     },
@@ -2177,6 +2215,7 @@ async function registerMCPServices(
         const { StreamableHTTPClientTransport } = await import(
           '@modelcontextprotocol/sdk/client/streamableHttp.js'
         );
+        const { restoreRedactedMCPAuthSecrets } = await import('@agor/core/tools/mcp/auth-secrets');
         const { resolveMCPAuthHeaders } = await import('@agor/core/tools/mcp/jwt-auth');
         const { mergeMCPRemoteHeaders, restoreRedactedMCPCustomHeaders } = await import(
           '@agor/core/tools/mcp/http-headers'
@@ -2250,6 +2289,10 @@ async function registerMCPServices(
                   error: 'Access denied: admin role required to update session-scoped MCP servers',
                 };
             }
+            serverConfig.auth = restoreRedactedMCPAuthSecrets({
+              current: server.auth,
+              next: data.auth,
+            });
             serverConfig.headers = restoreRedactedMCPCustomHeaders({
               current: server.headers,
               next: data.headers,
