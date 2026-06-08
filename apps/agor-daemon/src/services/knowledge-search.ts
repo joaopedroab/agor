@@ -9,6 +9,7 @@ import {
   executeRaw,
   isPostgresDatabase,
   KnowledgeDocumentRepository,
+  KnowledgeNamespaceRepository,
   type KnowledgeSearchQuery,
   KnowledgeSearchRepository,
   sql,
@@ -17,11 +18,9 @@ import { BadRequest } from '@agor/core/feathers';
 import {
   type AuthenticatedParams,
   buildKnowledgeUnitUri,
-  hasMinimumRole,
   type KnowledgeSearchResult,
   normalizeKnowledgeFolderPath,
   type QueryParams,
-  ROLES,
   type User,
 } from '@agor/core/types';
 import { getKnowledgeUrl } from '@agor/core/utils/url';
@@ -38,30 +37,40 @@ import {
   getKnowledgePgvectorCapability,
   semanticUnavailableMessage,
 } from '../knowledge/pgvector.js';
+import { canReadKnowledgeSearchResult, isKnowledgeAdmin } from './knowledge-access.js';
 
 export type KnowledgeSearchParams = QueryParams<KnowledgeSearchQuery> & AuthenticatedParams;
 
 export class KnowledgeSearchService {
   private repo: KnowledgeSearchRepository;
   private documents: KnowledgeDocumentRepository;
+  private namespaces: KnowledgeNamespaceRepository;
   private variables: AppVariableRepository;
   private embeddingProvider = new OpenAIEmbeddingProvider();
 
   constructor(private db: Database) {
     this.repo = new KnowledgeSearchRepository(db);
     this.documents = new KnowledgeDocumentRepository(db);
+    this.namespaces = new KnowledgeNamespaceRepository(db);
     this.variables = new AppVariableRepository(db);
   }
 
-  private canRead(
+  private async canRead(
     result: Awaited<ReturnType<KnowledgeSearchRepository['search']>>[number],
     user?: User
-  ): boolean {
-    return (
-      result.document.visibility === 'public' ||
-      hasMinimumRole(user?.role, ROLES.ADMIN) ||
-      Boolean(user?.user_id && result.document.created_by === user.user_id)
-    );
+  ): Promise<boolean> {
+    return canReadKnowledgeSearchResult(this.namespaces, result, user);
+  }
+
+  private async filterReadable(
+    results: KnowledgeSearchResult[],
+    user?: User
+  ): Promise<KnowledgeSearchResult[]> {
+    const readable: KnowledgeSearchResult[] = [];
+    for (const result of results) {
+      if (await this.canRead(result, user)) readable.push(result);
+    }
+    return readable;
   }
 
   private assertSupportedMode(query?: KnowledgeSearchQuery): void {
@@ -74,13 +83,19 @@ export class KnowledgeSearchService {
     }
   }
 
-  private scopedQuery(query: KnowledgeSearchQuery | undefined, user?: User): KnowledgeSearchQuery {
+  private async scopedQuery(
+    query: KnowledgeSearchQuery | undefined,
+    user?: User
+  ): Promise<KnowledgeSearchQuery> {
     this.assertSupportedMode(query);
-    const isAdmin = hasMinimumRole(user?.role, ROLES.ADMIN);
+    const isAdmin = isKnowledgeAdmin(user);
     const rawQuery = (query ?? {}) as KnowledgeSearchQuery & {
       includeMyDrafts?: boolean;
       includeOtherUserDrafts?: boolean;
     };
+    const readableNamespaceIds = isAdmin
+      ? undefined
+      : await this.namespaces.findReadableNamespaceIds(String(user?.user_id ?? ''));
     return {
       ...(query ?? {}),
       include_archived: isAdmin && rawQuery.include_archived === true,
@@ -89,6 +104,7 @@ export class KnowledgeSearchService {
         rawQuery.include_other_user_drafts ?? rawQuery.includeOtherUserDrafts ?? false,
       readable_as_admin: isAdmin,
       readable_by_user_id: user?.user_id,
+      readable_namespace_ids: readableNamespaceIds,
     };
   }
 
@@ -173,7 +189,7 @@ export class KnowledgeSearchService {
     );
     const vector = embeddingToPgvector(queryEmbedding.embedding);
     const limit = Math.min(Math.max(rawQuery.rerank_limit ?? rawQuery.limit ?? 25, 1), 100);
-    const isAdmin = hasMinimumRole(user?.role, ROLES.ADMIN);
+    const isAdmin = isKnowledgeAdmin(user);
     const normalizedPathPrefix = rawQuery.path_prefix?.trim()
       ? normalizeKnowledgeFolderPath(rawQuery.path_prefix)
       : '';
@@ -181,6 +197,18 @@ export class KnowledgeSearchService {
     const minSimilarity = this.parseMinSimilarity(rawQuery.min_similarity);
     const includeMyDrafts = rawQuery.include_my_drafts !== false;
     const includeOtherUserDrafts = rawQuery.include_other_user_drafts === true;
+    const readableNamespaceIds =
+      rawQuery.readable_namespace_ids ??
+      (isAdmin
+        ? undefined
+        : await this.namespaces.findReadableNamespaceIds(String(user?.user_id ?? '')));
+    if (readableNamespaceIds?.length === 0) return [];
+    const readableNamespaceFilter = readableNamespaceIds
+      ? sql`AND d.namespace_id IN (${sql.join(
+          readableNamespaceIds.map((id) => sql`${id}`),
+          sql`, `
+        )})`
+      : sql``;
 
     const baseUrl = await getBaseUrl();
     const result = await executeRaw(
@@ -209,6 +237,7 @@ export class KnowledgeSearchService {
           ns.repo_id AS namespace_repo_id,
           ns.branch_id AS namespace_branch_id,
           ns.visibility_default AS namespace_visibility_default,
+          ns.others_can AS namespace_others_can,
           ns.metadata AS namespace_metadata,
           ns.created_by AS namespace_created_by,
           ns.created_at AS namespace_created_at,
@@ -230,6 +259,8 @@ export class KnowledgeSearchService {
           AND sp.provider = ${provider}
           AND sp.model = ${model}
           AND sp.dimensions = ${dimensions}
+          ${readableNamespaceFilter}
+          AND (${rawQuery.namespace_id ?? null}::text IS NULL OR d.namespace_id = ${rawQuery.namespace_id ?? null})
           AND (${rawQuery.namespace_slug ?? null}::text IS NULL OR ns.slug = ${rawQuery.namespace_slug ?? null})
           AND (${pathPrefix}::text IS NULL OR d.path = ${pathPrefix} OR d.path LIKE (${pathPrefix} || '/%'))
           AND (${rawQuery.kind ?? null}::text IS NULL OR d.kind = ${rawQuery.kind ?? null})
@@ -303,6 +334,7 @@ export class KnowledgeSearchService {
           repo_id: (row.namespace_repo_id as never) ?? null,
           branch_id: (row.namespace_branch_id as never) ?? null,
           visibility_default: row.namespace_visibility_default as never,
+          others_can: row.namespace_others_can as never,
           metadata: (row.namespace_metadata as Record<string, unknown> | null) ?? null,
           created_by: (row.namespace_created_by as never) ?? null,
           created_at: new Date(row.namespace_created_at as string | number | Date),
@@ -319,8 +351,8 @@ export class KnowledgeSearchService {
         chunks: [chunk],
       });
     }
-    const values = [...byDoc.values()].slice(0, rawQuery.limit ?? 25);
-    return this.attachIndexingToResults(values, rawQuery);
+    const values = await this.filterReadable([...byDoc.values()], user);
+    return this.attachIndexingToResults(values.slice(0, rawQuery.limit ?? 25), rawQuery);
   }
 
   private hybridMerge(
@@ -346,11 +378,12 @@ export class KnowledgeSearchService {
 
   async find(params?: KnowledgeSearchParams) {
     const user = params?.user as User | undefined;
-    const query = this.scopedQuery(params?.query, user);
+    const query = await this.scopedQuery(params?.query, user);
     if ((query.mode ?? 'text') === 'semantic') return this.semanticSearch(query, user);
 
-    const textResults = (await this.repo.search({ ...query, mode: 'text' })).filter((result) =>
-      this.canRead(result, user)
+    const textResults = await this.filterReadable(
+      await this.repo.search({ ...query, mode: 'text' }),
+      user
     );
     const textResultsWithIndexing = await this.attachIndexingToResults(textResults, query);
     if (query.mode === 'hybrid') {
@@ -362,11 +395,12 @@ export class KnowledgeSearchService {
 
   async create(data: KnowledgeSearchQuery, params?: KnowledgeSearchParams) {
     const user = params?.user as User | undefined;
-    const query = this.scopedQuery(data, user);
+    const query = await this.scopedQuery(data, user);
     if ((query.mode ?? 'text') === 'semantic') return this.semanticSearch(query, user);
 
-    const textResults = (await this.repo.search({ ...query, mode: 'text' })).filter((result) =>
-      this.canRead(result, user)
+    const textResults = await this.filterReadable(
+      await this.repo.search({ ...query, mode: 'text' }),
+      user
     );
     const textResultsWithIndexing = await this.attachIndexingToResults(textResults, query);
     if (query.mode === 'hybrid') {

@@ -12,15 +12,14 @@ import {
 import { BadRequest, Forbidden } from '@agor/core/feathers';
 import {
   type AuthenticatedParams,
-  hasMinimumRole,
   type KnowledgeDocument,
   type KnowledgeDocumentVersion,
   parseKnowledgeUri,
   type QueryParams,
-  ROLES,
   type User,
 } from '@agor/core/types';
 import { DrizzleService } from '../adapters/drizzle';
+import { canReadKnowledgeDocument } from './knowledge-access.js';
 
 export type KnowledgeVersionParams = QueryParams<{
   document_id?: string;
@@ -58,12 +57,8 @@ export class KnowledgeVersionsService extends DrizzleService<
     this.namespaces = new KnowledgeNamespaceRepository(db);
   }
 
-  private canRead(document: KnowledgeDocument, user?: User): boolean {
-    return (
-      document.visibility === 'public' ||
-      hasMinimumRole(user?.role, ROLES.ADMIN) ||
-      Boolean(user?.user_id && document.created_by === user.user_id)
-    );
+  private async canRead(document: KnowledgeDocument, user?: User): Promise<boolean> {
+    return canReadKnowledgeDocument(this.namespaces, document, user);
   }
 
   async find(params?: KnowledgeVersionParams) {
@@ -85,7 +80,7 @@ export class KnowledgeVersionsService extends DrizzleService<
     if (document.archived) return [];
     const namespace = await this.namespaces.findById(document.namespace_id);
     if (!namespace || namespace.archived) return [];
-    if (!this.canRead(document, params?.user as User | undefined)) {
+    if (!(await this.canRead(document, params?.user as User | undefined))) {
       throw new Forbidden('You do not have permission to view this knowledge document history');
     }
 

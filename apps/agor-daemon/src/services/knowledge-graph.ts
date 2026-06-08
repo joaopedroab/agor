@@ -24,12 +24,17 @@ import type {
   UserID,
 } from '@agor/core/types';
 import {
-  hasMinimumRole,
   KNOWLEDGE_DOCUMENT_URI_PREFIX,
   KNOWLEDGE_UNIT_URI_PREFIX,
   parseKnowledgeUri,
-  ROLES,
 } from '@agor/core/types';
+import {
+  canReadKnowledgeDocument,
+  canWriteKnowledgeDocument,
+  hasKnowledgeNamespacePermission,
+  isKnowledgeAdmin,
+  resolveKnowledgeNamespacePermission,
+} from './knowledge-access.js';
 
 /** Query for the namespace-wide graph view (whole-namespace document graph). */
 export interface KnowledgeNamespaceGraphRequest {
@@ -92,6 +97,11 @@ export class KnowledgeGraphService {
       return { namespace_id: null, nodes: [], edges: [] };
     }
 
+    const namespacePermission = await this.namespacePermission(namespace.namespace_id, user);
+    if (!hasKnowledgeNamespacePermission(namespacePermission, 'read')) {
+      return { namespace_id: null, nodes: [], edges: [] };
+    }
+
     const docs = await this.documents.findAll({
       namespace_id: namespace.namespace_id,
       include_my_drafts: request.include_my_drafts ?? request.includeMyDrafts ?? true,
@@ -99,7 +109,10 @@ export class KnowledgeGraphService {
         request.include_other_user_drafts ?? request.includeOtherUserDrafts ?? false,
       draft_filter_user_id: user?.user_id as UserID | undefined,
     });
-    const readable = docs.filter((doc) => this.canRead(doc, user));
+    const readable: KnowledgeDocument[] = [];
+    for (const doc of docs) {
+      if (await this.canRead(doc, user)) readable.push(doc);
+    }
     const readableIds = new Set<string>(readable.map((doc) => doc.document_id));
 
     const nodes: KnowledgeGraphDocNode[] = readable.map((doc) => ({
@@ -123,26 +136,18 @@ export class KnowledgeGraphService {
     return { namespace_id: namespace.namespace_id, nodes, edges };
   }
 
-  private isAdmin(user?: User): boolean {
-    return hasMinimumRole(user?.role, ROLES.ADMIN);
+  private async namespacePermission(namespaceId: string, user?: User) {
+    return resolveKnowledgeNamespacePermission(this.namespaces, namespaceId, user);
   }
 
-  private canRead(document: KnowledgeDocument, user?: User): boolean {
-    return (
-      !document.archived &&
-      (document.visibility === 'public' ||
-        this.isAdmin(user) ||
-        Boolean(user?.user_id && document.created_by === user.user_id))
-    );
+  private async canRead(document: KnowledgeDocument, user?: User): Promise<boolean> {
+    if (document.archived) return false;
+    return canReadKnowledgeDocument(this.namespaces, document, user);
   }
 
-  private canWrite(document: KnowledgeDocument, user?: User): boolean {
-    return (
-      !document.archived &&
-      (this.isAdmin(user) ||
-        Boolean(user?.user_id && document.created_by === user.user_id) ||
-        (document.visibility === 'public' && document.edit_policy === 'public'))
-    );
+  private async canWrite(document: KnowledgeDocument, user?: User): Promise<boolean> {
+    if (document.archived) return false;
+    return canWriteKnowledgeDocument(this.namespaces, document, user);
   }
 
   private async activeDocument(
@@ -233,7 +238,7 @@ export class KnowledgeGraphService {
       throw new NotFound('Knowledge document not found');
     }
     if (!document) return;
-    if (!this.canWrite(document, user)) {
+    if (!(await this.canWrite(document, user))) {
       throw new Forbidden('You do not have permission to link this knowledge document');
     }
   }
@@ -260,7 +265,7 @@ export class KnowledgeGraphService {
 
   private attributionUserId(params?: KnowledgeGraphParams, requestedUserId?: UserID | null) {
     const user = params?.user as User | undefined;
-    if (this.isAdmin(user) && requestedUserId) return requestedUserId;
+    if (isKnowledgeAdmin(user) && requestedUserId) return requestedUserId;
     return (user?.user_id as UserID | undefined) ?? null;
   }
 

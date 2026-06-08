@@ -5,6 +5,7 @@ import { __resetConfigCacheForTests, type AgorConfig, saveConfig } from '@agor/c
 import type { Database } from '@agor/core/db';
 import {
   eq,
+  GroupRepository,
   generateId,
   KnowledgeDocumentRepository,
   KnowledgeNamespaceRepository,
@@ -21,6 +22,7 @@ import { KnowledgeDocumentsService } from './knowledge-documents';
 import { KnowledgeEmbeddingIndexer } from './knowledge-embedding-indexer';
 import { KnowledgeGraphService } from './knowledge-graph';
 import { KnowledgeIndexingStatusService } from './knowledge-indexing';
+import { KnowledgeNamespacesService } from './knowledge-namespaces';
 import { KnowledgeReindexService } from './knowledge-reindex';
 import { KnowledgeSearchService } from './knowledge-search';
 import { KnowledgeSettingsService } from './knowledge-settings';
@@ -86,6 +88,255 @@ async function withTempConfig<T>(config: AgorConfig, run: () => Promise<T>): Pro
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 }
+
+describe('KnowledgeNamespacesService permissions', () => {
+  dbTest('saves namespace fields and ACL draft through one service method', async ({ db }) => {
+    const owner = await seedUser(db, 'owner');
+    const other = await seedUser(db, 'other');
+    const service = new KnowledgeNamespacesService(db);
+
+    const created = await service.saveWithAcl(
+      {
+        namespace: {
+          slug: 'atomic-acl',
+          display_name: 'Atomic ACL',
+          others_can: 'none',
+        },
+        acl: [
+          {
+            subject_type: 'user',
+            subject_id: other.user_id,
+            permission: 'read',
+          },
+        ],
+      },
+      params(owner)
+    );
+
+    expect(created.namespace.display_name).toBe('Atomic ACL');
+    expect(created.acl).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          subject_type: 'user',
+          subject_id: owner.user_id,
+          permission: 'own',
+        }),
+        expect.objectContaining({
+          subject_type: 'user',
+          subject_id: other.user_id,
+          permission: 'read',
+        }),
+      ])
+    );
+
+    const updated = await service.saveWithAcl(
+      {
+        namespace_id: created.namespace.namespace_id,
+        namespace: {
+          display_name: 'Updated ACL',
+          slug: created.namespace.slug,
+          others_can: 'read',
+        },
+        acl: [
+          {
+            subject_type: 'user',
+            subject_id: other.user_id,
+            permission: 'write',
+          },
+        ],
+      },
+      params(owner)
+    );
+
+    expect(updated.namespace.display_name).toBe('Updated ACL');
+    expect(updated.namespace.others_can).toBe('read');
+    expect(updated.acl).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          subject_type: 'user',
+          subject_id: owner.user_id,
+          permission: 'own',
+        }),
+        expect.objectContaining({
+          subject_type: 'user',
+          subject_id: other.user_id,
+          permission: 'write',
+        }),
+      ])
+    );
+  });
+
+  dbTest('reports effective permissions when listing readable namespaces', async ({ db }) => {
+    const owner = await seedUser(db, 'owner');
+    const reader = await seedUser(db, 'reader');
+    const namespaces = new KnowledgeNamespaceRepository(db);
+    const readable = await namespaces.create({
+      slug: 'list-readable',
+      display_name: 'List Readable',
+      others_can: 'none',
+      owner_user_id: owner.user_id as UserID,
+    });
+    await namespaces.upsertNamespaceAclEntry({
+      namespace_id: readable.namespace_id,
+      subject_type: 'user',
+      subject_id: reader.user_id,
+      permission: 'read',
+    });
+
+    const service = new KnowledgeNamespacesService(db);
+    await expect(service.find(params(reader))).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          namespace_id: readable.namespace_id,
+          effective_permission: 'read',
+        }),
+      ])
+    );
+    await expect(service.find(params(owner))).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          namespace_id: readable.namespace_id,
+          effective_permission: 'own',
+        }),
+      ])
+    );
+    await expect(service.get(readable.namespace_id, params(reader))).resolves.toMatchObject({
+      namespace_id: readable.namespace_id,
+      effective_permission: 'read',
+    });
+  });
+
+  dbTest('prevents ACL methods from removing the caller last owner path', async ({ db }) => {
+    const owner = await seedUser(db, 'owner');
+    const service = new KnowledgeNamespacesService(db);
+    const namespaces = new KnowledgeNamespaceRepository(db);
+    const namespace = await namespaces.create({
+      slug: 'no-self-lock',
+      display_name: 'No Self Lock',
+      others_can: 'none',
+      owner_user_id: null,
+    });
+    await namespaces.upsertNamespaceAclEntry({
+      namespace_id: namespace.namespace_id,
+      subject_type: 'user',
+      subject_id: owner.user_id,
+      permission: 'own',
+    });
+
+    await expect(
+      service.setAcl(
+        {
+          namespace_id: namespace.namespace_id,
+          subject_type: 'user',
+          subject_id: owner.user_id,
+          permission: 'write',
+        },
+        params(owner)
+      )
+    ).rejects.toBeInstanceOf(BadRequest);
+    await expect(
+      service.removeAcl(
+        {
+          namespace_id: namespace.namespace_id,
+          subject_type: 'user',
+          subject_id: owner.user_id,
+        },
+        params(owner)
+      )
+    ).rejects.toBeInstanceOf(BadRequest);
+  });
+
+  dbTest(
+    'prevents owner_user_id changes from removing the caller last owner path',
+    async ({ db }) => {
+      const owner = await seedUser(db, 'owner');
+      const replacement = await seedUser(db, 'replacement');
+      const service = new KnowledgeNamespacesService(db);
+      const namespaces = new KnowledgeNamespaceRepository(db);
+      const namespace = await namespaces.create({
+        slug: 'owner-user-self-lock',
+        display_name: 'Owner User Self Lock',
+        others_can: 'none',
+        owner_user_id: owner.user_id as UserID,
+      });
+
+      await expect(
+        service.patch(
+          namespace.namespace_id,
+          { owner_user_id: replacement.user_id as UserID },
+          params(owner)
+        )
+      ).rejects.toBeInstanceOf(BadRequest);
+
+      await namespaces.upsertNamespaceAclEntry({
+        namespace_id: namespace.namespace_id,
+        subject_type: 'user',
+        subject_id: owner.user_id,
+        permission: 'own',
+      });
+      await expect(
+        service.patch(
+          namespace.namespace_id,
+          { owner_user_id: replacement.user_id as UserID },
+          params(owner)
+        )
+      ).resolves.toMatchObject({ owner_user_id: replacement.user_id });
+    }
+  );
+
+  dbTest(
+    'allows ACL owner changes when the caller keeps owner access through a group',
+    async ({ db }) => {
+      const owner = await seedUser(db, 'owner');
+      const service = new KnowledgeNamespacesService(db);
+      const namespaces = new KnowledgeNamespaceRepository(db);
+      const groups = new GroupRepository(db);
+      const group = await groups.create({ name: 'Namespace Owners', slug: 'namespace-owners' });
+      await groups.addMember(group.group_id, owner.user_id);
+      const namespace = await namespaces.create({
+        slug: 'group-owned-acl',
+        display_name: 'Group Owned ACL',
+        others_can: 'none',
+        owner_user_id: null,
+      });
+      await namespaces.upsertNamespaceAclEntry({
+        namespace_id: namespace.namespace_id,
+        subject_type: 'user',
+        subject_id: owner.user_id,
+        permission: 'own',
+      });
+      await namespaces.upsertNamespaceAclEntry({
+        namespace_id: namespace.namespace_id,
+        subject_type: 'group',
+        subject_id: group.group_id,
+        permission: 'own',
+      });
+
+      await expect(
+        service.setAcl(
+          {
+            namespace_id: namespace.namespace_id,
+            subject_type: 'user',
+            subject_id: owner.user_id,
+            permission: 'read',
+          },
+          params(owner)
+        )
+      ).resolves.toMatchObject({ permission: 'read' });
+      await expect(
+        service.listAcl({ namespace_id: namespace.namespace_id }, params(owner))
+      ).resolves.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            subject_type: 'group',
+            subject_id: group.group_id,
+            permission: 'own',
+          }),
+        ])
+      );
+    }
+  );
+});
 
 describe('KnowledgeDocumentsService permissions', () => {
   dbTest(
@@ -218,6 +469,180 @@ describe('KnowledgeDocumentsService permissions', () => {
       expect(recreated.document_id).not.toBe(created.document_id);
     }
   );
+
+  dbTest('enforces namespace read/write as outer gate for documents', async ({ db }) => {
+    const owner = await seedUser(db, 'owner');
+    const other = await seedUser(db, 'other');
+    const namespaces = new KnowledgeNamespaceRepository(db);
+    const namespace = await namespaces.create({
+      slug: 'namespace-gated-docs',
+      display_name: 'Namespace Gated Docs',
+      owner_user_id: owner.user_id as UserID,
+      others_can: 'none',
+    });
+    const service = new KnowledgeDocumentsService(db);
+    const doc = await service.create(
+      {
+        namespace_id: namespace.namespace_id,
+        path: 'shared.md',
+        title: 'Shared',
+        visibility: 'public',
+        edit_policy: 'public',
+        content_text: 'v1',
+      },
+      params(owner)
+    );
+
+    await expect(service.get(doc.document_id, params(other))).rejects.toBeInstanceOf(Forbidden);
+
+    await namespaces.upsertNamespaceAclEntry({
+      namespace_id: namespace.namespace_id,
+      subject_type: 'user',
+      subject_id: other.user_id,
+      permission: 'read',
+    });
+    await expect(service.get(doc.document_id, params(other))).resolves.toMatchObject({
+      document_id: doc.document_id,
+    });
+    await expect(
+      service.patch(doc.document_id, { content_text: 'v2' }, params(other))
+    ).rejects.toBeInstanceOf(Forbidden);
+
+    await namespaces.upsertNamespaceAclEntry({
+      namespace_id: namespace.namespace_id,
+      subject_type: 'user',
+      subject_id: other.user_id,
+      permission: 'write',
+    });
+    await expect(
+      service.patch(doc.document_id, { content_text: 'v2' }, params(other))
+    ).resolves.toMatchObject({ document_id: doc.document_id });
+  });
+
+  dbTest('enforces group namespace grants through document services', async ({ db }) => {
+    const owner = await seedUser(db, 'owner');
+    const groupMember = await seedUser(db, 'group-member');
+    const groups = new GroupRepository(db);
+    const group = await groups.create({ name: 'KB Editors', slug: 'kb-editors' });
+    await groups.addMember(group.group_id, groupMember.user_id);
+    const namespaces = new KnowledgeNamespaceRepository(db);
+    const namespace = await namespaces.create({
+      slug: 'group-gated-docs',
+      display_name: 'Group Gated Docs',
+      owner_user_id: owner.user_id as UserID,
+      others_can: 'none',
+    });
+    const service = new KnowledgeDocumentsService(db);
+    const doc = await service.create(
+      {
+        namespace_id: namespace.namespace_id,
+        path: 'group.md',
+        title: 'Group',
+        visibility: 'public',
+        edit_policy: 'public',
+        content_text: 'v1',
+      },
+      params(owner)
+    );
+
+    await expect(service.get(doc.document_id, params(groupMember))).rejects.toBeInstanceOf(
+      Forbidden
+    );
+
+    await namespaces.upsertNamespaceAclEntry({
+      namespace_id: namespace.namespace_id,
+      subject_type: 'group',
+      subject_id: group.group_id,
+      permission: 'write',
+    });
+
+    await expect(service.get(doc.document_id, params(groupMember))).resolves.toMatchObject({
+      document_id: doc.document_id,
+    });
+    await expect(
+      service.patch(doc.document_id, { content_text: 'v2' }, params(groupMember))
+    ).resolves.toMatchObject({ document_id: doc.document_id });
+  });
+
+  dbTest('filters search results by readable namespaces', async ({ db }) => {
+    const owner = await seedUser(db, 'owner');
+    const other = await seedUser(db, 'other');
+    const namespaces = new KnowledgeNamespaceRepository(db);
+    const openNamespace = await namespaces.create({
+      slug: 'search-open-namespace',
+      display_name: 'Search Open Namespace',
+      others_can: 'read',
+    });
+    const closedNamespace = await namespaces.create({
+      slug: 'search-closed-namespace',
+      display_name: 'Search Closed Namespace',
+      owner_user_id: owner.user_id as UserID,
+      others_can: 'none',
+    });
+    const documents = new KnowledgeDocumentRepository(db);
+    await documents.create({
+      namespace_id: openNamespace.namespace_id,
+      path: 'open.md',
+      title: 'Open',
+      visibility: 'public',
+      content_text: 'namespaceneedle open',
+      created_by: owner.user_id as UserID,
+    });
+    await documents.create({
+      namespace_id: closedNamespace.namespace_id,
+      path: 'closed.md',
+      title: 'Closed',
+      visibility: 'public',
+      content_text: 'namespaceneedle closed',
+      created_by: owner.user_id as UserID,
+    });
+
+    const search = new KnowledgeSearchService(db);
+    const results = await search.create({ q: 'namespaceneedle' }, params(other));
+    expect(results.map((result) => result.namespace.slug)).toEqual(['search-open-namespace']);
+  });
+
+  dbTest('filters text search by readable namespaces before applying row cap', async ({ db }) => {
+    const owner = await seedUser(db, 'owner');
+    const other = await seedUser(db, 'other');
+    const namespaces = new KnowledgeNamespaceRepository(db);
+    const openNamespace = await namespaces.create({
+      slug: 'search-starvation-open',
+      display_name: 'Search Starvation Open',
+      others_can: 'read',
+    });
+    const closedNamespace = await namespaces.create({
+      slug: 'search-starvation-closed',
+      display_name: 'Search Starvation Closed',
+      owner_user_id: owner.user_id as UserID,
+      others_can: 'none',
+    });
+    const documents = new KnowledgeDocumentRepository(db);
+    await documents.create({
+      namespace_id: openNamespace.namespace_id,
+      path: 'open-starvation.md',
+      title: 'Open Starvation',
+      visibility: 'public',
+      content_text: 'starvationneedle readable',
+      created_by: owner.user_id as UserID,
+      updated_at: new Date('2026-01-01T00:00:00.000Z'),
+    });
+    for (let index = 0; index < 120; index += 1) {
+      await documents.create({
+        namespace_id: closedNamespace.namespace_id,
+        path: `closed-${index}.md`,
+        title: `Closed ${index}`,
+        visibility: 'public',
+        content_text: `starvationneedle closed ${index}`,
+        created_by: owner.user_id as UserID,
+        updated_at: new Date(Date.UTC(2026, 0, 2, 0, 0, index)),
+      });
+    }
+
+    const search = new KnowledgeSearchService(db);
+    const results = await search.create({ q: 'starvationneedle', limit: 10 }, params(other));
+    expect(results.map((result) => result.namespace.slug)).toEqual(['search-starvation-open']);
+  });
 });
 
 describe('Knowledge semantic indexing lifecycle', () => {
@@ -492,6 +917,44 @@ describe('KnowledgeSearchService and KnowledgeVersionsService permissions', () =
       expect(await versions.find(params(owner, { document_id: doc.document_id }))).toEqual([]);
     }
   );
+
+  dbTest(
+    'requires namespace read for version history even when document is public',
+    async ({ db }) => {
+      const owner = await seedUser(db, 'owner');
+      const other = await seedUser(db, 'other');
+      const namespaces = new KnowledgeNamespaceRepository(db);
+      const namespace = await namespaces.create({
+        slug: 'history-closed-namespace',
+        display_name: 'History Closed Namespace',
+        owner_user_id: owner.user_id as UserID,
+        others_can: 'none',
+      });
+      const doc = await new KnowledgeDocumentRepository(db).create({
+        namespace_id: namespace.namespace_id,
+        path: 'history.md',
+        title: 'History',
+        visibility: 'public',
+        content_text: 'history body',
+        created_by: owner.user_id as UserID,
+      });
+      const versions = new KnowledgeVersionsService(db);
+
+      await expect(
+        versions.find(params(other, { document_id: doc.document_id }))
+      ).rejects.toBeInstanceOf(Forbidden);
+
+      await namespaces.upsertNamespaceAclEntry({
+        namespace_id: namespace.namespace_id,
+        subject_type: 'user',
+        subject_id: other.user_id,
+        permission: 'read',
+      });
+      await expect(
+        versions.find(params(other, { document_id: doc.document_id }))
+      ).resolves.toHaveLength(1);
+    }
+  );
 });
 
 describe('KnowledgeGraphService permissions', () => {
@@ -542,6 +1005,75 @@ describe('KnowledgeGraphService permissions', () => {
         params(other)
       )
     ).rejects.toBeInstanceOf(Forbidden);
+  });
+
+  dbTest('requires namespace read/write for graph reads and links', async ({ db }) => {
+    const owner = await seedUser(db, 'owner');
+    const other = await seedUser(db, 'other');
+    const namespaces = new KnowledgeNamespaceRepository(db);
+    const namespace = await namespaces.create({
+      slug: 'graph-closed-namespace',
+      display_name: 'Graph Closed Namespace',
+      owner_user_id: owner.user_id as UserID,
+      others_can: 'none',
+    });
+    const doc = await new KnowledgeDocumentRepository(db).create({
+      namespace_id: namespace.namespace_id,
+      path: 'graph.md',
+      title: 'Graph',
+      visibility: 'public',
+      edit_policy: 'public',
+      content_text: 'graph body',
+      created_by: owner.user_id as UserID,
+    });
+    const graph = new KnowledgeGraphService(db);
+
+    expect(
+      await graph.namespaceGraph({ namespace_id: namespace.namespace_id }, params(other))
+    ).toEqual({
+      namespace_id: null,
+      nodes: [],
+      edges: [],
+    });
+
+    await namespaces.upsertNamespaceAclEntry({
+      namespace_id: namespace.namespace_id,
+      subject_type: 'user',
+      subject_id: other.user_id,
+      permission: 'read',
+    });
+    const readableGraph = await graph.namespaceGraph(
+      { namespace_id: namespace.namespace_id },
+      params(other)
+    );
+    expect(readableGraph.nodes.map((node) => node.document_id)).toEqual([doc.document_id]);
+    await expect(
+      graph.link(
+        {
+          source: { documentId: doc.document_id },
+          target: { externalUri: 'https://example.com/no-write', label: 'No write' },
+          edge_type: 'references',
+        },
+        params(other)
+      )
+    ).rejects.toBeInstanceOf(Forbidden);
+
+    await namespaces.upsertNamespaceAclEntry({
+      namespace_id: namespace.namespace_id,
+      subject_type: 'user',
+      subject_id: other.user_id,
+      permission: 'write',
+    });
+    await expect(
+      graph.link(
+        {
+          source: { documentId: doc.document_id },
+          target: { externalUri: 'https://example.com/write', label: 'Write' },
+          edge_type: 'references',
+        },
+        params(other)
+      )
+    ).resolves.toMatchObject({ edge_type: 'references' });
   });
 
   dbTest('filters unreadable private neighbors from public graph queries', async ({ db }) => {

@@ -1,5 +1,5 @@
 import type { Database } from '@agor/core/db';
-import { KnowledgeDocumentVersionRepository } from '@agor/core/db';
+import { KnowledgeDocumentVersionRepository, KnowledgeNamespaceRepository } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
 import { BadRequest, Forbidden, NotFound } from '@agor/core/feathers';
 import { applyKnowledgeEditOps, KnowledgeEditError } from '@agor/core/knowledge';
@@ -12,8 +12,8 @@ import type {
   KnowledgeVersionToken,
   User,
 } from '@agor/core/types';
-import { hasMinimumRole, ROLES } from '@agor/core/types';
 import { createTwoFilesPatch, structuredPatch } from 'diff';
+import { canWriteKnowledgeDocument } from './knowledge-access.js';
 import type { KnowledgeDocumentParams, KnowledgeDocumentsService } from './knowledge-documents.js';
 
 interface KnowledgeDocumentEditInput {
@@ -48,14 +48,6 @@ function versionToToken(version: KnowledgeDocumentVersion): KnowledgeVersionToke
   };
 }
 
-function ensureCanEdit(document: KnowledgeDocument, user: User | undefined) {
-  const isAdmin = hasMinimumRole(user?.role, ROLES.ADMIN);
-  const isOwner = Boolean(user?.user_id && document.created_by === user.user_id);
-  const publicEditable = document.visibility === 'public' && document.edit_policy === 'public';
-  if (isAdmin || isOwner || publicEditable) return;
-  throw new Forbidden('You do not have permission to edit this knowledge document');
-}
-
 function extractChangedRanges(
   baseContent: string,
   updatedContent: string
@@ -80,8 +72,14 @@ export class KnowledgeDocumentEditsService {
   constructor(
     db: Database,
     private readonly documentsService: KnowledgeDocumentsService,
-    private readonly versionRepo = new KnowledgeDocumentVersionRepository(db)
+    private readonly versionRepo = new KnowledgeDocumentVersionRepository(db),
+    private readonly namespaceRepo = new KnowledgeNamespaceRepository(db)
   ) {}
+
+  private async ensureCanEdit(document: KnowledgeDocument, user: User | undefined) {
+    if (await canWriteKnowledgeDocument(this.namespaceRepo, document, user)) return;
+    throw new Forbidden('You do not have permission to edit this knowledge document');
+  }
 
   async create(
     data: KnowledgeDocumentEditInput,
@@ -117,7 +115,7 @@ export class KnowledgeDocumentEditsService {
     }
 
     const document = documentResult.document;
-    ensureCanEdit(document, params?.user as User | undefined);
+    await this.ensureCanEdit(document, params?.user as User | undefined);
 
     const currentVersion = documentResult.current_version;
     if (!currentVersion) {
