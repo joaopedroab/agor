@@ -16,10 +16,12 @@ import {
   WarningOutlined,
 } from '@ant-design/icons';
 import { Button, Spin, Tooltip, theme } from 'antd';
+import { Link } from 'react-router-dom';
 import { useConfirmNukeEnvironment } from '../../hooks/useConfirmNukeEnvironment';
 import { getEffectiveEnv } from '../../utils/environmentConfig';
 import { getEnvironmentState } from '../../utils/environmentState';
 import type { BranchModalTab } from '../BranchModal/BranchModal';
+import { ENTITY_PILL_COLORS } from '../Pill/Pill';
 import { Tag } from '../Tag';
 
 interface BranchHeaderPillProps {
@@ -35,6 +37,8 @@ interface BranchHeaderPillProps {
   connectionDisabled?: boolean;
   /** Show environment status/controls and environment shortcut. Defaults to true. */
   showEnvButtons?: boolean;
+  /** Optional link for the branch identity area. Used by session surfaces for deep links. */
+  identityLink?: string | null;
   /**
    * Compact rendering for constrained side panels.
    * Hides the repo slug in the identity section and omits destructive environment actions.
@@ -63,6 +67,7 @@ export function BranchHeaderPill({
   canControlEnvironment,
   connectionDisabled = false,
   showEnvButtons = true,
+  identityLink,
   compact = false,
 }: BranchHeaderPillProps) {
   const { token } = theme.useToken();
@@ -110,6 +115,32 @@ export function BranchHeaderPill({
   const openModal = () => {
     onOpenBranch?.(branch.branch_id);
   };
+
+  const identityContent = (
+    <>
+      <BranchesOutlined style={{ fontSize: 12 }} />
+      {!compact && (
+        <>
+          <span style={{ fontFamily: token.fontFamilyCode, fontSize: token.fontSizeSM }}>
+            {repo.slug}
+          </span>
+          <ApartmentOutlined style={{ fontSize: 10, opacity: 0.6 }} />
+        </>
+      )}
+      <span
+        style={{
+          fontFamily: token.fontFamilyCode,
+          fontSize: token.fontSizeSM,
+          maxWidth: compact ? 220 : 180,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {branch.name}
+      </span>
+    </>
+  );
 
   // --- Environment status helpers ---
 
@@ -160,15 +191,28 @@ export function BranchHeaderPill({
     }
   };
 
-  const identityTooltip = compact
-    ? `${repo.slug} / ${branch.name} · Open branch settings`
-    : 'Open branch settings';
+  const identityTooltip = identityLink
+    ? `${repo.slug} / ${branch.name} · Open session`
+    : compact
+      ? `${repo.slug} / ${branch.name} · Open branch settings`
+      : 'Open branch settings';
+  const identityLinkStyle: React.CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    padding: compact ? '0 6px' : '0 8px',
+    cursor: 'pointer',
+    height: PILL_HEIGHT,
+    color: 'inherit',
+    textDecoration: 'none',
+  };
+  const isInternalIdentityLink = identityLink?.startsWith('/');
 
   // --- Render ---
 
   return (
     <Tag
-      color="cyan"
+      color={ENTITY_PILL_COLORS.branch}
       style={{
         userSelect: 'none',
         padding: 0,
@@ -179,46 +223,36 @@ export function BranchHeaderPill({
         cursor: 'default',
       }}
     >
-      {/* Section 1: Repo + Branch — click opens modal (General tab) */}
+      {/* Section 1: Repo + Branch — click opens either the supplied identity URL or the branch modal. */}
       <Tooltip title={identityTooltip}>
-        <button
-          type="button"
-          onClick={openModal}
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 4,
-            padding: compact ? '0 6px' : '0 8px',
-            cursor: 'pointer',
-            height: PILL_HEIGHT,
-            background: 'none',
-            border: 'none',
-            color: 'inherit',
-            font: 'inherit',
-          }}
-        >
-          <BranchesOutlined style={{ fontSize: 12 }} />
-          {!compact && (
-            <>
-              <span style={{ fontFamily: token.fontFamilyCode, fontSize: token.fontSizeSM }}>
-                {repo.slug}
-              </span>
-              <ApartmentOutlined style={{ fontSize: 10, opacity: 0.6 }} />
-            </>
-          )}
-          <span
+        {identityLink && isInternalIdentityLink ? (
+          <Link to={identityLink} onClick={(e) => e.stopPropagation()} style={identityLinkStyle}>
+            {identityContent}
+          </Link>
+        ) : identityLink ? (
+          <a href={identityLink} onClick={(e) => e.stopPropagation()} style={identityLinkStyle}>
+            {identityContent}
+          </a>
+        ) : (
+          <button
+            type="button"
+            onClick={openModal}
             style={{
-              fontFamily: token.fontFamilyCode,
-              fontSize: token.fontSizeSM,
-              maxWidth: compact ? 220 : 180,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              padding: compact ? '0 6px' : '0 8px',
+              cursor: 'pointer',
+              height: PILL_HEIGHT,
+              background: 'none',
+              border: 'none',
+              color: 'inherit',
+              font: 'inherit',
             }}
           >
-            {branch.name}
-          </span>
-        </button>
+            {identityContent}
+          </button>
+        )}
       </Tooltip>
 
       {/* Section 2: Environment status + controls */}

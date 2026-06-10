@@ -22,6 +22,8 @@ import {
   SlackOutlined,
   ThunderboltOutlined,
   ToolOutlined,
+  UnorderedListOutlined,
+  UserOutlined,
 } from '@ant-design/icons';
 import { Badge, Collapse, Popover, Tooltip, theme } from 'antd';
 import type React from 'react';
@@ -33,8 +35,26 @@ import { Tag } from '../Tag';
 import { getUrlDisplayLabel, isGitHubUrl, type UrlDisplayRepo } from './url-helpers';
 
 /**
- * Standardized color palette for pills/badges
- * Using subset of Ant Design preset colors for consistency
+ * Object/entity colors for clickable identity pills.
+ *
+ * Keep these distinct from status colors below: object colors answer
+ * "what kind of thing is this?", while status colors answer "what state is it in?".
+ * Values are Ant Design preset colors.
+ */
+export const ENTITY_PILL_COLORS = {
+  branch: 'cyan',
+  session: 'default',
+  board: 'blue',
+  assistant: 'geekblue',
+  mcp: 'purple',
+  user: 'orange',
+  artifact: 'gold',
+  repo: 'default',
+} as const;
+
+/**
+ * Standardized color palette for pills/badges.
+ * Using subset of Ant Design preset colors for consistency.
  */
 export const PILL_COLORS = {
   // Metadata (grayscale - subtle, informational only)
@@ -43,7 +63,7 @@ export const PILL_COLORS = {
   token: 'default', // Token usage
   model: 'default', // Model ID
   git: 'default', // Git info (clean state)
-  session: 'default', // Session IDs
+  session: ENTITY_PILL_COLORS.session, // Session IDs
 
   // Status (colored - actionable/warnings)
   success: 'green', // Completed/success
@@ -58,7 +78,7 @@ export const PILL_COLORS = {
   // Features
   report: 'green', // Has report
   concept: 'geekblue', // Loaded concepts
-  branch: 'blue', // Managed branch
+  branch: ENTITY_PILL_COLORS.branch, // Managed branch
 } as const;
 
 interface BasePillProps {
@@ -81,7 +101,7 @@ interface PillProps {
   icon?: React.ReactNode;
   color?: string;
   children: React.ReactNode;
-  onClick?: (e: React.MouseEvent) => void;
+  onClick?: (e: EntityPillInteractionEvent) => void;
   tooltip?: string;
 }
 
@@ -834,48 +854,248 @@ export const DirtyStatePill: React.FC<DirtyStatePillProps> = ({ style }) => {
   );
 };
 
+type EntityPillInteractionEvent =
+  | React.MouseEvent<HTMLSpanElement>
+  | React.KeyboardEvent<HTMLSpanElement>;
+
+interface EntityPillProps extends BasePillProps {
+  icon?: React.ReactNode;
+  color: string;
+  label?: React.ReactNode;
+  emoji?: string | null;
+  compact?: boolean;
+  title?: string;
+  onClick?: (e: EntityPillInteractionEvent) => void;
+  maxWidth?: number;
+  code?: boolean;
+  ariaLabel?: string;
+  'aria-label'?: string;
+}
+
+export const EntityPill: React.FC<EntityPillProps> = ({
+  icon,
+  color,
+  label,
+  emoji,
+  compact = false,
+  title,
+  onClick,
+  maxWidth = 220,
+  code = false,
+  ariaLabel,
+  'aria-label': ariaLabelProp,
+  style,
+}) => {
+  const { token } = theme.useToken();
+  const hasLabel = label !== undefined && label !== null && label !== '';
+  const interactive = Boolean(onClick);
+  const resolvedAriaLabel = ariaLabelProp ?? ariaLabel;
+
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLSpanElement>) => {
+    if (!onClick || (event.key !== 'Enter' && event.key !== ' ')) return;
+    event.preventDefault();
+    onClick(event);
+  };
+
+  return (
+    <Tag
+      icon={icon}
+      color={color}
+      title={title}
+      aria-label={resolvedAriaLabel}
+      role={interactive ? 'button' : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      onKeyDown={handleKeyDown}
+      style={{
+        maxWidth: compact ? '100%' : undefined,
+        marginInlineEnd: compact ? 0 : undefined,
+        cursor: interactive ? 'pointer' : 'default',
+        ...style,
+      }}
+      onClick={onClick}
+    >
+      {hasLabel && (
+        <span
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: emoji ? 4 : undefined,
+            maxWidth: compact ? maxWidth : undefined,
+            overflow: compact ? 'hidden' : undefined,
+            textOverflow: compact ? 'ellipsis' : undefined,
+            whiteSpace: compact ? 'nowrap' : undefined,
+            verticalAlign: compact ? 'bottom' : undefined,
+            fontFamily: code ? token.fontFamilyCode : token.fontFamily,
+          }}
+        >
+          {emoji && <span style={{ fontFamily: token.fontFamily }}>{emoji}</span>}
+          {label}
+        </span>
+      )}
+    </Tag>
+  );
+};
+
 interface BranchPillProps extends BasePillProps {
   branch: string;
   compact?: boolean;
   title?: string;
+  emoji?: string | null;
+  onClick?: (e: EntityPillInteractionEvent) => void;
 }
 
 export const BranchPill: React.FC<BranchPillProps> = ({
   branch,
   compact = false,
   title,
+  emoji,
+  onClick,
+  style,
+}) => (
+  <EntityPill
+    icon={<BranchesOutlined />}
+    color={ENTITY_PILL_COLORS.branch}
+    label={branch}
+    emoji={emoji}
+    compact={compact}
+    title={title}
+    onClick={onClick}
+    code
+    style={style}
+  />
+);
+
+interface BoardPillProps extends BasePillProps {
+  board: {
+    name: string;
+    icon?: string | null;
+  };
+  compact?: boolean;
+  title?: string;
+  onClick?: (e: EntityPillInteractionEvent) => void;
+}
+
+export const BoardPill: React.FC<BoardPillProps> = ({
+  board,
+  compact = false,
+  title,
+  onClick,
+  style,
+}) => (
+  <EntityPill
+    icon={<ApartmentOutlined />}
+    color={ENTITY_PILL_COLORS.board}
+    label={board.name}
+    emoji={board.icon}
+    compact={compact}
+    title={title ?? board.name}
+    onClick={onClick}
+    style={style}
+  />
+);
+
+interface UserPillProps extends BasePillProps {
+  user: {
+    name?: string | null;
+    email?: string | null;
+    emoji?: string | null;
+  };
+  compact?: boolean;
+  title?: string;
+  onClick?: (e: EntityPillInteractionEvent) => void;
+}
+
+export const UserPill: React.FC<UserPillProps> = ({
+  user,
+  compact = false,
+  title,
+  onClick,
   style,
 }) => {
-  const { token } = theme.useToken();
+  const label = user.name || user.email || 'Someone';
 
   return (
-    <Tag
-      icon={<BranchesOutlined />}
-      color={PILL_COLORS.git}
-      title={title}
-      style={{
-        maxWidth: compact ? '100%' : undefined,
-        marginInlineEnd: compact ? 0 : undefined,
-        cursor: 'default',
-        ...style,
-      }}
-    >
-      <span
-        style={{
-          display: compact ? 'inline-block' : undefined,
-          maxWidth: compact ? 220 : undefined,
-          overflow: compact ? 'hidden' : undefined,
-          textOverflow: compact ? 'ellipsis' : undefined,
-          whiteSpace: compact ? 'nowrap' : undefined,
-          verticalAlign: compact ? 'bottom' : undefined,
-          fontFamily: token.fontFamilyCode,
-        }}
-      >
-        {branch}
-      </span>
-    </Tag>
+    <EntityPill
+      icon={<UserOutlined />}
+      color={ENTITY_PILL_COLORS.user}
+      label={label}
+      emoji={user.emoji}
+      compact={compact}
+      title={title ?? label}
+      onClick={onClick}
+      maxWidth={180}
+      style={style}
+    />
   );
 };
+
+interface AssistantPillProps extends BasePillProps {
+  name: string;
+  emoji?: string | null;
+  compact?: boolean;
+  title?: string;
+  onClick?: (e: EntityPillInteractionEvent) => void;
+}
+
+export const AssistantPill: React.FC<AssistantPillProps> = ({
+  name,
+  emoji,
+  compact = false,
+  title,
+  onClick,
+  style,
+}) => (
+  <EntityPill
+    icon={<RobotOutlined />}
+    color={ENTITY_PILL_COLORS.assistant}
+    label={name}
+    emoji={emoji}
+    compact={compact}
+    title={title ?? name}
+    onClick={onClick}
+    code
+    style={style}
+  />
+);
+
+interface SessionPillProps extends BasePillProps {
+  label?: React.ReactNode;
+  compact?: boolean;
+  title?: string;
+  ariaLabel?: string;
+  'aria-label'?: string;
+  onClick?: (e: EntityPillInteractionEvent) => void;
+}
+
+export const SessionPill: React.FC<SessionPillProps> = ({
+  label,
+  compact = false,
+  title,
+  ariaLabel,
+  'aria-label': ariaLabelProp,
+  onClick,
+  style,
+}) => (
+  <EntityPill
+    icon={<UnorderedListOutlined />}
+    color={ENTITY_PILL_COLORS.session}
+    label={label}
+    compact={compact}
+    title={title}
+    ariaLabel={ariaLabelProp ?? ariaLabel}
+    onClick={onClick}
+    style={style}
+  />
+);
+
+interface KnowledgeNamespacePillProps extends BasePillProps {
+  namespace: string;
+}
+
+export const KnowledgeNamespacePill: React.FC<KnowledgeNamespacePillProps> = ({
+  namespace,
+  style,
+}) => <EntityPill color="default" label={namespace} compact title={namespace} style={style} />;
 
 interface RepoPillProps extends BasePillProps {
   repoName: string;

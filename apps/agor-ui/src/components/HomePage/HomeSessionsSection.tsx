@@ -1,5 +1,5 @@
 import type { Board, Branch, Repo, Session } from '@agor-live/client';
-import { ClockCircleOutlined } from '@ant-design/icons';
+import { UnorderedListOutlined } from '@ant-design/icons';
 import { Badge, Card, Empty, List, Space, Tag, Tooltip, Typography, theme } from 'antd';
 import type React from 'react';
 import { useMemo, useState } from 'react';
@@ -17,9 +17,8 @@ import { getSessionStatusTone } from '../../utils/sessionStatus';
 import { getSessionDisplayTitle } from '../../utils/sessionTitle';
 import { formatRelativeTime, formatTimestampWithRelative } from '../../utils/time';
 import { HighlightMatch } from '../HighlightMatch';
-import { BranchPill } from '../Pill';
+import { BoardPill, BranchPill } from '../Pill';
 import { SessionSearchToolbar } from '../SessionSearchControls';
-import { ToolIcon } from '../ToolIcon';
 import { HomeSectionHeader } from './HomeSectionHeader';
 import { glassCardStyle } from './homeStyles';
 import type { HomePageProps } from './types';
@@ -67,7 +66,7 @@ const HomeSessionRow: React.FC<{
             dot={tone !== 'success' && tone !== 'default'}
             status={tone === 'success' || tone === 'default' ? undefined : tone}
           >
-            <ToolIcon tool={session.agentic_tool} size={20} />
+            <UnorderedListOutlined style={{ fontSize: 20, color: token.colorTextSecondary }} />
           </Badge>
         }
         title={
@@ -99,11 +98,7 @@ const HomeSessionRow: React.FC<{
                   {formatRelativeTime(session.last_updated)}
                 </Text>
               </Tooltip>
-              {board && (
-                <Tag>
-                  {board.icon || '📋'} {board.name}
-                </Tag>
-              )}
+              {board && <BoardPill board={board} compact />}
               {branch && (
                 <BranchPill
                   branch={branch.name}
@@ -120,15 +115,21 @@ const HomeSessionRow: React.FC<{
 };
 
 export const HomeSessionsSection: React.FC<
-  Pick<HomePageProps, 'sessionById' | 'branchById' | 'boardById' | 'repoById' | 'onSessionClick'>
-> = ({ sessionById, branchById, boardById, repoById, onSessionClick }) => {
+  Pick<
+    HomePageProps,
+    'sessionById' | 'branchById' | 'boardById' | 'repoById' | 'currentUserId' | 'onSessionClick'
+  >
+> = ({ sessionById, branchById, boardById, repoById, currentUserId, onSessionClick }) => {
   const { token } = theme.useToken();
   const cardGlassStyle = glassCardStyle(token);
   const [searchQuery, setSearchQuery] = useState('');
   const [sort, setSort] = useLocalStorage<SessionSort>(SESSION_SORT_STORAGE_KEY, 'recent');
   const allSessions = useMemo(
-    () => Array.from(sessionById.values()).filter((session) => !session.archived),
-    [sessionById]
+    () =>
+      Array.from(sessionById.values()).filter(
+        (session) => !session.archived && (!currentUserId || session.created_by === currentUserId)
+      ),
+    [currentUserId, sessionById]
   );
   const trimmed = searchQuery.trim();
   const searching = isSessionSearchActive(trimmed);
@@ -142,9 +143,9 @@ export const HomeSessionsSection: React.FC<
   return (
     <section style={{ minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column' }}>
       <HomeSectionHeader
-        title="Sessions"
-        icon={<ClockCircleOutlined />}
-        info={`Up to ${HOME_SESSIONS_LIMIT} cross-board sessions using the same local session state as the board left panel. Board and branch pills are included because this list is not filtered to one board.`}
+        title={currentUserId ? 'My Sessions' : 'Sessions'}
+        icon={<UnorderedListOutlined />}
+        info={`Up to ${HOME_SESSIONS_LIMIT} ${currentUserId ? 'of your' : 'cross-board'} sessions using the same local session state as the board left panel. Board and branch pills are included because this list is not filtered to one board.`}
       />
       <Card
         styles={{

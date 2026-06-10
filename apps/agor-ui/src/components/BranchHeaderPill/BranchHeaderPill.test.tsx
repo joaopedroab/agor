@@ -1,5 +1,6 @@
 import type { Branch, Repo } from '@agor-live/client';
 import { render, screen } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('antd', async () => {
@@ -99,5 +100,23 @@ describe('BranchHeaderPill', () => {
     render(<BranchHeaderPill {...defaultProps} />);
 
     expect(screen.getByRole('button', { name: 'Nuke environment' })).toBeInTheDocument();
+  });
+
+  it('uses the supplied identity link for the branch identity area', () => {
+    render(<BranchHeaderPill {...defaultProps} identityLink="https://agor.example/ui/s/abc123/" />);
+
+    const link = screen.getByRole('link', { name: /preset-io\/agor.*feature\/remove-nuke/ });
+    expect(link).toHaveAttribute('href', 'https://agor.example/ui/s/abc123/');
+  });
+
+  it('renders basename-aware internal identity links', () => {
+    render(
+      <MemoryRouter basename="/ui" initialEntries={['/ui/']}>
+        <BranchHeaderPill {...defaultProps} identityLink="/s/abc123/" />
+      </MemoryRouter>
+    );
+
+    const link = screen.getByRole('link', { name: /preset-io\/agor.*feature\/remove-nuke/ });
+    expect(link).toHaveAttribute('href', '/ui/s/abc123/');
   });
 });

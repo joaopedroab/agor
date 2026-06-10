@@ -1,5 +1,5 @@
 import type { AgorClient, Branch, Session, SpawnConfig, Task } from '@agor-live/client';
-import { getAssistantConfig, isAssistant, shortId } from '@agor-live/client';
+import { getAssistantConfig, isAssistant, sessionPath, shortId } from '@agor-live/client';
 import {
   CodeOutlined,
   CommentOutlined,
@@ -126,6 +126,7 @@ export const SessionPanelContent = React.memo<SessionPanelContentProps>(
                   onStopEnvironment={onStopEnvironment}
                   onNukeEnvironment={onNukeEnvironment}
                   onViewLogs={onViewLogs}
+                  identityLink={sessionPath(session.session_id)}
                 />
               )}
               {/* Issue and PR Pills */}

@@ -1,14 +1,19 @@
 export { EventStreamPill } from './EventStreamPill';
 export {
+  AssistantPill,
+  BoardPill,
   BranchPill,
   ChannelPill,
   ConceptPill,
   ContextWindowPill,
   DirtyStatePill,
+  ENTITY_PILL_COLORS,
+  EntityPill,
   ForkPill,
   GitShaPill,
   GitStatePill,
   IssuePill,
+  KnowledgeNamespacePill,
   MessageCountPill,
   ModelPill,
   PILL_COLORS,
@@ -18,10 +23,12 @@ export {
   ReportPill,
   ScheduledRunPill,
   SessionIdPill,
+  SessionPill,
   SpawnPill,
   StatusPill,
   TokenCountPill,
   ToolCountPill,
+  UserPill,
 } from './Pill';
 export { SessionMetadataCard } from './SessionMetadataCard';
 export { TimerPill } from './TimerPill';

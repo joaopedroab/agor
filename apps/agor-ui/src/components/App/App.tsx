@@ -23,7 +23,7 @@ import type {
 } from '@agor-live/client';
 import { hasMinimumRole, PermissionScope } from '@agor-live/client';
 import { Layout, Upload } from 'antd';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   type ImperativePanelHandle,
   Panel,
@@ -295,6 +295,7 @@ export const App: React.FC<AppProps> = ({
   }>();
   const isRootHomePath = location.pathname === '/';
   const hasExplicitEntityTarget = hasExplicitEntityRouteTarget(routeParams);
+  const [pendingHomeNavigation, setPendingHomeNavigation] = useState(false);
   const sessionCanvasRef = useRef<SessionCanvasRef>(null);
   const [newSessionBranchId, setNewSessionBranchId] = useState<string | null>(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
@@ -329,10 +330,13 @@ export const App: React.FC<AppProps> = ({
   // single-phase unmount identical to the explicit-close path.
   const effectiveSelectedSessionId = useMemo(
     () =>
-      !isRootHomePath && selectedSessionId && sessionById.has(selectedSessionId)
+      !isRootHomePath &&
+      !pendingHomeNavigation &&
+      selectedSessionId &&
+      sessionById.has(selectedSessionId)
         ? selectedSessionId
         : null,
-    [isRootHomePath, selectedSessionId, sessionById]
+    [isRootHomePath, pendingHomeNavigation, selectedSessionId, sessionById]
   );
 
   const [leftPanelTab, setLeftPanelTab] = useState<BoardAssistantPanelTab>('assistant');
@@ -391,7 +395,30 @@ export const App: React.FC<AppProps> = ({
   );
 
   const currentBoard = boardById.get(currentBoardId);
-  const isHomeSurface = isRootHomePath && !hasExplicitEntityTarget;
+  const isHomeSurface = (isRootHomePath || pendingHomeNavigation) && !hasExplicitEntityTarget;
+  const headerBoardId = isHomeSurface ? '' : currentBoardId;
+  const headerBoard = isHomeSurface ? undefined : currentBoard;
+
+  // Home is route-authoritative. Do not clear board/session state while the
+  // old `/b/...` URL is still active — that creates a transient no-board
+  // canvas render. Instead, render Home immediately via `pendingHomeNavigation`
+  // during the route transition, then clean stale board/session state only once
+  // the `/` route has committed. Layout timing keeps the header/board picker
+  // from painting stale board identity on Home.
+  useLayoutEffect(() => {
+    if (!isRootHomePath || hasExplicitEntityTarget) return;
+    if (currentBoardId) setCurrentBoardIdInternal('');
+    if (selectedSessionId) setSelectedSessionId(null);
+    if (activeUrlTarget) setActiveUrlTarget(null);
+    if (pendingHomeNavigation) setPendingHomeNavigation(false);
+  }, [
+    activeUrlTarget,
+    currentBoardId,
+    hasExplicitEntityTarget,
+    isRootHomePath,
+    pendingHomeNavigation,
+    selectedSessionId,
+  ]);
 
   const leftPanelCollapsed = commentsPanelCollapsed || suppressLeftPanel || isHomeSurface;
 
@@ -1015,20 +1042,18 @@ export const App: React.FC<AppProps> = ({
               onThemeEditorClick={() => setThemeEditorOpen(true)}
               onLogout={onLogout}
               onRetryConnection={onRetryConnection}
-              currentBoardName={currentBoard?.name}
-              currentBoardIcon={currentBoard?.icon}
+              currentBoardName={headerBoard?.name}
+              currentBoardIcon={headerBoard?.icon}
               unreadCommentsCount={
                 activeComments.filter((c: BoardComment) => !c.parent_comment_id).length
               }
               eventStreamEnabled={eventStreamEnabled}
               hasUserMentions={hasUserMentions}
               boards={mapToArray(boardById)}
-              currentBoardId={currentBoardId}
+              currentBoardId={headerBoardId}
               onBoardChange={navigation.goToBoard}
               onHomeClick={() => {
-                setCurrentBoardIdInternal('');
-                setSelectedSessionId(null);
-                setActiveUrlTarget(null);
+                setPendingHomeNavigation(true);
                 navigation.goHome();
               }}
               branchById={branchById}
@@ -1195,6 +1220,7 @@ export const App: React.FC<AppProps> = ({
                             sessionById={sessionById}
                             sessionsByBranch={sessionsByBranch}
                             userById={userById}
+                            currentUserId={user?.user_id}
                             onBoardClick={navigation.goToBoard}
                             onBranchClick={navigation.goToBranch}
                             onSessionClick={handleSessionClick}
