@@ -30,6 +30,7 @@ import {
   KNOWLEDGE_GRAPH_EDGE_TYPES,
   KNOWLEDGE_GRAPH_NODE_TYPES,
   KNOWLEDGE_VISIBILITIES,
+  normalizeKnowledgeDocumentIconEmoji,
   parseKnowledgeUri,
 } from '@agor/core/types';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -1193,10 +1194,11 @@ export function registerKnowledgeTools(server: McpServer, ctx: McpContext): void
         ),
         content: z
           .string({
-            error: 'content is required and must be a string.',
+            error: 'content must be a string when provided.',
           })
+          .optional()
           .describe(
-            'Markdown content for the new version. Embed [label](agor://kb/document/<documentId>) links to other KB docs to create graph edges between them.'
+            'Markdown content for the new version. Required when creating a new document; omit for metadata-only updates such as setting iconEmoji on an existing document. Embed [label](agor://kb/document/<documentId>) links to other KB docs to create graph edges between them.'
           ),
         firstLineIsTitle: z
           .boolean()
@@ -1205,6 +1207,13 @@ export function registerKnowledgeTools(server: McpServer, ctx: McpContext): void
             'Derive the title from the first non-empty markdown line and hide that line in the read-only viewer. Defaults to true when content starts with an H1 (even if `title` is also provided) or when `title` is omitted; set false only when the explicit `title` should be separate from the markdown body.'
           ),
         kind: KnowledgeDocumentKindSchema.optional().describe('Document kind (default: doc)'),
+        iconEmoji: z
+          .string({ error: 'iconEmoji must be a string or null when provided.' })
+          .nullable()
+          .optional()
+          .describe(
+            'Optional emoji icon for the document. Pass null or an empty string to clear. Values are trimmed and capped to a short display-safe length.'
+          ),
         visibility: KnowledgeVisibilitySchema.optional().describe(
           'Visibility (default: namespace default or public)'
         ),
@@ -1240,21 +1249,27 @@ export function registerKnowledgeTools(server: McpServer, ctx: McpContext): void
       if (!service) return knowledgeNotImplementedResult('agor_kb_put', ['kb/documents']);
 
       const content = typeof args.content === 'string' ? args.content : undefined;
-      if (content === undefined) throw new Error('content is required and must be a string.');
-
       const uri = coerceString(args.uri);
       const parsedUri = parseKnowledgeUri(uri);
       const title = coerceString(args.title);
-      const firstContentLine = content
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find(Boolean);
+      const firstContentLine =
+        content
+          ?.split(/\r?\n/)
+          .map((line) => line.trim())
+          .find(Boolean) ?? null;
       const contentStartsWithHeading = Boolean(firstContentLine?.match(/^#{1,6}\s+\S/));
       // Agents commonly pass both `title` and markdown beginning with `# Title`.
       // Default to deriving/hiding the first heading in that case so the viewer
       // does not render duplicate titles. Callers can opt out explicitly.
       const firstLineIsTitle =
-        args.firstLineIsTitle ?? (contentStartsWithHeading || title === undefined);
+        content === undefined
+          ? args.firstLineIsTitle
+          : (args.firstLineIsTitle ?? (contentStartsWithHeading || title === undefined));
+
+      const iconEmoji =
+        args.iconEmoji === undefined
+          ? undefined
+          : normalizeKnowledgeDocumentIconEmoji(args.iconEmoji);
 
       const data = {
         document_id: coerceString(args.documentId),
@@ -1262,9 +1277,10 @@ export function registerKnowledgeTools(server: McpServer, ctx: McpContext): void
         namespace_slug: coerceString(args.namespace) ?? parsedUri?.namespace_slug,
         path: coerceString(args.path) ?? parsedUri?.path,
         title,
-        content_text: content,
-        first_line_is_title: firstLineIsTitle,
-        kind: (args.kind as KnowledgeDocumentKind | undefined) ?? 'doc',
+        ...(content !== undefined ? { content_text: content } : {}),
+        ...(firstLineIsTitle !== undefined ? { first_line_is_title: firstLineIsTitle } : {}),
+        ...(args.kind !== undefined ? { kind: args.kind as KnowledgeDocumentKind } : {}),
+        ...(args.iconEmoji !== undefined ? { icon_emoji: iconEmoji } : {}),
         visibility: args.visibility as KnowledgeVisibility | undefined,
         status: args.status as KnowledgeDocumentStatus | undefined,
         edit_policy: args.editPolicy as KnowledgeEditPolicy | undefined,

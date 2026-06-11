@@ -161,6 +161,17 @@ export const KNOWLEDGE_GRAPH_EDGE_TYPES = [
 
 export type KnowledgeGraphEdgeType = (typeof KNOWLEDGE_GRAPH_EDGE_TYPES)[number];
 
+export const KNOWLEDGE_DOCUMENT_ICON_EMOJI_MAX_LENGTH = 32;
+
+export function normalizeKnowledgeDocumentIconEmoji(
+  icon: string | null | undefined
+): string | null {
+  if (typeof icon !== 'string') return null;
+  const trimmed = icon.trim();
+  if (!trimmed) return null;
+  return [...trimmed].slice(0, KNOWLEDGE_DOCUMENT_ICON_EMOJI_MAX_LENGTH).join('');
+}
+
 export const KNOWLEDGE_URI_PREFIX = 'agor://kb/';
 
 /**
@@ -426,6 +437,8 @@ export interface KnowledgeDocument {
    */
   url?: string | null;
   title: string;
+  /** Optional Notion-style emoji icon shown beside this document in Knowledge UI. */
+  icon_emoji?: string | null;
   kind: KnowledgeDocumentKind;
   visibility: KnowledgeVisibility;
   /**
@@ -621,6 +634,7 @@ export interface KnowledgeGraphEdge {
 export interface KnowledgeGraphDocNode {
   document_id: KnowledgeDocumentID;
   title: string;
+  icon_emoji?: string | null;
   path: string;
   uri: string;
   kind: KnowledgeDocumentKind;

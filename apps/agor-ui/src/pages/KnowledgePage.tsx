@@ -16,6 +16,7 @@ import type {
 import {
   hasMinimumRole,
   KNOWLEDGE_DOCUMENT_KINDS,
+  normalizeKnowledgeDocumentIconEmoji,
   normalizeKnowledgeFolderPath,
   ROLES,
   titleFromKnowledgeContent,
@@ -90,6 +91,7 @@ import {
   type KbDocMention,
 } from '../components/AutocompleteTextarea';
 import { BrandLogo } from '../components/BrandLogo';
+import { AgorEmojiPicker } from '../components/EmojiPickerInput';
 import { GlobalUserMenu } from '../components/GlobalUserMenu';
 import { HighlightMatch } from '../components/HighlightMatch';
 import { KnowledgeGraph } from '../components/KnowledgeGraph';
@@ -697,6 +699,7 @@ export function KnowledgePage({
   const [visibilityDraft, setVisibilityDraft] = useState<KnowledgeDocument['visibility']>('public');
   const [statusDraft, setStatusDraft] = useState<KnowledgeDocumentStatus>('published');
   const [kindDraft, setKindDraft] = useState<KnowledgeDocumentKind>('doc');
+  const [iconEmojiDraft, setIconEmojiDraft] = useState<string | null>(null);
   const [titleFromContent, setTitleFromContent] = useState(false);
   const [markdownDraft, setMarkdownDraft] = useState(DEFAULT_MARKDOWN);
   const [sidebarFilterQuery, setSidebarFilterQuery] = useState('');
@@ -733,6 +736,7 @@ export function KnowledgePage({
   const [selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
   const [historyView, setHistoryView] = useState<'preview' | 'diff'>('preview');
   const [titleActionsVisible, setTitleActionsVisible] = useState(false);
+  const [iconPickerOpen, setIconPickerOpen] = useState(false);
   const [renamePathOnTitleChange, setRenamePathOnTitleChange] = useState(false);
   const [knowledgeSettingsOpen, setKnowledgeSettingsOpen] = useState(false);
   const [knowledgeSettings, setKnowledgeSettings] =
@@ -1083,6 +1087,7 @@ export function KnowledgePage({
         (activeDoc &&
           (markdownDraft !== savedMarkdown ||
             titleDraft !== activeDoc.title ||
+            (iconEmojiDraft ?? null) !== (activeDoc.icon_emoji ?? null) ||
             visibilityDraft !== activeDoc.visibility ||
             statusDraft !== activeDoc.status ||
             kindDraft !== activeDoc.kind ||
@@ -1781,6 +1786,7 @@ export function KnowledgePage({
       setVisibilityDraft(activeDoc.visibility);
       setStatusDraft(activeDoc.status ?? 'published');
       setKindDraft(activeDoc.kind);
+      setIconEmojiDraft(activeDoc.icon_emoji ?? null);
       setTitleFromContent(activeDoc.metadata?.title_from_content === true);
       setRenamePathOnTitleChange(false);
       setIsEditing(pendingEditModeRef.current ?? routeSearchParams.get('mode') === 'edit');
@@ -1942,6 +1948,7 @@ export function KnowledgePage({
     setVisibilityDraft(draft.visibility);
     setStatusDraft(draft.status);
     setKindDraft(draft.kind);
+    setIconEmojiDraft(draft.icon_emoji ?? null);
     setTitleFromContent(true);
     setRenamePathOnTitleChange(false);
     setMarkdownDraft(`# ${title}\n\nWrite markdown here.\n`);
@@ -2058,6 +2065,7 @@ export function KnowledgePage({
           path,
           title: nextTitle,
           kind: kindDraft,
+          icon_emoji: iconEmojiDraft,
           visibility: visibilityDraft,
           status: statusDraft,
           metadata: {
@@ -2098,6 +2106,7 @@ export function KnowledgePage({
         visibility: visibilityDraft,
         status: statusDraft,
         kind: kindDraft,
+        icon_emoji: iconEmojiDraft,
         ...(nextPath ? { path: nextPath } : {}),
         content_text: markdownDraft,
         metadata: {
@@ -2182,6 +2191,51 @@ export function KnowledgePage({
     }
   };
 
+  const updateActiveDocumentIcon = async (emoji: string | null) => {
+    if (!activeDoc) return;
+    const nextIcon = normalizeKnowledgeDocumentIconEmoji(emoji);
+    setIconEmojiDraft(nextIcon);
+    if (isDraftDocument) {
+      setDraftDocument((current) => (current ? { ...current, icon_emoji: nextIcon } : current));
+      return;
+    }
+    if (!client) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = (await client.service('kb/documents').patch(activeDoc.document_id, {
+        icon_emoji: nextIcon,
+        change_summary: nextIcon
+          ? 'Updated Knowledge document icon'
+          : 'Removed Knowledge document icon',
+      } as unknown as Partial<CoreKnowledgeDocument>)) as KnowledgeDocument;
+      setDocuments((prev) =>
+        prev.map((doc) => (doc.document_id === updated.document_id ? updated : doc))
+      );
+      setActiveDocSnapshot(updated);
+    } catch (err) {
+      console.error('Failed to update Knowledge document icon:', err);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const renderKnowledgeIconPicker = (onChange: (emoji: string | null) => void) => {
+    const selectIcon = (emoji: string | null) => {
+      onChange(emoji);
+      setIconPickerOpen(false);
+    };
+    return (
+      <Space direction="vertical" size={8} onClick={(event) => event.stopPropagation()}>
+        <AgorEmojiPicker onEmojiClick={(emojiData) => selectIcon(emojiData.emoji)} />
+        <Button block onClick={() => selectIcon(null)}>
+          Remove icon
+        </Button>
+      </Space>
+    );
+  };
+
   const cancelEdit = () => {
     if (!activeDoc) return;
     if (isDraftDocument) {
@@ -2193,6 +2247,7 @@ export function KnowledgePage({
       setTitleDraft('');
       setVisibilityDraft('public');
       setKindDraft('doc');
+      setIconEmojiDraft(null);
       setTitleFromContent(false);
       setRenamePathOnTitleChange(false);
       setMarkdownDraft(DEFAULT_MARKDOWN);
@@ -2204,6 +2259,7 @@ export function KnowledgePage({
     setTitleDraft(activeDoc.title);
     setVisibilityDraft(activeDoc.visibility);
     setKindDraft(activeDoc.kind);
+    setIconEmojiDraft(activeDoc.icon_emoji ?? null);
     setTitleFromContent(activeDoc.metadata?.title_from_content === true);
     setRenamePathOnTitleChange(false);
     setMarkdownDraft(versions[0]?.content_text ?? DEFAULT_MARKDOWN);
@@ -2412,7 +2468,13 @@ export function KnowledgePage({
           textAlign: 'left',
         }}
       >
-        <FileOutlined style={{ color: token.colorTextTertiary, fontSize: 13 }} />
+        {doc.icon_emoji ? (
+          <span style={{ fontSize: 15, lineHeight: 1, width: 14, textAlign: 'center' }}>
+            {doc.icon_emoji}
+          </span>
+        ) : (
+          <FileOutlined style={{ color: token.colorTextTertiary, fontSize: 13 }} />
+        )}
         <div style={{ flex: 1, minWidth: 0 }}>
           <span
             style={{
@@ -2662,6 +2724,9 @@ export function KnowledgePage({
                       }}
                     >
                       <Flex align="baseline" gap={8} style={{ minWidth: 0 }}>
+                        {doc.icon_emoji && (
+                          <span style={{ fontSize: 15, lineHeight: 1 }}>{doc.icon_emoji}</span>
+                        )}
                         <Text strong style={{ flex: 1, minWidth: 0 }} ellipsis>
                           <HighlightMatch text={doc.title} query={globalSearchQuery} />
                         </Text>
@@ -2713,7 +2778,7 @@ export function KnowledgePage({
     : null;
   const folderNameHelp =
     'Use letters, numbers, spaces, dashes, underscores, dots, and / for subfolders.';
-  const showReadActions = titleActionsVisible;
+  const showReadActions = titleActionsVisible || iconPickerOpen;
   const activeDocMatchesRoute =
     !routeDocumentPath ||
     Boolean(
@@ -3076,20 +3141,56 @@ export function KnowledgePage({
                         size={8}
                         style={{ width: '100%', minWidth: 0, flex: 1 }}
                       >
-                        {isEditing && !titleFromContent ? (
-                          <Input
-                            value={titleDraft}
-                            onChange={(event) => setTitleDraft(event.target.value)}
-                            placeholder="Page title"
-                            size="large"
-                            variant="borderless"
-                            style={{ fontSize: 32, fontWeight: 700, paddingInline: 0 }}
-                          />
-                        ) : (
-                          <Title level={1} style={{ margin: 0 }}>
-                            {isEditing ? titleDraft : activeDoc.title}
-                          </Title>
-                        )}
+                        <Flex align="center" gap={12} style={{ width: '100%' }}>
+                          <Popover
+                            trigger="click"
+                            placement="bottomLeft"
+                            onOpenChange={setIconPickerOpen}
+                            content={renderKnowledgeIconPicker(
+                              isEditing ? setIconEmojiDraft : updateActiveDocumentIcon
+                            )}
+                          >
+                            <Button
+                              type="text"
+                              size="large"
+                              disabled={!client && !isDraftDocument}
+                              style={{
+                                fontSize: 30,
+                                width: 44,
+                                height: 44,
+                                padding: 0,
+                                color: (isEditing ? iconEmojiDraft : activeDoc.icon_emoji)
+                                  ? undefined
+                                  : token.colorTextTertiary,
+                              }}
+                              aria-label={
+                                (isEditing ? iconEmojiDraft : activeDoc.icon_emoji)
+                                  ? 'Change Knowledge document emoji icon'
+                                  : 'Add Knowledge document emoji icon'
+                              }
+                            >
+                              {(isEditing ? iconEmojiDraft : activeDoc.icon_emoji) || (
+                                <FileOutlined />
+                              )}
+                            </Button>
+                          </Popover>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            {isEditing && !titleFromContent ? (
+                              <Input
+                                value={titleDraft}
+                                onChange={(event) => setTitleDraft(event.target.value)}
+                                placeholder="Page title"
+                                size="large"
+                                variant="borderless"
+                                style={{ fontSize: 32, fontWeight: 700, paddingInline: 0 }}
+                              />
+                            ) : (
+                              <Title level={1} style={{ margin: 0 }}>
+                                {isEditing ? titleDraft : activeDoc.title}
+                              </Title>
+                            )}
+                          </div>
+                        </Flex>
                         <Space wrap>
                           {isEditing ? (
                             <Select

@@ -4,6 +4,8 @@ import { generateId } from '../../lib/ids';
 import type { GroupID, UserID } from '../../types';
 import {
   buildKnowledgeUri,
+  KNOWLEDGE_DOCUMENT_ICON_EMOJI_MAX_LENGTH,
+  normalizeKnowledgeDocumentIconEmoji,
   normalizeKnowledgePath,
   parseKnowledgeUri,
   validateKnowledgePath,
@@ -43,6 +45,15 @@ describe('Knowledge path and URI helpers', () => {
     expect(validateKnowledgePath('../bad.md')).toContain('must not contain');
     expect(validateKnowledgePath('bad:name.md')).toContain('cannot contain');
     expect(validateKnowledgePath('CON/readme.md')).toContain('reserved');
+  });
+
+  dbTest('normalizes document emoji icons for display-safe storage', async () => {
+    expect(normalizeKnowledgeDocumentIconEmoji('  📘  ')).toBe('📘');
+    expect(normalizeKnowledgeDocumentIconEmoji('   ')).toBeNull();
+    expect(normalizeKnowledgeDocumentIconEmoji(null)).toBeNull();
+    expect(normalizeKnowledgeDocumentIconEmoji('🙂'.repeat(64))).toBe(
+      '🙂'.repeat(KNOWLEDGE_DOCUMENT_ICON_EMOJI_MAX_LENGTH)
+    );
   });
 });
 
@@ -174,6 +185,7 @@ describe('Knowledge repositories', () => {
       namespace_id: namespace.namespace_id,
       path: 'guides/intro.md',
       title: 'Intro',
+      icon_emoji: '📘',
       content_text: '# Intro\n\nHello Knowledge',
       created_by: owner.user_id as UserID,
     });
@@ -182,6 +194,17 @@ describe('Knowledge repositories', () => {
     expect(created.url).toContain('/ui/kb/repo-test/guides/intro.md');
     expect(created.current_version_id).toBeTruthy();
     expect(created.status).toBe('published');
+    expect(created.icon_emoji).toBe('📘');
+
+    const normalizedIcon = await documents.create({
+      namespace_id: namespace.namespace_id,
+      path: 'guides/icon-normalization.md',
+      title: 'Icon normalization',
+      icon_emoji: `  ${'🙂'.repeat(64)}  `,
+      content_text: '# Icon normalization\n',
+      created_by: owner.user_id as UserID,
+    });
+    expect(normalizedIcon.icon_emoji).toBe('🙂'.repeat(KNOWLEDGE_DOCUMENT_ICON_EMOJI_MAX_LENGTH));
 
     const history = await versions.findAll({ document_id: created.document_id });
     expect(history).toHaveLength(1);
@@ -219,6 +242,7 @@ describe('Knowledge repositories', () => {
     const updated = await documents.update(created.document_id, {
       path: 'folder/new.md',
       title: 'New',
+      icon_emoji: '🧭',
       content_text: 'v2',
       updated_by: owner.user_id as UserID,
       change_summary: 'Second version',
@@ -226,7 +250,13 @@ describe('Knowledge repositories', () => {
 
     expect(updated.path).toBe('folder/new.md');
     expect(updated.uri).toBe('agor://kb/version-test/folder/new.md');
+    expect(updated.icon_emoji).toBe('🧭');
     expect(updated.current_version_id).not.toBe(created.current_version_id);
+
+    const withoutIcon = await documents.update(created.document_id, { icon_emoji: null });
+    expect(withoutIcon.icon_emoji).toBeNull();
+    const blankIcon = await documents.update(created.document_id, { icon_emoji: '   ' });
+    expect(blankIcon.icon_emoji).toBeNull();
 
     const history = await versions.findAll({ document_id: created.document_id });
     expect(history.map((version) => version.version_number)).toEqual([2, 1]);
@@ -375,6 +405,7 @@ describe('Knowledge repositories', () => {
       namespace_id: namespace.namespace_id,
       path: 'guides/intro.md',
       title: 'Intro',
+      icon_emoji: '📘',
       content_text: 'prefixneedle guide',
     });
     await documents.create({
