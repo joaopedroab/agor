@@ -1,0 +1,37 @@
+/* Wrapper styling only. The form itself lives inside HubSpot's iframe
+ * and is themed via the `css` option passed to hbspt.forms.create — see
+ * HUBSPOT_FORM_CSS in HubSpotForm.tsx. */
+
+.wrapper {
+  margin: 2.5rem auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  /* Scroll target offset so anchored jumps don't tuck the form under the
+   * sticky Nextra navbar. */
+  scroll-margin-top: 6rem;
+}
+
+.form {
+  width: 100%;
+  max-width: 560px;
+}
+
+.demoLine {
+  margin: 1rem 0 0;
+  font-size: 0.95rem;
+  color: inherit;
+  opacity: 0.85;
+}
+
+.demoLink {
+  font-weight: 600;
+  color: #7fe8df;
+  text-decoration: none;
+}
+
+.demoLink:hover {
+  color: #a8f5ed;
+  text-decoration: underline;
+}
