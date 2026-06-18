@@ -82,6 +82,7 @@ interface GatewayChannelsTableProps {
 const CHANNEL_TYPE_OPTIONS: { value: ChannelType; label: string; icon: React.ReactNode }[] = [
   { value: 'slack', label: 'Slack', icon: <SlackOutlined /> },
   { value: 'github', label: 'GitHub', icon: <GithubOutlined /> },
+  { value: 'teams', label: 'Microsoft Teams', icon: <TeamOutlined /> },
   { value: 'discord', label: 'Discord', icon: <MessageOutlined /> },
   { value: 'whatsapp', label: 'WhatsApp', icon: <MessageOutlined /> },
   { value: 'telegram', label: 'Telegram', icon: <MessageOutlined /> },
@@ -93,6 +94,8 @@ function getChannelTypeIcon(type: ChannelType): React.ReactNode {
       return <SlackOutlined />;
     case 'github':
       return <GithubOutlined />;
+    case 'teams':
+      return <TeamOutlined />;
     default:
       return <MessageOutlined />;
   }
@@ -104,6 +107,8 @@ function getChannelTypeColor(type: ChannelType): string {
       return 'purple';
     case 'github':
       return 'default';
+    case 'teams':
+      return 'geekblue';
     case 'discord':
       return 'blue';
     case 'whatsapp':
@@ -448,10 +453,10 @@ const ChannelFormFields: React.FC<{
         <Switch />
       </Form.Item>
 
-      {channelType !== 'slack' && channelType !== 'github' && (
+      {channelType !== 'slack' && channelType !== 'github' && channelType !== 'teams' && (
         <Alert
           title={`${channelType.charAt(0).toUpperCase() + channelType.slice(1)} support coming soon`}
-          description="This platform integration is not yet available. Slack and GitHub are currently supported."
+          description="This platform integration is not yet available. Slack, GitHub, and Microsoft Teams are currently supported."
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
@@ -865,6 +870,247 @@ const ChannelFormFields: React.FC<{
             />
           )}
         </>
+      )}
+
+      {/* ── Collapsible sections (Teams) ── */}
+      {channelType === 'teams' && (
+        <Collapse
+          ghost
+          destroyOnHidden={false}
+          defaultActiveKey={mode === 'create' ? ['teams-credentials'] : []}
+          style={{ marginLeft: -16, marginRight: -16 }}
+          items={[
+            // ── Credentials ──
+            {
+              key: 'teams-credentials',
+              label: (
+                <SectionLabel
+                  icon={<KeyOutlined />}
+                  title="Azure Bot Credentials"
+                  subtitle={mode === 'edit' ? 'leave blank to keep current' : undefined}
+                />
+              ),
+              children: (
+                <>
+                  {mode === 'edit' && editingChannel && (
+                    <Form.Item label="Channel Key">
+                      <Input.Search
+                        value={editingChannel.channel_key}
+                        readOnly
+                        enterButton={<CopyOutlined />}
+                        onSearch={() => onCopyKey?.(editingChannel.channel_key)}
+                      />
+                      <Typography.Text
+                        type="secondary"
+                        style={{ fontSize: 12, marginTop: 4, display: 'block' }}
+                      >
+                        Use this key to authenticate inbound messages from the platform.
+                      </Typography.Text>
+                    </Form.Item>
+                  )}
+
+                  <Form.Item
+                    label="App ID"
+                    name="teams_app_id"
+                    rules={
+                      mode === 'create'
+                        ? [{ required: true, message: 'Azure Bot App ID is required' }]
+                        : []
+                    }
+                    tooltip="Azure Bot Registration Application (client) ID"
+                  >
+                    <Input placeholder="00000000-0000-0000-0000-000000000000" />
+                  </Form.Item>
+
+                  <Form.Item
+                    label="App Password"
+                    name="teams_app_password"
+                    rules={
+                      mode === 'create'
+                        ? [{ required: true, message: 'Azure Bot App Password is required' }]
+                        : []
+                    }
+                    tooltip="Azure Bot Registration client secret (value, not the secret ID)"
+                  >
+                    <Input.Password
+                      placeholder={mode === 'edit' ? '••••••••' : 'Client secret value'}
+                    />
+                  </Form.Item>
+
+                  <Form.Item
+                    label="Tenant ID"
+                    name="teams_tenant_id"
+                    rules={[
+                      {
+                        required: true,
+                        message: 'Tenant ID is required for Teams bots',
+                      },
+                    ]}
+                    tooltip="Azure AD Tenant ID. Required so the bot can acquire tokens to send replies."
+                  >
+                    <Input placeholder="00000000-0000-0000-0000-000000000000" />
+                  </Form.Item>
+
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="Azure Bot Setup"
+                    description={
+                      <span>
+                        Create an Azure Bot resource in the{' '}
+                        <Typography.Link
+                          href="https://portal.azure.com/#create/Microsoft.AzureBotService"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          Azure Portal
+                        </Typography.Link>
+                        . Both single-tenant and multi-tenant bots are supported. The{' '}
+                        <strong>Tenant ID</strong> is required so the bot can send replies. Then
+                        sideload the bot as a Teams app via a custom manifest.
+                      </span>
+                    }
+                    style={{ fontSize: 12 }}
+                  />
+                </>
+              ),
+            },
+
+            // ── Message Sources ──
+            {
+              key: 'teams-message-sources',
+              label: (
+                <SectionLabel
+                  icon={<MessageOutlined />}
+                  title="Message Sources"
+                  subtitle="DMs & channels"
+                />
+              ),
+              children: (
+                <>
+                  <Typography.Text
+                    type="secondary"
+                    style={{ fontSize: 12, display: 'block', marginBottom: 16 }}
+                  >
+                    Configure how the bot responds in Teams channels vs 1:1 chats. Direct messages
+                    are always enabled.
+                  </Typography.Text>
+
+                  <Form.Item
+                    label="Require @mention in channels"
+                    name="teams_require_mention"
+                    valuePropName="checked"
+                    initialValue={true}
+                    tooltip="When enabled, bot only responds when @mentioned in Teams channels (recommended)"
+                  >
+                    <Switch />
+                  </Form.Item>
+                </>
+              ),
+            },
+
+            // ── Webhook Configuration ──
+            {
+              key: 'teams-webhook',
+              label: (
+                <SectionLabel
+                  icon={<ToolOutlined />}
+                  title="Webhook Configuration"
+                  subtitle="port & path"
+                />
+              ),
+              children: (
+                <>
+                  <Typography.Text
+                    type="secondary"
+                    style={{ fontSize: 12, display: 'block', marginBottom: 12 }}
+                  >
+                    The Teams connector runs an HTTP server for the Bot Framework messaging
+                    endpoint. Configure the port and path to match your Azure Bot&apos;s messaging
+                    endpoint URL.
+                  </Typography.Text>
+
+                  <Form.Item
+                    label="Webhook Port"
+                    name="teams_webhook_port"
+                    initialValue={3978}
+                    tooltip="Port for the Bot Framework HTTP endpoint"
+                  >
+                    <InputNumber min={1024} max={65535} style={{ width: '100%' }} />
+                  </Form.Item>
+
+                  <Form.Item
+                    label="Webhook Path"
+                    name="teams_webhook_path"
+                    initialValue="/api/messages"
+                    tooltip="URL path for the Bot Framework messaging endpoint"
+                  >
+                    <Input placeholder="/api/messages" />
+                  </Form.Item>
+                </>
+              ),
+            },
+
+            // ── Agentic Tool Configuration ──
+            {
+              key: 'agentic-tool-config',
+              label: (
+                <SectionLabel
+                  icon={<ThunderboltOutlined />}
+                  title="Agent Configuration"
+                  subtitle={selectedAgent}
+                />
+              ),
+              children: (
+                <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    Configure which agent and settings to use for sessions created from this
+                    channel.
+                  </Typography.Text>
+                  <AgentSelectionGrid
+                    agents={AVAILABLE_AGENTS}
+                    selectedAgentId={selectedAgent}
+                    onSelect={onAgentChange}
+                    columns={2}
+                    showHelperText={false}
+                    showComparisonLink={false}
+                  />
+                  <AgenticToolConfigForm
+                    agenticTool={selectedAgent as AgenticToolName}
+                    mcpServerById={mcpServerById}
+                    showHelpText={false}
+                  />
+                </Space>
+              ),
+            },
+
+            // ── Environment Variables ──
+            {
+              key: 'env-vars',
+              label: (
+                <SectionLabel
+                  icon={<LockOutlined />}
+                  title="Environment Variables"
+                  subtitle="channel-level secrets"
+                />
+              ),
+              children: (
+                <>
+                  <Typography.Text
+                    type="secondary"
+                    style={{ fontSize: 12, display: 'block', marginBottom: 12 }}
+                  >
+                    Define environment variables for sessions created from this channel. Useful for
+                    service account tokens or API keys for MCP servers.
+                  </Typography.Text>
+                  <Form.Item name="envVars" noStyle>
+                    <GatewayEnvVarsEditor />
+                  </Form.Item>
+                </>
+              ),
+            },
+          ]}
+        />
       )}
 
       {/* ── Collapsible sections (Slack only) ── */}
@@ -1335,7 +1581,13 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
     // back to the server. The API redacts tokens to '••••••••' — if we spread
     // that into the config object, the backend would save the sentinel as the
     // actual token (wiping the real credentials).
-    const SENSITIVE_FIELDS = ['bot_token', 'app_token', 'signing_secret', 'private_key'];
+    const SENSITIVE_FIELDS = [
+      'bot_token',
+      'app_token',
+      'signing_secret',
+      'private_key',
+      'app_password',
+    ];
     const sanitizedExisting = { ...(existingConfig || {}) };
     for (const field of SENSITIVE_FIELDS) {
       delete sanitizedExisting[field];
@@ -1365,6 +1617,13 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
           // validateJSON rule handles the error display
         }
       }
+    } else if (values.channel_type === 'teams') {
+      if (values.teams_app_id) config.app_id = values.teams_app_id;
+      if (values.teams_app_password) config.app_password = values.teams_app_password;
+      config.tenant_id = values.teams_tenant_id;
+      config.webhook_port = (values.teams_webhook_port as number) ?? 3978;
+      config.webhook_path = (values.teams_webhook_path as string) || '/api/messages';
+      config.require_mention = values.teams_require_mention ?? true;
     } else if (values.channel_type === 'slack') {
       if (values.bot_token) config.bot_token = values.bot_token;
       if (values.app_token) config.app_token = values.app_token;
@@ -1501,6 +1760,12 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       if (userMap && typeof userMap === 'object' && Object.keys(userMap).length > 0) {
         formValues.github_user_map = JSON.stringify(userMap, null, 2);
       }
+    } else if (channel.channel_type === 'teams') {
+      formValues.teams_app_id = config?.app_id;
+      formValues.teams_tenant_id = config?.tenant_id;
+      formValues.teams_webhook_port = (config?.webhook_port as number) ?? 3978;
+      formValues.teams_webhook_path = (config?.webhook_path as string) || '/api/messages';
+      formValues.teams_require_mention = config?.require_mention ?? true;
     }
 
     editForm.setFieldsValue(formValues);
@@ -1681,7 +1946,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
         }}
       >
         <Typography.Text type="secondary">
-          Route messages from Slack, GitHub, and other platforms to Agor sessions.
+          Route messages from Slack, GitHub, Microsoft Teams, and other platforms to Agor sessions.
         </Typography.Text>
         <Space>
           <Input
@@ -1732,8 +1997,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
             No channels configured.
           </Typography.Text>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            Add a channel to route messages from Slack, Discord, or other platforms to Agor
-            sessions.
+            Add a channel to route messages from Slack, Teams, or other platforms to Agor sessions.
           </Typography.Text>
         </div>
       ) : (
@@ -1908,6 +2172,34 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
                     </li>
                     <li>
                       No webhooks needed — Agor polls the GitHub API on the configured interval
+                    </li>
+                  </ol>
+                }
+                type="info"
+                showIcon
+              />
+            )}
+            {createdChannelType === 'teams' && (
+              <Alert
+                message="Microsoft Teams Channel Ready"
+                description={
+                  <ol style={{ margin: 0, paddingLeft: 20, fontSize: 12 }}>
+                    <li>
+                      Ensure your Azure Bot&apos;s messaging endpoint points to this Agor
+                      instance&apos;s webhook URL (e.g.{' '}
+                      <code>https://your-domain:3978/api/messages</code>)
+                    </li>
+                    <li>
+                      Sideload the bot as a Teams app via a custom manifest (manifest.json + icons
+                      zip)
+                    </li>
+                    <li>
+                      Send a message to the bot in 1:1 chat or @mention it in a channel to create a
+                      session
+                    </li>
+                    <li>
+                      The app registration must be <strong>multi-tenant</strong> for outbound
+                      replies to work
                     </li>
                   </ol>
                 }

@@ -205,6 +205,60 @@ When mentioned on an issue:
 
 With a capable model (like Claude Opus) and Agor MCP tools available, even a minimal prompt produces good results — the agent figures out how to use branches, spawn sessions, and interact with GitHub. Over time, the assistant learns the codebase, team conventions, and review patterns across PRs.
 
+## Setting Up Microsoft Teams Integration
+
+### How It Works
+
+When you message Agor's bot in a 1:1 chat — or `@mention` it in a Teams channel — Agor receives the activity through a [Bot Framework](https://dev.botframework.com) webhook and creates a session. The session runs on the target branch, and the agent's response is posted back into the same conversation under the bot's identity.
+
+Key differences from Slack and GitHub:
+
+- **Webhook, not polling or WebSocket** — Inbound messages arrive at an HTTP endpoint (default `/api/messages` on port `3978`) that the Azure Bot's messaging endpoint points to. The daemon must be reachable from Azure (e.g., via a public host or tunnel).
+- **Bot Framework identity** — Replies are sent as the registered Azure Bot, using a `ConversationReference` captured from the inbound activity (proactive messaging).
+- **1:1 DM vs channel threads** — In a personal (1:1) chat, every message routes to that conversation's session. In a channel or group chat, Agor replies in the same thread and, by default, only responds when `@mentioned` (configurable). The bot mention is stripped before the text reaches the agent.
+- **Thread IDs** — Conversations map to `{conversationId}|{activityId}`; personal chats are normalized to the conversation so follow-up messages stay in one session.
+
+### 1. Create an Azure Bot
+
+1. In the [Azure Portal](https://portal.azure.com), create an **Azure Bot** resource backed by an app registration.
+2. Note the **App ID** (Application/client ID) and create a **client secret** — copy the secret _value_, not its ID.
+3. Note the **Tenant ID** (required so the bot can acquire tokens to send replies).
+4. Under the bot's **Configuration**, set the **Messaging endpoint** to `https://<your-daemon-host>/api/messages` (matching the webhook path and port you configure in Agor).
+5. Under **Channels**, add the **Microsoft Teams** channel.
+
+### 2. Add the App to Teams
+
+1. Build a Teams app manifest referencing your bot's **App ID** — use the [Developer Portal for Teams](https://dev.teams.microsoft.com) or a `manifest.json`.
+2. Add the `bot` capability with the scopes you need: `personal` (1:1 chats), `team` (channels), and `groupChat`.
+3. Sideload the custom app (or publish it to your org), then install it into the relevant team or chat.
+
+### 3. Create a Channel in Agor
+
+1. Open **Settings** → **Gateway** tab → **Add Channel**.
+2. Fill in:
+   - **Name** — e.g., "Teams: Platform Team"
+   - **Channel Type** — Select `teams`.
+   - **Target Branch** — Pick the branch where sessions will run. Ideally, this is an [assistant](/guide/assistants) branch.
+   - **App ID** — Your Azure Bot's Application (client) ID.
+   - **App Password** — The Azure Bot client secret value (encrypted at rest).
+   - **Tenant ID** — Your Azure AD tenant ID.
+3. Optionally configure:
+   - **Webhook Port** — Port for the Bot Framework endpoint (default: `3978`).
+   - **Webhook Path** — Path for inbound activities (default: `/api/messages`).
+   - **Require mention** — Require an `@mention` to trigger in channels and group chats (default: on).
+4. Save. The webhook listener starts immediately.
+
+### 4. Message the Bot or @mention agor
+
+In a 1:1 chat, just message the bot. In a channel, post `@agor review this thread`. Agor:
+
+1. Receives the activity via the webhook.
+2. Creates (or resumes) the session mapped to that conversation.
+3. Runs the agent on the target branch.
+4. Posts the agent's response back into the same chat or channel thread.
+
+Follow-up messages in the same conversation continue the same session — the agent has full conversation history.
+
 ## Agentic Tool Configuration
 
 Each channel can define its own agent configuration, overriding the user's defaults:
@@ -225,7 +279,7 @@ The gateway is built as a set of loosely coupled components:
 - **Gateway Service** (`/gateway`) — Orchestrates inbound routing (platform to session) and outbound routing (session to platform). Custom FeathersJS service.
 - **Gateway Channels** (`/gateway-channels`) — CRUD for channel configurations with encrypted credential storage.
 - **Thread-Session Map** (`/thread-session-map`) — Persists the mapping between platform thread IDs and Agor session IDs.
-- **Connector Layer** — Platform-agnostic `GatewayConnector` interface with a registry pattern. Currently: `SlackConnector` (Socket Mode) and `GitHubConnector` (API polling). Adding a new platform means implementing `sendMessage()` and optionally `startListening()`.
+- **Connector Layer** — Platform-agnostic `GatewayConnector` interface with a registry pattern. Currently: `SlackConnector` (Socket Mode), `GitHubConnector` (API polling), and `TeamsConnector` (Bot Framework webhook). Adding a new platform means implementing `sendMessage()` and optionally `startListening()`.
 - **Outbound Hook** — FeathersJS `after.create` hook on the messages service. Fire-and-forget; never blocks message creation.
 
 ### Adding a New Platform
@@ -275,6 +329,13 @@ The `blocks` field is opaque platform-specific data — currently only the Slack
 - **Mentions detected but no session created.** The `require_mention` setting may be filtering incorrectly. Check that `mention_name` matches your app's slug (default: `agor`). Mentions inside code blocks are ignored by design.
 - **Response posted as wrong user.** GitHub comments should appear as the app's bot identity (e.g., `agor[bot]`). If comments appear as a human user, something is bypassing the connector and using a personal `GITHUB_TOKEN` instead.
 - **Rate limit errors.** At 15s polling with 5 repos, you use ~1,200 req/hour out of 5,000. If you're monitoring many repos, increase `poll_interval_ms` or use `watch_repos` to narrow scope.
+
+### Teams
+
+- **Bot doesn't receive messages.** Confirm the Azure Bot's **Messaging endpoint** points at `https://<your-daemon-host>/api/messages` and that the host is reachable from Azure. Check daemon logs for `[teams] Webhook server listening on port ...`.
+- **"Authentication failed" or replies never send.** Verify the **App ID**, **App Password** (the secret _value_), and **Tenant ID** are correct. A wrong or expired client secret blocks the bot from acquiring a token to reply.
+- **Bot doesn't respond to channel mentions.** In channels and group chats the bot only responds when `@mentioned` unless `require_mention` is disabled. Make sure the app is installed with the `team`/`groupChat` scope.
+- **Port already in use.** The default webhook port is `3978`. Change **Webhook Port** in the channel config if it collides with another service.
 
 ### General
 

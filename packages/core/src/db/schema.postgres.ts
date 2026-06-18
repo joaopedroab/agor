@@ -1616,7 +1616,7 @@ export const gatewayChannels = pgTable(
     // Materialized for queries
     name: text('name').notNull(),
     channel_type: text('channel_type', {
-      enum: ['slack', 'discord', 'whatsapp', 'telegram', 'github'],
+      enum: ['slack', 'discord', 'whatsapp', 'telegram', 'github', 'teams'],
     }).notNull(),
     target_branch_id: varchar('target_branch_id', { length: 36 })
       .notNull()

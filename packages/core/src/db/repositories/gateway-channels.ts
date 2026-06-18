@@ -34,6 +34,7 @@ const SENSITIVE_CONFIG_FIELDS = [
   'signing_secret', // Slack
   'private_key',
   'webhook_secret', // GitHub
+  'app_password', // Teams (Azure Bot App Secret)
 ];
 
 /** Sentinel value used by the API to redact sensitive fields in responses */

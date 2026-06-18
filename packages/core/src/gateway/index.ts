@@ -10,6 +10,11 @@ export { normalizeOutbound } from './connector';
 export { getConnector, hasConnector, registerConnector } from './connector-registry';
 export { GitHubConnector, parseThreadId as parseGitHubThreadId } from './connectors/github';
 export { SlackConnector } from './connectors/slack';
+export {
+  extractQuotedReplyText,
+  parseThreadId as parseTeamsThreadId,
+  TeamsConnector,
+} from './connectors/teams';
 export type { GatewayContext } from './context';
 export { formatGatewayContext } from './context';
 export { formatGatewaySystemMessage } from './system-message';

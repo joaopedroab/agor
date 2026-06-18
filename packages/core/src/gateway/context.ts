@@ -36,6 +36,7 @@ const PLATFORM_LABELS: Record<string, string> = {
   github: 'GitHub',
   whatsapp: 'WhatsApp',
   telegram: 'Telegram',
+  teams: 'Microsoft Teams',
 };
 
 /**

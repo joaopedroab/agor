@@ -390,6 +390,7 @@
     "@slack/web-api": "^7.17.0",
     "analytics": "^0.8.19",
     "bcryptjs": "^2.4.3",
+    "botbuilder": "^4.23.3",
     "cron-parser": "^5.5.0",
     "cronstrue": "^3.14.0",
     "drizzle-orm": "^0.45.2",
