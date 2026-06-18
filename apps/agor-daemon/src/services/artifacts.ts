@@ -48,6 +48,7 @@ import type {
   SandpackConfig,
   SandpackError,
   SandpackTemplate,
+  SessionID,
   UserID,
   UserRole,
 } from '@agor/core/types';
@@ -357,6 +358,25 @@ export class ArtifactsService extends DrizzleService<Artifact, Partial<Artifact>
   }
 
   /**
+   * Direct REST/service updates are metadata-only and must not rewrite
+   * provenance. `source_session_id` is stamped by publishArtifact() from the
+   * trusted MCP/session context; letting generic PATCH/UPDATE mutate it would
+   * make the "created by session" link spoofable.
+   */
+  private stripClientControlledProvenance(data: Partial<Artifact>): Partial<Artifact> {
+    const { source_session_id: _sourceSessionId, ...safeData } = data;
+    return safeData;
+  }
+
+  async update(id: string | number, data: Partial<Artifact>, params?: unknown): Promise<Artifact> {
+    return (await super.update(
+      id,
+      this.stripClientControlledProvenance(data),
+      params as never
+    )) as Artifact;
+  }
+
+  /**
    * Patch override: route board_id and placement changes through
    * updateMetadata so the board_objects entry is moved/resized alongside the
    * row update. Plain metadata patches fall through to the default
@@ -398,7 +418,11 @@ export class ArtifactsService extends DrizzleService<Artifact, Partial<Artifact>
       );
     }
 
-    return (await super.patch(id, data as Partial<Artifact>, params as never)) as Artifact;
+    return (await super.patch(
+      id,
+      this.stripClientControlledProvenance(data) as Partial<Artifact>,
+      params as never
+    )) as Artifact;
   }
 
   /**
@@ -446,6 +470,7 @@ export class ArtifactsService extends DrizzleService<Artifact, Partial<Artifact>
     data: {
       folderPath?: string;
       branch_id?: string;
+      source_session_id?: SessionID | null;
       subpath?: string;
       board_id?: string;
       name?: string;
@@ -547,6 +572,7 @@ export class ArtifactsService extends DrizzleService<Artifact, Partial<Artifact>
       const updated = await this.artifactRepo.update(existing.artifact_id, {
         name: resolvedName,
         branch_id: matchedBranchId ?? existing.branch_id ?? null,
+        source_session_id: data.source_session_id ?? existing.source_session_id ?? null,
         files,
         dependencies: cachedDeps,
         entry: cachedEntry,
@@ -584,6 +610,7 @@ export class ArtifactsService extends DrizzleService<Artifact, Partial<Artifact>
       artifact_id: artifactId,
       board_id: resolvedBoardId,
       branch_id: matchedBranchId,
+      source_session_id: data.source_session_id ?? null,
       name: resolvedName,
       path: folderPath,
       template,
@@ -1002,6 +1029,7 @@ export class ArtifactsService extends DrizzleService<Artifact, Partial<Artifact>
 
     const payload: ArtifactPayload = {
       artifact_id: artifact.artifact_id,
+      source_session_id: artifact.source_session_id ?? null,
       name: artifact.name,
       description: artifact.description,
       template: artifact.template,
