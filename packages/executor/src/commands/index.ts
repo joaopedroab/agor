@@ -8,6 +8,7 @@
  */
 
 import type { ExecutorPayload, ExecutorResult, PromptPayload } from '../payload-types.js';
+import { handleEnvironmentLifecycle, handleEnvironmentLogs } from './environment.js';
 import {
   handleBranchAgorYmlExport,
   handleBranchAgorYmlImport,
@@ -159,6 +160,8 @@ registerCommand('branch.files.list', handleBranchFilesList);
 registerCommand('branch.inspect', handleBranchInspect);
 registerCommand('branch.agor-yml.import', handleBranchAgorYmlImport);
 registerCommand('branch.agor-yml.export', handleBranchAgorYmlExport);
+registerCommand('environment.lifecycle', handleEnvironmentLifecycle);
+registerCommand('environment.logs', handleEnvironmentLogs);
 registerCommand('git.repo.realign-origin', handleGitRepoRealignOrigin);
 registerCommand('git.repo.delete', handleGitRepoDelete);
 registerCommand('unix.sync-repo', handleUnixSyncRepo);

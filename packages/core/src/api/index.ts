@@ -489,8 +489,15 @@ export interface BranchesService extends AgorService<Branch> {
    * Update environment status
    */
   updateEnvironment(
-    id: string,
-    environmentUpdate: Partial<Branch['environment_instance']>,
+    data:
+      | {
+          branch_id?: string;
+          branchId?: string;
+          environment_update?: Partial<Branch['environment_instance']>;
+          environmentUpdate?: Partial<Branch['environment_instance']>;
+        }
+      | string,
+    environmentUpdate?: Partial<Branch['environment_instance']>,
     params?: Params
   ): Promise<Branch>;
 
@@ -816,7 +823,11 @@ function extendBranchesService(client: AgorClient): void {
   };
   if (branchesService[BRANCHES_SERVICE_EXTENDED]) return;
   if (typeof branchesService.methods === 'function') {
-    branchesService.methods('initializeUnixGroup', 'ensureAssistantKnowledgeNamespace');
+    branchesService.methods(
+      'updateEnvironment',
+      'initializeUnixGroup',
+      'ensureAssistantKnowledgeNamespace'
+    );
   }
   branchesService[BRANCHES_SERVICE_EXTENDED] = true;
 }

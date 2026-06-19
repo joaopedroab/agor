@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type {
+  EnvironmentLifecyclePayload,
   GitBranchAddPayload,
   GitBranchRemovePayload,
   GitClonePayload,
@@ -23,6 +24,8 @@ describe('Command Registry', () => {
     expect(commands).toContain('branch.inspect');
     expect(commands).toContain('branch.agor-yml.import');
     expect(commands).toContain('branch.agor-yml.export');
+    expect(commands).toContain('environment.lifecycle');
+    expect(commands).toContain('environment.logs');
     expect(commands).toContain('git.repo.realign-origin');
     expect(commands).toContain('git.repo.delete');
     expect(commands).toContain('zellij.attach');
@@ -37,6 +40,8 @@ describe('Command Registry', () => {
     expect(hasCommand('branch.inspect')).toBe(true);
     expect(hasCommand('branch.agor-yml.import')).toBe(true);
     expect(hasCommand('branch.agor-yml.export')).toBe(true);
+    expect(hasCommand('environment.lifecycle')).toBe(true);
+    expect(hasCommand('environment.logs')).toBe(true);
     expect(hasCommand('git.repo.realign-origin')).toBe(true);
     expect(hasCommand('git.repo.delete')).toBe(true);
     expect(hasCommand('zellij.attach')).toBe(true);
@@ -46,6 +51,55 @@ describe('Command Registry', () => {
     expect(hasCommand('unknown')).toBe(false);
     expect(hasCommand('git.push')).toBe(false);
     expect(hasCommand('')).toBe(false);
+  });
+});
+
+describe('executeCommand - environment.lifecycle', () => {
+  const payload: EnvironmentLifecyclePayload = {
+    command: 'environment.lifecycle',
+    sessionToken: 'jwt-token',
+    params: {
+      branchId: '550e8400-e29b-41d4-a716-446655440000',
+      branchPath: '/data/agor/worktrees/repo/feature-x',
+      action: 'start',
+      startCommand: 'docker compose up -d --build',
+      appUrl: 'http://localhost:3000',
+    },
+  };
+
+  it('should handle environment.lifecycle in dry-run mode', async () => {
+    const result = await executeCommand(payload, { dryRun: true });
+
+    expect(result.success).toBe(true);
+    expect(result.data).toMatchObject({
+      dryRun: true,
+      command: 'environment.lifecycle',
+      action: 'start',
+      branchId: payload.params.branchId,
+    });
+  });
+});
+
+describe('executeCommand - environment.logs', () => {
+  const payload = {
+    command: 'environment.logs' as const,
+    sessionToken: 'jwt-token',
+    params: {
+      branchId: '550e8400-e29b-41d4-a716-446655440000',
+      branchPath: '/data/agor/worktrees/repo/feature-x',
+      logsCommand: 'docker compose logs --tail=100',
+    },
+  };
+
+  it('should handle environment.logs in dry-run mode', async () => {
+    const result = await executeCommand(payload, { dryRun: true });
+
+    expect(result.success).toBe(true);
+    expect(result.data).toMatchObject({
+      dryRun: true,
+      command: 'environment.logs',
+      branchId: payload.params.branchId,
+    });
   });
 });
 

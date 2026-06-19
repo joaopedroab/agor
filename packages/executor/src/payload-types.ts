@@ -539,6 +539,94 @@ export const BranchAgorYmlExportPayloadSchema = BasePayloadSchema.extend({
 export type BranchAgorYmlExportPayload = z.infer<typeof BranchAgorYmlExportPayloadSchema>;
 
 // ═══════════════════════════════════════════════════════════
+// Environment Lifecycle Payload
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Environment lifecycle payload - run shell-based start/stop/restart/nuke
+ * commands from the executor. Webhook lifecycle commands stay daemon-owned.
+ */
+export const EnvironmentLifecyclePayloadSchema = BasePayloadSchema.extend({
+  command: z.literal('environment.lifecycle'),
+
+  /** JWT for Feathers authentication */
+  sessionToken: z.string(),
+
+  params: z
+    .object({
+      /** Branch ID whose environment is being controlled */
+      branchId: z.string().uuid(),
+
+      /** Branch checkout path. Executor refetches the branch but this avoids ambiguity. */
+      branchPath: z.string().optional(),
+
+      /** Lifecycle action */
+      action: z.enum(['start', 'stop', 'restart', 'nuke']),
+
+      /** Shell start command. Required for start/restart. */
+      startCommand: z.string().optional(),
+
+      /** Shell stop command. Required for stop and used before restart when present. */
+      stopCommand: z.string().optional(),
+
+      /** Shell nuke command. Required for nuke. */
+      nukeCommand: z.string().optional(),
+
+      /** Static app URL rendered by the daemon/branch snapshot. */
+      appUrl: z.string().optional(),
+    })
+    .superRefine((params, ctx) => {
+      if ((params.action === 'start' || params.action === 'restart') && !params.startCommand) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['startCommand'],
+          message: 'startCommand is required for start/restart',
+        });
+      }
+      if (params.action === 'stop' && !params.stopCommand) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['stopCommand'],
+          message: 'stopCommand is required for stop',
+        });
+      }
+      if (params.action === 'nuke' && !params.nukeCommand) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['nukeCommand'],
+          message: 'nukeCommand is required for nuke',
+        });
+      }
+    }),
+});
+
+export type EnvironmentLifecyclePayload = z.infer<typeof EnvironmentLifecyclePayloadSchema>;
+
+/**
+ * Environment logs payload - run shell-based logs command from executor.
+ * Webhook logs stay daemon-owned.
+ */
+export const EnvironmentLogsPayloadSchema = BasePayloadSchema.extend({
+  command: z.literal('environment.logs'),
+
+  /** JWT for Feathers authentication */
+  sessionToken: z.string(),
+
+  params: z.object({
+    /** Branch ID whose environment logs are being fetched */
+    branchId: z.string().uuid(),
+
+    /** Branch checkout path. Executor refetches the branch but this avoids ambiguity. */
+    branchPath: z.string().optional(),
+
+    /** Shell logs command */
+    logsCommand: z.string(),
+  }),
+});
+
+export type EnvironmentLogsPayload = z.infer<typeof EnvironmentLogsPayloadSchema>;
+
+// ═══════════════════════════════════════════════════════════
 // Git Repo Realign Origin Payload
 // ═══════════════════════════════════════════════════════════
 
@@ -802,6 +890,8 @@ export const ExecutorPayloadSchema = z.discriminatedUnion('command', [
   BranchInspectPayloadSchema,
   BranchAgorYmlImportPayloadSchema,
   BranchAgorYmlExportPayloadSchema,
+  EnvironmentLifecyclePayloadSchema,
+  EnvironmentLogsPayloadSchema,
   GitRepoRealignOriginPayloadSchema,
   GitRepoDeletePayloadSchema,
   UnixSyncBranchPayloadSchema,
@@ -864,6 +954,8 @@ export function getSupportedCommands(): string[] {
     'branch.inspect',
     'branch.agor-yml.import',
     'branch.agor-yml.export',
+    'environment.lifecycle',
+    'environment.logs',
     'git.repo.realign-origin',
     'git.repo.delete',
     'unix.sync-branch',

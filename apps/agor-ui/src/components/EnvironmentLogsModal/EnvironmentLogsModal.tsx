@@ -7,6 +7,8 @@ import { ErrorBoundary } from '../ErrorBoundary';
 
 const { Text } = Typography;
 
+const LOGS_AUTO_REFRESH_INTERVAL_MS = 10_000;
+
 interface EnvironmentLogsModalProps {
   open: boolean;
   onClose: () => void;
@@ -34,10 +36,12 @@ export const EnvironmentLogsModal: React.FC<EnvironmentLogsModalProps> = ({
   const logsContainerRef = useRef<HTMLDivElement>(null);
   const logsRef = useRef<LogsResponse | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fetchInFlightRef = useRef(false);
 
   const fetchLogs = useCallback(
     async (shouldAutoScroll = false, isManualRefresh = false) => {
-      if (!client) return;
+      if (!client || fetchInFlightRef.current) return;
+      fetchInFlightRef.current = true;
 
       // Check if user is scrolled to bottom before fetching
       const container = logsContainerRef.current;
@@ -76,6 +80,7 @@ export const EnvironmentLogsModal: React.FC<EnvironmentLogsModalProps> = ({
         setLogs(errorData);
         logsRef.current = errorData;
       } finally {
+        fetchInFlightRef.current = false;
         if (isManualRefresh) {
           setLoading(false);
         }
@@ -106,7 +111,7 @@ export const EnvironmentLogsModal: React.FC<EnvironmentLogsModalProps> = ({
     if (autoRefresh && open) {
       intervalRef.current = setInterval(() => {
         fetchLogs(true); // true = enable auto-scroll
-      }, 3000); // 3 seconds
+      }, LOGS_AUTO_REFRESH_INTERVAL_MS);
     }
 
     // Cleanup on unmount or when dependencies change

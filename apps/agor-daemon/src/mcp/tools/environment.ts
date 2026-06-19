@@ -27,7 +27,12 @@ export function registerEnvironmentTools(server: McpServer, ctx: McpContext): vo
           branchId as BranchID,
           ctx.baseServiceParams
         );
-        return textResult({ success: true, branch });
+        return textResult({
+          success: true,
+          branch,
+          message:
+            'Environment start requested. Poll agor_environment_health and agor_environment_logs for readiness, progress, or failures.',
+        });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
         const commandOutput =
@@ -62,7 +67,12 @@ export function registerEnvironmentTools(server: McpServer, ctx: McpContext): vo
           branchId as BranchID,
           ctx.baseServiceParams
         );
-        return textResult({ success: true, branch });
+        return textResult({
+          success: true,
+          branch,
+          message:
+            'Environment stop requested. Poll agor_environment_health for final status and agor_environment_logs for command output.',
+        });
       } catch (error) {
         return textResult({
           success: false,
@@ -112,7 +122,7 @@ export function registerEnvironmentTools(server: McpServer, ctx: McpContext): vo
     'agor_environment_logs',
     {
       description:
-        'Fetch recent logs from a branch environment (non-streaming, last ~100 lines; shell command by default, or HTTP(S) GET webhook when URL-shaped / webhook-only mode)',
+        'Fetch recent logs from a branch environment (non-streaming, last ~500 lines; shell command by default, or HTTP(S) GET webhook when URL-shaped / webhook-only mode)',
       annotations: { readOnlyHint: true },
       inputSchema: z.object({
         branchId: mcpRequiredId('branchId', 'Branch'),
@@ -244,7 +254,9 @@ export function registerEnvironmentTools(server: McpServer, ctx: McpContext): vo
           return textResult({
             success: true,
             branch: started,
-            message: `Environment variant set to "${updated.environment_variant}" and started.`,
+            message:
+              `Environment variant set to "${updated.environment_variant}" and start requested. ` +
+              'Poll agor_environment_health and agor_environment_logs for readiness, progress, or failures.',
           });
         } catch (startError) {
           const startMessage = startError instanceof Error ? startError.message : 'Unknown error';
@@ -297,7 +309,8 @@ export function registerEnvironmentTools(server: McpServer, ctx: McpContext): vo
         return textResult({
           success: true,
           branch,
-          message: 'Environment nuked successfully - all data and volumes destroyed',
+          message:
+            'Environment nuke requested. Poll agor_environment_health for final status and agor_environment_logs for command output.',
         });
       } catch (error) {
         return textResult({

@@ -7,17 +7,21 @@
 
 import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
 import { analyticsLogger } from '@agor/core/analytics';
-import { ENVIRONMENT, isBranchRbacEnabled, loadConfig, PAGINATION } from '@agor/core/config';
+import {
+  createUserProcessEnvironment,
+  ENVIRONMENT,
+  isBranchRbacEnabled,
+  loadConfig,
+  PAGINATION,
+} from '@agor/core/config';
 import {
   BoardRepository,
   BranchRepository,
   type BranchWithZoneAndSessions,
   type Database,
   KnowledgeNamespaceRepository,
+  UsersRepository,
 } from '@agor/core/db';
 import { renderBranchSnapshot } from '@agor/core/environment/render-snapshot';
 import {
@@ -44,7 +48,11 @@ import type {
   UUID,
 } from '@agor/core/types';
 import { getAssistantConfig, isAssistant } from '@agor/core/types';
-import { getGidFromGroupName, spawnEnvironmentCommand } from '@agor/core/unix';
+import {
+  getGidFromGroupName,
+  resolveUnixUserForImpersonation,
+  validateResolvedUnixUser,
+} from '@agor/core/unix';
 import { resolveHostIpAddress } from '@agor/core/utils/host-ip';
 import { isAllowedHealthCheckUrl } from '@agor/core/utils/url';
 import { DrizzleService } from '../adapters/drizzle';
@@ -53,7 +61,12 @@ import { ensureCanControlBranchEnvironment } from '../utils/branch-authorization
 import { shouldUseCloneReferencePath } from '../utils/clone-reference.js';
 import { resolveGitImpersonationForBranch } from '../utils/git-impersonation.js';
 import { parseLastMessageTruncationLength } from '../utils/query-params.js';
-import { generateSessionToken, getDaemonUrl, spawnExecutor } from '../utils/spawn-executor.js';
+import {
+  generateSessionToken,
+  getDaemonUrl,
+  runExecutorCommand,
+  spawnExecutor,
+} from '../utils/spawn-executor.js';
 import { ensureAssistantKnowledgeNamespace as ensureAssistantKnowledgeNamespaceForBranch } from './assistant-knowledge.js';
 import { isKnowledgeAdmin } from './knowledge-access.js';
 import type { InternalEnrichmentParams } from './sessions';
@@ -76,6 +89,24 @@ export type BranchParams = QueryParams<{
     /** Root-level include_sessions flag (bypasses Feathers query filtering, used by internal service calls) */
     _include_sessions?: boolean | 'true' | 'false';
   };
+
+type EnvironmentLifecycleAction = 'start' | 'stop' | 'restart' | 'nuke';
+
+interface EnvironmentLifecycleExecutorPayload extends Record<string, unknown> {
+  command: 'environment.lifecycle';
+  sessionToken: string;
+  daemonUrl: string;
+  env: Record<string, string>;
+  params: {
+    branchId: BranchID;
+    branchPath: string;
+    action: EnvironmentLifecycleAction;
+    startCommand?: string;
+    stopCommand?: string;
+    nukeCommand?: string;
+    appUrl?: string;
+  };
+}
 
 /**
  * Process tracking for environment management
@@ -271,6 +302,185 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
       body: Buffer.concat(chunks, total).toString('utf8'),
       truncated,
     };
+  }
+
+  private async resolveEnvironmentExecutorContext(branch: Branch): Promise<{
+    asUser?: string;
+    env: Record<string, string>;
+  }> {
+    const config = await loadConfig();
+    const unixUserMode = config.execution?.unix_user_mode ?? 'simple';
+    let asUser: string | undefined;
+
+    if (unixUserMode !== 'simple') {
+      const usersRepo = new UsersRepository(this.db);
+      const user = await usersRepo.findById(branch.created_by);
+      const impersonationResult = resolveUnixUserForImpersonation({
+        mode: unixUserMode,
+        userUnixUsername: user?.unix_username,
+        executorUnixUser: config.execution?.executor_unix_user,
+      });
+
+      asUser = impersonationResult.unixUser ?? undefined;
+      if (asUser) {
+        validateResolvedUnixUser(unixUserMode, asUser);
+      }
+    }
+
+    const env = await createUserProcessEnvironment(branch.created_by, this.db, undefined, !!asUser);
+    return { asUser, env };
+  }
+
+  private async createEnvironmentExecutorPayload(options: {
+    branch: Branch;
+    action: EnvironmentLifecycleAction;
+    params?: BranchParams;
+  }): Promise<{
+    payload: EnvironmentLifecycleExecutorPayload;
+    asUser?: string;
+    env: Record<string, string>;
+  }> {
+    const { branch, action, params } = options;
+    const userId =
+      ((params as AuthenticatedParams | undefined)?.user?.user_id as UserID | undefined) ??
+      branch.created_by;
+    const appWithToken = this.app as unknown as {
+      sessionTokenService?: import('../services/session-token-service').SessionTokenService;
+    };
+    const sessionToken = await appWithToken.sessionTokenService?.generateToken(
+      `environment-${action}`,
+      userId,
+      { branchId: branch.branch_id, maxUses: -1 }
+    );
+    if (!sessionToken) {
+      throw new Error(`Session token service unavailable; cannot dispatch environment ${action}`);
+    }
+
+    const { asUser, env } = await this.resolveEnvironmentExecutorContext(branch);
+
+    return {
+      asUser,
+      env,
+      payload: {
+        command: 'environment.lifecycle',
+        sessionToken,
+        daemonUrl: getDaemonUrl(),
+        env,
+        params: {
+          branchId: branch.branch_id,
+          branchPath: branch.path,
+          action,
+          startCommand: branch.start_command,
+          stopCommand: branch.stop_command,
+          nukeCommand: branch.nuke_command,
+          appUrl: branch.app_url,
+        },
+      },
+    };
+  }
+
+  private async dispatchEnvironmentExecutor(options: {
+    branch: Branch;
+    action: EnvironmentLifecycleAction;
+    params?: BranchParams;
+  }): Promise<void> {
+    const { branch, action } = options;
+    const { payload, asUser, env } = await this.createEnvironmentExecutorPayload(options);
+
+    spawnExecutor(payload, {
+      logPrefix: `[Environment.${action} ${branch.name}]`,
+      asUser,
+      preparedEnv: env,
+      templateVariables: {
+        branch_id: branch.branch_id,
+      },
+    });
+  }
+
+  private async runEnvironmentExecutor(options: {
+    branch: Branch;
+    action: EnvironmentLifecycleAction;
+    params?: BranchParams;
+  }): Promise<void> {
+    const { branch, action } = options;
+    const { payload, asUser, env } = await this.createEnvironmentExecutorPayload(options);
+
+    const result = await runExecutorCommand(payload, {
+      logPrefix: `[Environment.${action} ${branch.name}]`,
+      asUser,
+      preparedEnv: env,
+      // Mixed webhook/shell restart needs the daemon to wait for shell stop
+      // before it invokes the daemon-owned webhook start. Keep this generous
+      // enough for docker compose down while still bounding the request.
+      timeoutMs: 10 * 60_000,
+      templateVariables: {
+        branch_id: branch.branch_id,
+      },
+    });
+
+    if (!result.success) {
+      const details = result.error?.details as { output?: string } | undefined;
+      const error = new Error(
+        result.error?.message || 'Executor environment command failed'
+      ) as Error & {
+        commandOutput?: string;
+      };
+      error.commandOutput = details?.output;
+      throw error;
+    }
+  }
+
+  private async fetchEnvironmentLogsViaExecutor(
+    branch: Branch,
+    logsCommand: string,
+    params?: BranchParams
+  ): Promise<{ stdout: string; stderr: string; truncated: boolean }> {
+    const userId =
+      ((params as AuthenticatedParams | undefined)?.user?.user_id as UserID | undefined) ??
+      branch.created_by;
+    const appWithToken = this.app as unknown as {
+      sessionTokenService?: import('../services/session-token-service').SessionTokenService;
+    };
+    const sessionToken = await appWithToken.sessionTokenService?.generateToken(
+      'environment-logs',
+      userId,
+      { branchId: branch.branch_id, maxUses: -1 }
+    );
+    if (!sessionToken) {
+      throw new Error('Session token service unavailable; cannot fetch environment logs');
+    }
+
+    const { asUser, env } = await this.resolveEnvironmentExecutorContext(branch);
+    const result = await runExecutorCommand(
+      {
+        command: 'environment.logs',
+        sessionToken,
+        daemonUrl: getDaemonUrl(),
+        env,
+        params: {
+          branchId: branch.branch_id,
+          branchPath: branch.path,
+          logsCommand,
+        },
+      },
+      {
+        logPrefix: `[Environment.logs ${branch.name}]`,
+        asUser,
+        preparedEnv: env,
+        timeoutMs: ENVIRONMENT.LOGS_TIMEOUT_MS,
+        templateVariables: {
+          branch_id: branch.branch_id,
+        },
+      }
+    );
+
+    if (!result.success) {
+      const details = result.error?.details as { output?: string } | undefined;
+      throw new Error(result.error?.message || details?.output || 'Failed to fetch logs');
+    }
+
+    const data = (result.data ?? {}) as { logs?: string; truncated?: boolean };
+    return { stdout: data.logs ?? '', stderr: '', truncated: data.truncated ?? false };
   }
 
   /**
@@ -1447,11 +1657,34 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
    * Custom method: Update environment status
    */
   async updateEnvironment(
-    id: BranchID,
-    environmentUpdate: Partial<Branch['environment_instance']>,
+    idOrData:
+      | BranchID
+      | {
+          branch_id?: BranchID;
+          branchId?: BranchID;
+          environment_update?: Partial<Branch['environment_instance']>;
+          environmentUpdate?: Partial<Branch['environment_instance']>;
+        },
+    environmentUpdateOrParams?: Partial<Branch['environment_instance']> | BranchParams,
     params?: BranchParams
   ): Promise<BranchWithZoneAndSessions> {
-    const existing = await this.get(id, params);
+    const isRpcEnvelope = typeof idOrData === 'object';
+    const id = isRpcEnvelope ? (idOrData.branch_id ?? idOrData.branchId) : idOrData;
+    const environmentUpdate = isRpcEnvelope
+      ? (idOrData.environment_update ?? idOrData.environmentUpdate)
+      : (environmentUpdateOrParams as Partial<Branch['environment_instance']> | undefined);
+    const resolvedParams = isRpcEnvelope
+      ? (environmentUpdateOrParams as BranchParams | undefined)
+      : params;
+
+    if (!id) {
+      throw new Error('Branch ID is required to update environment status');
+    }
+    if (!environmentUpdate) {
+      throw new Error('Environment update is required');
+    }
+
+    const existing = await this.get(id, resolvedParams);
 
     const updatedEnvironment = {
       ...existing.environment_instance,
@@ -1486,7 +1719,7 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
         environment_instance: updatedEnvironment,
         updated_at: new Date().toISOString(),
       },
-      params
+      resolvedParams
     );
 
     return branch;
@@ -1499,19 +1732,18 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     await this.ensureCanTriggerEnv(id, params, 'start branch environments');
     const branch = await this.get(id, params);
 
-    // Validate static start command exists
     if (!branch.start_command) {
       throw new Error('No start command configured for this branch');
     }
 
-    // Check if already running
     if (branch.environment_instance?.status === 'running') {
       throw new Error('Environment is already running');
     }
 
-    // Set status to 'starting' and record start timestamp
-    // Merge with existing process fields (e.g. pid from a failed stop) rather than replacing
-    // Clear last_error from previous attempts
+    const command = branch.start_command;
+    const execution = await this.resolveEnvironmentCommand(command, 'start');
+    const access_urls = branch.app_url ? [{ name: 'App', url: branch.app_url }] : undefined;
+
     await this.updateEnvironment(
       id,
       {
@@ -1520,6 +1752,7 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
           ...branch.environment_instance?.process,
           started_at: new Date().toISOString(),
         },
+        access_urls,
         last_health_check: undefined,
         last_error: undefined,
       },
@@ -1527,10 +1760,6 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     );
 
     try {
-      // Use static start_command (initialized from template at branch creation)
-      const command = branch.start_command;
-      const execution = await this.resolveEnvironmentCommand(command, 'start');
-
       console.log(
         `🚀 Starting environment for branch ${branch.name}: ${
           execution.kind === 'webhook'
@@ -1538,17 +1767,6 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
             : execution.command
         }`
       );
-
-      // Create log directory
-      const logPath = join(
-        homedir(),
-        '.agor',
-        'logs',
-        'branches',
-        branch.branch_id,
-        'environment.log'
-      );
-      await mkdir(dirname(logPath), { recursive: true });
 
       if (execution.kind === 'webhook') {
         await this.executeEnvironmentWebhook({
@@ -1560,80 +1778,11 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
         });
         console.log(`✅ Start webhook completed successfully for ${branch.name}`);
       } else {
-        // Execute command and wait for it to complete
-        // Use stdio: 'pipe' to capture output for error reporting
-        const childProcess = await spawnEnvironmentCommand({
-          command: execution.command,
-          branch,
-          db: this.db,
-          commandType: 'start',
-          stdio: 'pipe',
-          triggeredBy: this.extractTriggeredBy(params),
-        });
-
-        // Collect stdout/stderr for error reporting (last ~100 lines)
-        const outputChunks: string[] = [];
-        const MAX_OUTPUT_LINES = 100;
-
-        const collectOutput = (stream: NodeJS.ReadableStream | null, prefix?: string) => {
-          if (!stream) return;
-          stream.on('data', (chunk: Buffer) => {
-            const text = chunk.toString();
-            // Also forward to daemon console so logs aren't lost
-            if (prefix) {
-              process.stderr.write(text);
-            } else {
-              process.stdout.write(text);
-            }
-            outputChunks.push(text);
-          });
-        };
-        collectOutput(childProcess.stdout);
-        collectOutput(childProcess.stderr, 'stderr');
-
-        await new Promise<void>((resolve, reject) => {
-          childProcess.on('exit', (code: number | null) => {
-            if (code === 0) {
-              console.log(`✅ Start command completed successfully for ${branch.name}`);
-              resolve();
-            } else {
-              // Combine collected output and truncate to last ~100 lines
-              const fullOutput = outputChunks.join('');
-              const lines = fullOutput.split('\n');
-              const truncated =
-                lines.length > MAX_OUTPUT_LINES
-                  ? `... (truncated ${lines.length - MAX_OUTPUT_LINES} lines)\n${lines.slice(-MAX_OUTPUT_LINES).join('\n')}`
-                  : fullOutput;
-              const output = truncated.trim();
-              const err = new Error(`Start command exited with code ${code}`) as Error & {
-                commandOutput?: string;
-              };
-              err.commandOutput = output || undefined;
-              reject(err);
-            }
-          });
-
-          childProcess.on('error', (error: Error) => reject(error));
-        });
+        await this.dispatchEnvironmentExecutor({ branch, action: 'start', params });
       }
 
-      // Use static app_url (initialized from template at branch creation)
-      let access_urls: Array<{ name: string; url: string }> | undefined;
-      if (branch.app_url) {
-        access_urls = [{ name: 'App', url: branch.app_url }];
-      }
-
-      // Keep status as 'starting' - let health checks transition to 'running'
-      // The first successful health check will transition from 'starting' → 'running'
-      // This prevents premature "healthy" status before app is truly ready
-      return await this.updateEnvironment(
-        id,
-        {
-          // Don't change status - keep as 'starting' until first successful health check
-          access_urls,
-        },
-        params
-      );
+      // Keep status as 'starting' - let health checks transition to 'running'.
+      return await this.get(id, params);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       const commandOutput =
@@ -1641,7 +1790,6 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
           ? (error as Error & { commandOutput?: string }).commandOutput
           : undefined;
 
-      // Store short message in last_health_check, full output in last_error
       await this.updateEnvironment(
         id,
         {
@@ -1667,21 +1815,11 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     await this.ensureCanTriggerEnv(id, params, 'stop branch environments');
     const branch = await this.get(id, params);
 
-    // Set status to 'stopping'
-    await this.updateEnvironment(
-      id,
-      {
-        status: 'stopping',
-      },
-      params
-    );
+    await this.updateEnvironment(id, { status: 'stopping' }, params);
 
     try {
-      // Check if we have a static stop command
       if (branch.stop_command) {
-        // Use static stop_command (initialized from template at branch creation)
-        const command = branch.stop_command;
-        const execution = await this.resolveEnvironmentCommand(command, 'stop');
+        const execution = await this.resolveEnvironmentCommand(branch.stop_command, 'stop');
 
         console.log(
           `🛑 Stopping environment for branch ${branch.name}: ${
@@ -1700,35 +1838,17 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
             maxBytes: 16 * 1024,
           });
         } else {
-          // Execute down command
-          const stopProcess = await spawnEnvironmentCommand({
-            command: execution.command,
-            branch,
-            db: this.db,
-            commandType: 'stop',
-            triggeredBy: this.extractTriggeredBy(params),
-          });
-
-          await new Promise<void>((resolve, reject) => {
-            stopProcess.on('exit', (code: number | null) => {
-              if (code === 0) {
-                resolve();
-              } else {
-                reject(new Error(`Down command exited with code ${code}`));
-              }
-            });
-
-            stopProcess.on('error', (error: Error) => reject(error));
-          });
+          await this.dispatchEnvironmentExecutor({ branch, action: 'stop', params });
+          return await this.get(id, params);
         }
       } else {
-        // No down command - kill the managed process if we have it
+        // No down command - kill the managed process if we have it. This is
+        // only meaningful for daemon-local legacy managed processes.
         const managedProcess = this.processes.get(id);
         if (managedProcess) {
           managedProcess.process.kill('SIGTERM');
           this.processes.delete(id);
         } else if (branch.environment_instance?.process?.pid) {
-          // Try to kill by PID stored in database
           try {
             process.kill(branch.environment_instance.process.pid, 'SIGTERM');
           } catch (error) {
@@ -1739,7 +1859,6 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
         }
       }
 
-      // Update status to 'stopped'
       return await this.updateEnvironment(
         id,
         {
@@ -1754,7 +1873,6 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
         params
       );
     } catch (error) {
-      // Update status to 'error'
       await this.updateEnvironment(
         id,
         {
@@ -1782,16 +1900,51 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     await this.ensureCanTriggerEnv(id, params, 'restart branch environments');
     const branch = await this.get(id, params);
 
-    // Stop if running
-    if (branch.environment_instance?.status === 'running') {
-      await this.stopEnvironment(id, params);
-
-      // Wait a bit for processes to clean up
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (!branch.start_command) {
+      throw new Error('No start command configured for this branch');
     }
 
-    // Start
-    return await this.startEnvironment(id, params);
+    if (branch.environment_instance?.status !== 'running') {
+      return await this.startEnvironment(id, params);
+    }
+
+    const startExecution = await this.resolveEnvironmentCommand(branch.start_command, 'start');
+
+    const stopExecution = branch.stop_command
+      ? await this.resolveEnvironmentCommand(branch.stop_command, 'stop')
+      : undefined;
+
+    if (!branch.stop_command || stopExecution?.kind === 'webhook') {
+      await this.stopEnvironment(id, params);
+      return await this.startEnvironment(id, params);
+    }
+
+    if (startExecution.kind === 'webhook') {
+      await this.updateEnvironment(id, { status: 'stopping' }, params);
+      await this.runEnvironmentExecutor({ branch, action: 'stop', params });
+      return await this.startEnvironment(id, params);
+    }
+
+    await this.updateEnvironment(id, { status: 'stopping' }, params);
+
+    try {
+      await this.dispatchEnvironmentExecutor({ branch, action: 'restart', params });
+      return await this.get(id, params);
+    } catch (error) {
+      await this.updateEnvironment(
+        id,
+        {
+          status: 'error',
+          last_health_check: {
+            timestamp: new Date().toISOString(),
+            status: 'unhealthy',
+            message: error instanceof Error ? error.message : 'Unknown error during restart',
+          },
+        },
+        params
+      );
+      throw error;
+    }
   }
 
   /**
@@ -1801,23 +1954,14 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     await this.ensureCanTriggerEnv(id, params, 'nuke branch environments');
     const branch = await this.get(id, params);
 
-    // Require nuke_command to be configured
     if (!branch.nuke_command) {
       throw new Error('No nuke_command configured for this branch');
     }
 
-    // Set status to 'stopping' (reuse stopping state for nuke)
-    await this.updateEnvironment(
-      id,
-      {
-        status: 'stopping',
-      },
-      params
-    );
+    await this.updateEnvironment(id, { status: 'stopping' }, params);
 
     try {
-      const command = branch.nuke_command;
-      const execution = await this.resolveEnvironmentCommand(command, 'nuke');
+      const execution = await this.resolveEnvironmentCommand(branch.nuke_command, 'nuke');
 
       console.log(
         `💣 NUKING environment for branch ${branch.name}: ${
@@ -1837,35 +1981,15 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
           maxBytes: 16 * 1024,
         });
       } else {
-        // Execute nuke command
-        const nukeProcess = await spawnEnvironmentCommand({
-          command: execution.command,
-          branch,
-          db: this.db,
-          commandType: 'nuke',
-          triggeredBy: this.extractTriggeredBy(params),
-        });
-
-        await new Promise<void>((resolve, reject) => {
-          nukeProcess.on('exit', (code: number | null) => {
-            if (code === 0) {
-              resolve();
-            } else {
-              reject(new Error(`Nuke command exited with code ${code}`));
-            }
-          });
-
-          nukeProcess.on('error', (error: Error) => reject(error));
-        });
+        await this.dispatchEnvironmentExecutor({ branch, action: 'nuke', params });
+        return await this.get(id, params);
       }
 
-      // Clean up any managed process references
       const managedProcess = this.processes.get(id);
       if (managedProcess) {
         this.processes.delete(id);
       }
 
-      // Update status to 'stopped' with clear nuke message
       return await this.updateEnvironment(
         id,
         {
@@ -1880,7 +2004,6 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
         params
       );
     } catch (error) {
-      // Update status to 'error'
       await this.updateEnvironment(
         id,
         {
@@ -2084,69 +2207,7 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
               triggeredBy: this.extractTriggeredBy(params),
               maxBytes: ENVIRONMENT.LOGS_MAX_BYTES,
             }).then(({ body, truncated }) => ({ stdout: body, stderr: '', truncated }))
-          : await new Promise<{
-              stdout: string;
-              stderr: string;
-              truncated: boolean;
-            }>((resolve, reject) => {
-              // Execute command with timeout and output limits
-              spawnEnvironmentCommand({
-                command: execution.command,
-                branch,
-                db: this.db,
-                commandType: 'logs',
-                stdio: 'pipe', // Need to capture output for logs
-                triggeredBy: this.extractTriggeredBy(params),
-              })
-                .then((childProcess) => {
-                  let stdout = '';
-                  let stderr = '';
-                  let truncated = false;
-
-                  // Set timeout
-                  const timeout = setTimeout(() => {
-                    childProcess.kill('SIGTERM');
-                    reject(
-                      new Error(
-                        `Logs command timed out after ${ENVIRONMENT.LOGS_TIMEOUT_MS / 1000}s`
-                      )
-                    );
-                  }, ENVIRONMENT.LOGS_TIMEOUT_MS);
-
-                  // Capture stdout with size limit
-                  childProcess.stdout?.on('data', (data: Buffer) => {
-                    const chunk = data.toString();
-                    if (stdout.length + chunk.length <= ENVIRONMENT.LOGS_MAX_BYTES) {
-                      stdout += chunk;
-                    } else {
-                      // Truncate to max bytes
-                      stdout += chunk.substring(0, ENVIRONMENT.LOGS_MAX_BYTES - stdout.length);
-                      truncated = true;
-                      childProcess.kill('SIGTERM');
-                    }
-                  });
-
-                  // Capture stderr
-                  childProcess.stderr?.on('data', (data: Buffer) => {
-                    stderr += data.toString();
-                  });
-
-                  childProcess.on('exit', (code: number | null) => {
-                    clearTimeout(timeout);
-                    if (code === 0 || stdout.length > 0) {
-                      resolve({ stdout, stderr, truncated });
-                    } else {
-                      reject(new Error(stderr || `Logs command exited with code ${code}`));
-                    }
-                  });
-
-                  childProcess.on('error', (error: Error) => {
-                    clearTimeout(timeout);
-                    reject(error);
-                  });
-                })
-                .catch(reject);
-            });
+          : await this.fetchEnvironmentLogsViaExecutor(branch, execution.command, params);
 
       // Process output: split into lines and keep last N lines
       const allLines = result.stdout.split('\n');
