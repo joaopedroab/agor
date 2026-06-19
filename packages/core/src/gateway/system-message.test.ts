@@ -4,6 +4,7 @@ import {
   formatGatewayMarkdownSessionReference,
   formatGatewaySessionCreatedMessage,
   formatGatewaySystemMessage,
+  formatGatewaySystemPayload,
 } from './system-message';
 
 const sessionId = '019e6fca-0000-7000-8000-000000000000';
@@ -30,12 +31,22 @@ describe('formatGatewaySystemMessage', () => {
   it('formats Slack follow-up routing messages with a clickable session link', () => {
     const text = formatGatewayFollowUpRoutingMessage(sessionId, sessionUrl);
 
-    expect(text).toBe(
-      `Follow-up received — routing to [session ${sessionShortId}](${sessionUrl})...`
-    );
+    expect(text).toBe(`Follow-up received — routing to [session](${sessionUrl}) ...`);
     expect(formatGatewaySystemMessage('slack', text)).toBe(
-      `Agor: Follow-up received — routing to <${sessionUrl}|session ${sessionShortId}>...`
+      `Agor: Follow-up received — routing to <${sessionUrl}|session> ...`
     );
+  });
+
+  it('formats Slack system messages as muted context-block payloads', () => {
+    expect(formatGatewaySystemPayload('slack', 'Creating new codex session...')).toEqual({
+      text: 'Agor: Creating new codex session...',
+      blocks: [
+        {
+          type: 'context',
+          elements: [{ type: 'mrkdwn', text: 'Agor: Creating new codex session...' }],
+        },
+      ],
+    });
   });
 
   it('falls back to a short session ID when no session URL is available', () => {
@@ -43,7 +54,7 @@ describe('formatGatewaySystemMessage', () => {
       `session ${sessionShortId}`
     );
     expect(formatGatewayFollowUpRoutingMessage(sessionId, null)).toBe(
-      `Follow-up received — routing to session ${sessionShortId}...`
+      `Follow-up received — routing to session ${sessionShortId} ...`
     );
   });
 
@@ -60,5 +71,11 @@ describe('formatGatewaySystemMessage', () => {
     expect(formatGatewaySystemMessage('github', `Session created: ${sessionUrl}`)).toBe(
       `Agor: Session created: ${sessionUrl}`
     );
+  });
+
+  it('keeps non-Slack system payloads text-only', () => {
+    expect(formatGatewaySystemPayload('github', `Session created: ${sessionUrl}`)).toEqual({
+      text: `Agor: Session created: ${sessionUrl}`,
+    });
   });
 });

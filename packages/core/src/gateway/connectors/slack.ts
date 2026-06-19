@@ -37,6 +37,8 @@ const TABLE_MAX_COLS = 20;
 // either path. Beyond this we drop to monospace, then text-only.
 const TABLE_MAX_CELL_CHARS = 3000;
 const SECTION_MAX_CHARS = 3000;
+// Slack's native markdown block currently caps cumulative markdown text at 12k chars.
+const MARKDOWN_BLOCK_MAX_CHARS = 12000;
 // Slack rejects messages with more than one `table` block.
 const MAX_TABLES_PER_MESSAGE = 1;
 // Slack rejects `chat.postMessage` with more than 50 blocks; if we'd exceed
@@ -47,7 +49,10 @@ const MAX_BLOCKS_PER_MESSAGE = 50;
 const BLOCK_PAYLOAD_ERRORS = new Set([
   'invalid_blocks',
   'invalid_blocks_format',
+  'invalid_block_type',
   'message_blocks_too_long',
+  'unknown_block_type',
+  'unsupported_block_type',
 ]);
 
 // GFM scanner regexes — hoisted so both `segmentMarkdown` and helpers share
@@ -56,6 +61,11 @@ const FENCE_LINE_RE = /^(`{3,}|~{3,})/;
 const PIPE_LINE_RE = /^\s*\|/;
 const TABLE_SEPARATOR_LINE_RE = /^\s*\|[\s:]*-[\s:-]*\|/;
 const TABLE_SEPARATOR_BLOCK_RE = /^\|[\s:]*-[\s:-]*\|/m;
+
+interface SlackMarkdownBlock {
+  type: 'markdown';
+  text: string;
+}
 
 interface SlackConfig {
   bot_token: string;
@@ -368,10 +378,32 @@ function monospaceFallbackBlock(tableLines: string[]): SectionBlock | null {
   };
 }
 
+function buildMarkdownBlock(markdown: string): SlackMarkdownBlock | null {
+  const trimmed = markdown.trim();
+  if (trimmed.length === 0 || trimmed.length > MARKDOWN_BLOCK_MAX_CHARS) return null;
+  return { type: 'markdown', text: markdown };
+}
+
+function tableHasRichMarkdown(tableLines: string[]): boolean {
+  return tableLines.some((line) =>
+    /(\*\*|__|~~|`|\[[^\]]+\]\([^)]*\)|<br\s*\/?\s*>|_[^_|]+_|(^|\|)\s*[-*+]\s+)/i.test(line)
+  );
+}
+
+function shouldUseNativeMarkdownBlock(markdown: string, segments: Segment[]): boolean {
+  if (!buildMarkdownBlock(markdown)) return false;
+
+  const tableSegments = segments.filter((segment) => segment.kind === 'table');
+  if (tableSegments.length > 1) return true;
+  return tableSegments.some((segment) => tableHasRichMarkdown(segment.lines));
+}
+
 /**
  * Build a Slack outbound payload from GitHub-flavored markdown.
  *
- * If the message contains GFM tables, emits a `blocks` array that uses
+ * If the message contains rich or multiple GFM tables and fits Slack's native
+ * markdown block budget, emits a `markdown` block so Slack can preserve richer
+ * table Markdown. Otherwise emits a `blocks` array that uses
  * Block Kit's native `table` block (Aug 2025) for the first qualifying
  * table and falls back to a monospace code block for any table that
  * exceeds Slack's caps (>{@link TABLE_MAX_ROWS} rows, >{@link TABLE_MAX_COLS}
@@ -391,8 +423,16 @@ export function markdownToSlackPayload(markdown: string): OutboundPayload {
   const text = markdownToMrkdwn(markdown);
 
   const segments = segmentMarkdown(markdown);
-  if (!segments.some((s) => s.kind === 'table')) {
+  const hasTable = segments.some((s) => s.kind === 'table');
+  if (!hasTable) {
     return { text };
+  }
+
+  if (shouldUseNativeMarkdownBlock(markdown, segments)) {
+    const markdownBlock = buildMarkdownBlock(markdown);
+    if (markdownBlock) {
+      return { text, blocks: [markdownBlock] };
+    }
   }
 
   const blocks: KnownBlock[] = [];
@@ -452,11 +492,13 @@ export class SlackConnector implements GatewayConnector {
     string,
     { email: string | null; displayName: string | null; expiresAt: number }
   >();
+  private inboundEventDedup = new Map<string, number>();
 
   /** Cache: Slack channel ID → channel name */
   private channelNameCache = new Map<string, { name: string | null; expiresAt: number }>();
   private static USER_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min for successful lookups
   private static USER_CACHE_ERROR_TTL_MS = 60 * 1000; // 1 min for errors (transient recovery)
+  private static INBOUND_EVENT_DEDUP_TTL_MS = 5 * 60 * 1000; // Slack may send message + app_mention for one user action
 
   /**
    * Cache: Slack channel ID → channel type string (channel/group/mpim/im).
@@ -593,6 +635,75 @@ export class SlackConnector implements GatewayConnector {
     }
   }
 
+  private async lookupLatestThreadReply(
+    event: Record<string, unknown>
+  ): Promise<Record<string, unknown> | null> {
+    const channel = typeof event.channel === 'string' ? event.channel : undefined;
+    const message =
+      typeof event.message === 'object' && event.message !== null
+        ? (event.message as Record<string, unknown>)
+        : undefined;
+    const threadTs =
+      (typeof message?.thread_ts === 'string' ? message.thread_ts : undefined) ??
+      (typeof message?.ts === 'string' ? message.ts : undefined) ??
+      (typeof event.thread_ts === 'string' ? event.thread_ts : undefined);
+    const replies = Array.isArray(message?.replies)
+      ? message.replies.filter((reply): reply is Record<string, unknown> => {
+          return typeof reply === 'object' && reply !== null;
+        })
+      : [];
+    const latestReplyTs =
+      (typeof message?.latest_reply === 'string' ? message.latest_reply : undefined) ??
+      (typeof event.latest_reply === 'string' ? event.latest_reply : undefined) ??
+      [...replies]
+        .reverse()
+        .map((reply) => (typeof reply.ts === 'string' ? reply.ts : undefined))
+        .find(Boolean);
+
+    if (!channel || !threadTs || !latestReplyTs) return null;
+
+    try {
+      const result = await this.web.conversations.replies({
+        channel,
+        ts: threadTs,
+        oldest: latestReplyTs,
+        inclusive: true,
+        limit: 1,
+      });
+      const reply =
+        result.messages?.find((candidate) => candidate.ts === latestReplyTs) ??
+        result.messages?.[0] ??
+        null;
+      if (!reply) return null;
+      return {
+        ...reply,
+        channel,
+        thread_ts: typeof reply.thread_ts === 'string' ? reply.thread_ts : threadTs,
+        team: event.team,
+      };
+    } catch (error) {
+      console.warn('[slack] Failed to fetch latest thread reply for message_replied event:', error);
+      return null;
+    }
+  }
+
+  private shouldProcessInboundEventOnce(
+    channel: string | undefined,
+    ts: string | undefined
+  ): boolean {
+    if (!channel || !ts) return true;
+
+    const now = Date.now();
+    for (const [key, expiresAt] of this.inboundEventDedup) {
+      if (expiresAt <= now) this.inboundEventDedup.delete(key);
+    }
+
+    const key = `${channel}:${ts}`;
+    if (this.inboundEventDedup.has(key)) return false;
+    this.inboundEventDedup.set(key, now + SlackConnector.INBOUND_EVENT_DEDUP_TTL_MS);
+    return true;
+  }
+
   /**
    * Cache a known channel type from a trusted source (e.g. `message` event with explicit `channel_type`).
    */
@@ -713,25 +824,39 @@ export class SlackConnector implements GatewayConnector {
   }): Promise<string> {
     const { channel, thread_ts } = parseThreadId(req.threadId);
     const blocks = req.blocks && req.blocks.length > 0 ? (req.blocks as KnownBlock[]) : undefined;
+    const updateTs =
+      typeof req.metadata?.slack_update_ts === 'string' ? req.metadata.slack_update_ts : undefined;
 
-    const post = (withBlocks: boolean) =>
-      this.web.chat.postMessage({
+    const send = (withBlocks: boolean) => {
+      const base = {
         channel,
-        thread_ts,
         text: req.text,
         ...(withBlocks && blocks ? { blocks } : {}),
         unfurl_links: false,
         unfurl_media: false,
-      });
+      };
 
-    let result: Awaited<ReturnType<typeof post>>;
+      if (updateTs) {
+        return this.web.chat.update({
+          ...base,
+          ts: updateTs,
+        });
+      }
+
+      return this.web.chat.postMessage({
+        ...base,
+        thread_ts,
+      });
+    };
+
+    let result: Awaited<ReturnType<typeof send>>;
     try {
-      result = await post(true);
+      result = await send(true);
     } catch (err) {
       const code = extractSlackErrorCode(err);
       if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
         console.warn(`[slack] Block payload rejected (${code}); retrying as text-only`);
-        result = await post(false);
+        result = await send(false);
       } else {
         throw err;
       }
@@ -741,7 +866,7 @@ export class SlackConnector implements GatewayConnector {
       const code = extractSlackErrorCode(result);
       if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
         console.warn(`[slack] Block payload rejected (${code}); retrying as text-only`);
-        const retry = await post(false);
+        const retry = await send(false);
         if (!retry.ok || !retry.ts) {
           throw new Error(`Slack API error: ${retry.error ?? 'unknown error'}`);
         }
@@ -752,6 +877,105 @@ export class SlackConnector implements GatewayConnector {
     }
 
     return result.ts;
+  }
+
+  async startStream(req: {
+    threadId: string;
+    text?: string;
+    recipientUserId?: string;
+    recipientTeamId?: string;
+  }): Promise<string> {
+    const { channel, thread_ts } = parseThreadId(req.threadId);
+    const chat = this.web.chat as unknown as {
+      startStream: (
+        args: Record<string, unknown>
+      ) => Promise<{ ok?: boolean; ts?: string; error?: string }>;
+    };
+    const result = await chat.startStream({
+      channel,
+      thread_ts,
+      markdown_text: req.text?.trim() ? req.text : ' ',
+      ...(req.recipientUserId ? { recipient_user_id: req.recipientUserId } : {}),
+      ...(req.recipientTeamId ? { recipient_team_id: req.recipientTeamId } : {}),
+    });
+    if (!result.ok || !result.ts) {
+      throw new Error(`Slack stream start error: ${result.error ?? 'unknown error'}`);
+    }
+    return result.ts;
+  }
+
+  async appendStream(req: { threadId: string; ts: string; text: string }): Promise<void> {
+    const { channel } = parseThreadId(req.threadId);
+    const chat = this.web.chat as unknown as {
+      appendStream: (args: Record<string, unknown>) => Promise<{ ok?: boolean; error?: string }>;
+    };
+    const result = await chat.appendStream({
+      channel,
+      ts: req.ts,
+      markdown_text: req.text,
+    });
+    if (!result.ok) {
+      throw new Error(`Slack stream append error: ${result.error ?? 'unknown error'}`);
+    }
+  }
+
+  async stopStream(req: { threadId: string; ts: string; text?: string }): Promise<void> {
+    const { channel } = parseThreadId(req.threadId);
+    const chat = this.web.chat as unknown as {
+      stopStream: (args: Record<string, unknown>) => Promise<{ ok?: boolean; error?: string }>;
+    };
+    const result = await chat.stopStream({
+      channel,
+      ts: req.ts,
+      ...(req.text ? { markdown_text: req.text } : {}),
+    });
+    if (!result.ok) {
+      throw new Error(`Slack stream stop error: ${result.error ?? 'unknown error'}`);
+    }
+  }
+
+  async deleteMessage(req: { threadId: string; messageId: string }): Promise<void> {
+    const { channel } = parseThreadId(req.threadId);
+    const result = await this.web.chat.delete({
+      channel,
+      ts: req.messageId,
+    });
+    if (!result.ok) {
+      throw new Error(`Slack delete error: ${result.error ?? 'unknown error'}`);
+    }
+  }
+
+  async setThreadStatus(req: {
+    threadId: string;
+    status: string;
+    loadingMessages?: string[];
+    iconEmoji?: string;
+  }): Promise<void> {
+    const { channel, thread_ts } = parseThreadId(req.threadId);
+    const web = this.web as unknown as {
+      assistant?: {
+        threads?: {
+          setStatus?: (args: Record<string, unknown>) => Promise<{ ok?: boolean; error?: string }>;
+        };
+      };
+      apiCall?: (
+        method: string,
+        args: Record<string, unknown>
+      ) => Promise<{ ok?: boolean; error?: string }>;
+    };
+    const args = {
+      channel_id: channel,
+      thread_ts,
+      status: req.status,
+      ...(req.loadingMessages?.length ? { loading_messages: req.loadingMessages } : {}),
+      ...(req.iconEmoji ? { icon_emoji: req.iconEmoji } : {}),
+    };
+    const result = web.assistant?.threads?.setStatus
+      ? await web.assistant.threads.setStatus(args)
+      : await web.apiCall?.('assistant.threads.setStatus', args);
+    if (!result?.ok) {
+      throw new Error(`Slack assistant status error: ${result?.error ?? 'unknown error'}`);
+    }
   }
 
   /**
@@ -836,7 +1060,20 @@ export class SlackConnector implements GatewayConnector {
       }
 
       await ack();
-      const event = body.event;
+      let event = body.event;
+      const slackTeamId =
+        typeof event.team === 'string'
+          ? event.team
+          : typeof body.team_id === 'string'
+            ? body.team_id
+            : Array.isArray(body.authorizations) &&
+                typeof body.authorizations[0]?.team_id === 'string'
+              ? body.authorizations[0].team_id
+              : undefined;
+      console.log(
+        `[slack] Processing ${eventType} event - channel: ${event.channel}, channel_type: ${event.channel_type}`
+      );
+
       // Skip bot messages to avoid loops
       if (event.bot_id || event.subtype === 'bot_message') {
         return;
@@ -845,6 +1082,35 @@ export class SlackConnector implements GatewayConnector {
       // Skip message edits, deletes, and other subtypes — only handle new messages
       // Note: app_mention events don't have subtypes
       if (eventType === 'message' && event.subtype) {
+        if (event.subtype === 'message_replied') {
+          const replyEvent = await this.lookupLatestThreadReply(event);
+          if (!replyEvent) {
+            console.log(
+              `[slack] Skipping message_replied event without fetchable latest reply channel=${event.channel ?? '(none)'} ts=${event.ts ?? '(none)'}`
+            );
+            return;
+          }
+          event = {
+            ...replyEvent,
+            type: 'message',
+            channel_type: event.channel_type,
+          };
+          console.log(
+            `[slack] Resolved message_replied event to latest reply thread_ts=${event.thread_ts ?? '(none)'} ts=${event.ts ?? '(none)'}`
+          );
+        } else {
+          console.debug(
+            `[slack] Skipping message subtype=${event.subtype} user=${event.user ?? '(none)'} thread_ts=${event.thread_ts ?? '(none)'} ts=${event.ts ?? '(none)'}`
+          );
+          return;
+        }
+      }
+
+      // Skip bot replies resolved from message_replied events to avoid loops.
+      if (event.bot_id || event.subtype === 'bot_message') {
+        console.debug(
+          `[slack] Skipping resolved bot message subtype=${event.subtype ?? '(none)'} thread_ts=${event.thread_ts ?? '(none)'} ts=${event.ts ?? '(none)'}`
+        );
         return;
       }
 
@@ -861,11 +1127,13 @@ export class SlackConnector implements GatewayConnector {
       // This happens for top-level messages AND thread replies.
       //
       // Strategy:
-      // - Use 'app_mention' for active mentions outside code blocks
-      // - Use 'message' for DMs, non-mention messages, and code-block-only mentions
-      // - Skip 'message' events that have active mentions (to avoid duplicates)
-      // - Skip 'app_mention' events where the mention is only inside code blocks
-      //   (those are not "real" mentions and should be handled as plain messages)
+      // - Process whichever event arrives first for an active mention (`message`
+      //   or `app_mention`) and dedupe by channel+ts. Relying only on
+      //   `app_mention` makes Socket Mode multi-connection/lost-event behavior
+      //   look like missed prompts.
+      // - Use `message` for DMs, non-mention messages, and code-block-only mentions.
+      // - Skip `app_mention` events where the mention is only inside code blocks
+      //   (those are not "real" mentions and should be handled as plain messages).
       const isThreadReply = !!event.thread_ts;
       const isChannelMessage = channelType === 'channel' || channelType === 'group';
 
@@ -886,12 +1154,6 @@ export class SlackConnector implements GatewayConnector {
 
       if (isChannelMessage && botMentionPattern) {
         const mentionOutsideCodeBlock = hasActiveMention(event.text ?? '', botMentionPattern);
-
-        if (eventType === 'message' && mentionOutsideCodeBlock) {
-          // Active (non-code-block) mention detected in a message event.
-          // Skip — the parallel app_mention event will handle it.
-          return;
-        }
 
         if (eventType === 'app_mention' && !mentionOutsideCodeBlock) {
           // app_mention fired but the mention is only inside a code block.
@@ -977,6 +1239,13 @@ export class SlackConnector implements GatewayConnector {
         }
       }
 
+      if (!this.shouldProcessInboundEventOnce(event.channel, event.ts)) {
+        console.log(
+          `[slack] Skipping duplicate inbound event type=${eventType} channel=${event.channel} ts=${event.ts}`
+        );
+        return;
+      }
+
       const threadId = event.thread_ts
         ? `${event.channel}-${event.thread_ts}`
         : `${event.channel}-${event.ts}`;
@@ -1010,6 +1279,8 @@ export class SlackConnector implements GatewayConnector {
         metadata: {
           channel: event.channel,
           channel_type: channelType,
+          ...(event.user ? { slack_user_id: event.user } : {}),
+          ...(slackTeamId ? { slack_team_id: slackTeamId } : {}),
           requires_mapping_verification: allowedViaThreadReplyException,
           ...(slackUserEmail ? { slack_user_email: slackUserEmail } : {}),
           ...(slackUserDisplayName ? { slack_user_name: slackUserDisplayName } : {}),
@@ -1040,8 +1311,8 @@ export class SlackConnector implements GatewayConnector {
    *
    * Returns `{ text, blocks? }`. `text` is the mrkdwn fallback used for
    * notifications and clients that don't render Block Kit; `blocks` is set
-   * when the message contains a GFM table that we can emit as a native
-   * Block Kit `table` block (or a monospace section fallback alongside one).
+   * when the message contains tables that can benefit from Slack's native
+   * markdown/table blocks.
    */
   formatMessage(markdown: string): OutboundPayload {
     return markdownToSlackPayload(markdown);

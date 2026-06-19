@@ -9,7 +9,7 @@ export type { GatewayConnector, InboundMessage, OutboundPayload } from './connec
 export { normalizeOutbound } from './connector';
 export { getConnector, hasConnector, registerConnector } from './connector-registry';
 export { GitHubConnector, parseThreadId as parseGitHubThreadId } from './connectors/github';
-export { SlackConnector } from './connectors/slack';
+export { markdownToMrkdwn, SlackConnector } from './connectors/slack';
 export {
   extractQuotedReplyText,
   parseThreadId as parseTeamsThreadId,
@@ -22,4 +22,5 @@ export {
   formatGatewayMarkdownSessionReference,
   formatGatewaySessionCreatedMessage,
   formatGatewaySystemMessage,
+  formatGatewaySystemPayload,
 } from './system-message';
