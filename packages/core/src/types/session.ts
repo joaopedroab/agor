@@ -17,7 +17,7 @@ import type {
   OpenCodePermissionMode,
 } from './agentic-tool';
 import type { ContextFilePath } from './context';
-import type { BoardID, BranchID, SessionID, TaskID } from './id';
+import type { BoardID, BranchID, SessionID, SessionRelationshipID, TaskID, UserID } from './id';
 import type { ScheduleID } from './schedule';
 
 export const SessionStatus = {
@@ -481,6 +481,52 @@ export interface Session {
    * - 'btw_completed': Ephemeral btw fork auto-archived after task completion
    */
   archived_reason?: 'branch_archived' | 'manual' | 'btw_completed';
+
+  /**
+   * Durable non-genealogy relationships involving this session.
+   *
+   * These are separate from genealogy.parent_session_id/forked_from_session_id.
+   * For example, a session in branch A can create a remote session in branch B;
+   * branch B keeps its own genealogy shape, while branch A can still render a
+   * muted/surrogate child card for track-record and navigation purposes.
+   */
+  remote_relationships?: {
+    as_source?: SessionRelationship[];
+    as_target?: SessionRelationship[];
+  };
+
+  /**
+   * UI-only marker for a remote-created session rendered as a surrogate in the
+   * source branch tree. The canonical session still lives in `target_branch_id`;
+   * clicking the surrogate should navigate to/open that real session.
+   */
+  remote_surrogate?: {
+    relationship: SessionRelationship;
+    source_session_id: SessionID;
+    source_branch_id: BranchID;
+    target_branch_id: BranchID;
+  };
+}
+
+export type SessionRelationshipType = 'remote_create';
+
+/**
+ * Durable links between sessions that are not necessarily canonical
+ * branch-local genealogy. Cross-branch delegation uses this instead of
+ * genealogy.parent_session_id so the local session tree, recursive delete,
+ * and fork/spawn semantics remain branch-local.
+ */
+export interface SessionRelationship {
+  relationship_id: SessionRelationshipID;
+  source_session_id: SessionID;
+  target_session_id: SessionID;
+  relationship_type: SessionRelationshipType;
+  created_by: UserID;
+  created_at: string;
+  updated_at?: string | null;
+  callback_enabled: boolean;
+  callback_session_id?: SessionID | null;
+  data?: Record<string, unknown> | null;
 }
 
 /**

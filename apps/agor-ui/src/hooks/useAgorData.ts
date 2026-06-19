@@ -288,6 +288,27 @@ function hasIdMatchingPrefix<T>(
  *                                  active-list query omits it because it is archived, fetch it by ID.
  * @returns Sessions, boards, loading state, and refetch function
  */
+
+function preserveSessionRelationshipFields(session: Session, existing?: Session): Session {
+  if (!existing) return session;
+
+  const remoteRelationships = session.remote_relationships ?? existing.remote_relationships;
+  const remoteSurrogate = session.remote_surrogate ?? existing.remote_surrogate;
+
+  if (
+    remoteRelationships === session.remote_relationships &&
+    remoteSurrogate === session.remote_surrogate
+  ) {
+    return session;
+  }
+
+  return {
+    ...session,
+    ...(remoteRelationships !== undefined && { remote_relationships: remoteRelationships }),
+    ...(remoteSurrogate !== undefined && { remote_surrogate: remoteSurrogate }),
+  };
+}
+
 export function useAgorData(
   client: AgorClient | null,
   options?: { enabled?: boolean; directSessionId?: string | null }
@@ -600,6 +621,54 @@ export function useAgorData(
           sessionsByBranchId.get(branchId)!.push(session);
         }
 
+        // Cross-branch remote-created sessions are canonical in their target
+        // branch, but should also appear as muted/surrogate children under
+        // the creating session's branch for track-record and navigation.
+        //
+        // Keep this as a UI projection only: the cloned session preserves the
+        // real session_id (so clicks open the real remote session) while using
+        // the source branch + source session as its local tree placement.
+        for (const sourceSession of sessionsList) {
+          if (sourceSession.archived) continue;
+
+          for (const relationship of sourceSession.remote_relationships?.as_source ?? []) {
+            if (relationship.relationship_type !== 'remote_create') continue;
+
+            const targetSession = sessionsById.get(relationship.target_session_id);
+            if (!targetSession || targetSession.archived) continue;
+            if (targetSession.branch_id === sourceSession.branch_id) continue;
+
+            const sourceBranchSessions = sessionsByBranchId.get(sourceSession.branch_id) ?? [];
+            if (
+              sourceBranchSessions.some(
+                (session) => session.session_id === targetSession.session_id
+              )
+            ) {
+              continue;
+            }
+
+            const remoteSurrogate: Session = {
+              ...targetSession,
+              branch_id: sourceSession.branch_id,
+              genealogy: {
+                ...(targetSession.genealogy ?? {}),
+                parent_session_id: sourceSession.session_id,
+              },
+              remote_surrogate: {
+                relationship,
+                source_session_id: sourceSession.session_id,
+                source_branch_id: sourceSession.branch_id,
+                target_branch_id: targetSession.branch_id,
+              },
+            };
+
+            sessionsByBranchId.set(sourceSession.branch_id, [
+              ...sourceBranchSessions,
+              remoteSurrogate,
+            ]);
+          }
+        }
+
         // Build board Map for efficient lookups
         const boardsMap = new Map<string, Board>();
         for (const board of boardsList) {
@@ -889,15 +958,17 @@ export function useAgorData(
           return next;
         }
 
+        const mergedSession = preserveSessionRelationshipFields(session, existing);
+
         // Bail out on no-op patches. Feathers always emits a fresh object so
         // `existing === session` never holds, but the daemon does emit
         // idempotent patches (e.g. callback bookkeeping that lands at the same
         // status). Shallow-equal misses nested fields the daemon reserializes
         // — that's a safe false negative.
-        if (existing && shallowEqualEntity(existing, session)) return prev;
+        if (existing && shallowEqualEntity(existing, mergedSession)) return prev;
 
         const next = new Map(prev);
-        next.set(session.session_id, session);
+        next.set(session.session_id, mergedSession);
         return next;
       });
 
@@ -921,10 +992,11 @@ export function useAgorData(
         };
 
         if (isArchived) {
-          if (oldBranchId) {
-            removeFromBranch(oldBranchId);
+          for (const [branchId, bucket] of next) {
+            if (bucket.some((item) => item.session_id === session.session_id)) {
+              removeFromBranch(branchId);
+            }
           }
-          removeFromBranch(newBranchId);
           return changed ? next : prev;
         }
 
@@ -942,21 +1014,47 @@ export function useAgorData(
           return next;
         }
 
+        const mergedSession = preserveSessionRelationshipFields(session, branchSessions[index]);
+
         // Bail out when the session is content-equal to what we already hold.
         // Mirrors the sessionById bailout above so an idempotent patch doesn't
         // produce a fresh branch-bucket array (which would invalidate
         // `data.sessions === n.sessions` in BranchNode's custom areEqual and
         // re-render every BranchCard on the affected branch).
         if (
-          branchSessions[index] === session ||
-          shallowEqualEntity(branchSessions[index], session)
+          branchSessions[index] === mergedSession ||
+          shallowEqualEntity(branchSessions[index], mergedSession)
         ) {
           return changed ? next : prev;
         }
 
         const updatedSessions = [...branchSessions];
-        updatedSessions[index] = session;
+        updatedSessions[index] = mergedSession;
         next.set(newBranchId, updatedSessions);
+
+        // Also update any remote/surrogate projections of this session that
+        // live in source-branch buckets. Preserve their local tree placement
+        // while refreshing status/callback_config/etc. from the canonical row.
+        for (const [branchId, bucket] of next) {
+          if (branchId === newBranchId) continue;
+
+          let bucketChanged = false;
+          const refreshedBucket = bucket.map((item) => {
+            if (item.session_id !== session.session_id) return item;
+            bucketChanged = true;
+            return {
+              ...preserveSessionRelationshipFields(session, item),
+              branch_id: item.branch_id,
+              genealogy: item.genealogy,
+              remote_surrogate: item.remote_surrogate,
+            };
+          });
+
+          if (bucketChanged) {
+            next.set(branchId, refreshedBucket);
+          }
+        }
+
         return next;
       });
     };
