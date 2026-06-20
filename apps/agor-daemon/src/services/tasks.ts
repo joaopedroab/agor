@@ -35,6 +35,7 @@ import {
   ExecutorHeartbeatCallbackRunner,
 } from '../utils/executor-heartbeat-callback.js';
 import { ensureRepoOriginAlignedById } from '../utils/realign-repo-origin';
+import type { TerminalQueueProcessingParams } from '../utils/session-task-state.js';
 import type { SessionsService } from './sessions';
 
 /**
@@ -60,9 +61,9 @@ export type TaskParams = QueryParams<{
 }> & {
   /**
    * Internal-only: terminal task patches normally transition the owning session
-   * back to idle. Heartbeat-loss handling marks the session failed instead.
+   * back to a promptable terminal state. Heartbeat-loss handling marks the session failed instead.
    */
-  suppressTerminalSessionIdle?: boolean;
+  suppressTerminalSessionStateUpdate?: boolean;
   /**
    * Internal-only: terminal task patches normally drain queued work for the
    * owning session. Heartbeat-loss handling must not auto-start queued prompts.
@@ -270,7 +271,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       },
       {
         ...params,
-        suppressTerminalSessionIdle: true,
+        suppressTerminalSessionStateUpdate: true,
         suppressTerminalQueueProcessing: true,
       }
     );
@@ -286,12 +287,19 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       );
       return failedTask;
     }
+    const sessionPatchParams: TerminalQueueProcessingParams = {
+      ...params,
+      suppressTerminalQueueProcessing: true,
+    };
     await this.app
       .service('sessions')
       .patch(
         failedTask.session_id,
-        { status: SessionStatus.FAILED, ready_for_prompt: true },
-        params
+        {
+          status: SessionStatus.FAILED,
+          ready_for_prompt: true,
+        },
+        sessionPatchParams
       )
       .catch((error: unknown) => {
         console.warn(
@@ -432,7 +440,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
 
     // Run completion side effects only for statuses that historically completed
     // executor turns. Timeout paths patch session state separately and should not
-    // enqueue callbacks, mark sessions idle, archive forks, or drain queues here.
+    // enqueue callbacks, mark sessions promptable, archive forks, or drain queues here.
     if (isCompletionSideEffectTransition) {
       // Since tasks are patched one at a time, result is always a single Task (not an array)
       const task = result as Task;
@@ -466,7 +474,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
 
           if (latestTaskId && latestTaskId !== task.task_id) {
             console.log(
-              `⏭️ [TasksService] Skipping session IDLE update - task ${shortId(task.task_id)} is not the latest (latest: ${shortId(latestTaskId)})`
+              `⏭️ [TasksService] Skipping session terminal-state update - task ${shortId(task.task_id)} is not the latest (latest: ${shortId(latestTaskId)})`
             );
             // Still process completion callbacks (task completed, callback target needs to know).
             // Route through the same centralized/idempotent dispatcher used by the normal
@@ -476,7 +484,8 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
           }
 
           // For STOPPED tasks: The stop endpoint directly patches session → IDLE with
-          // ready_for_prompt=false. Skip the session update here to avoid racing with it.
+          // ready_for_prompt=true and triggers queue processing after that patch.
+          // Skip the session update here to avoid racing with it.
           //
           // For other terminal tasks: Normal completion - set ready_for_prompt=true
           // to allow auto-queue-processing of any pending messages.
@@ -484,24 +493,25 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
 
           if (isUserInitiatedStop) {
             console.log(
-              `⏭️ [TasksService] Skipping session IDLE update for STOPPED task ${shortId(task.task_id)} — stop endpoint handles session state`
+              `⏭️ [TasksService] Skipping session terminal-state update for STOPPED task ${shortId(task.task_id)} — stop endpoint handles session state`
             );
-          } else if (params?.suppressTerminalSessionIdle) {
+          } else if (params?.suppressTerminalSessionStateUpdate) {
             console.log(
-              `⏭️ [TasksService] Skipping session IDLE update for task ${shortId(task.task_id)} (${data.status}) due to internal patch params`
+              `⏭️ [TasksService] Skipping session terminal-state update for task ${shortId(task.task_id)} (${data.status}) due to internal patch params`
             );
           } else {
             await this.app.service('sessions').patch(
               task.session_id,
               {
-                status: 'idle',
+                status:
+                  data.status === TaskStatus.FAILED ? SessionStatus.FAILED : SessionStatus.IDLE,
                 ready_for_prompt: true,
               },
               params
             );
 
             console.log(
-              `✅ [TasksService] Session ${shortId(task.session_id)} status updated to IDLE (task ${shortId(task.task_id)} ${data.status})`
+              `✅ [TasksService] Session ${shortId(task.session_id)} status updated after terminal task (task ${shortId(task.task_id)} ${data.status})`
             );
           }
 
@@ -528,8 +538,8 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
             await this.injectBtwResultMessage(task, session, params);
           }
 
-          // IMPORTANT: Now that session is idle, process any queued tasks (including callbacks)
-          // This handles the case where callbacks were queued while this session was running
+          // IMPORTANT: Now that the terminal task made the session promptable, process any queued tasks
+          // (including callbacks). This handles the case where callbacks were queued while this session was running
           const sessionsService = this.app.service('sessions') as unknown as SessionsService;
           if (!params?.suppressTerminalQueueProcessing && sessionsService.triggerQueueProcessing) {
             await sessionsService.triggerQueueProcessing(task.session_id);
@@ -700,8 +710,8 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       // CRITICAL: After queuing callback, ALWAYS trigger target's queue processing.
       // The queue processor uses a promise-based lock that will:
       // - If target is busy: wait for current processing, then retry (self-healing)
-      // - If target is idle: immediately process the callback
-      // - If target becomes idle while waiting: the retry will catch it
+      // - If target is promptable: immediately process the callback
+      // - If target becomes promptable while waiting: the retry will catch it
       //
       // DO NOT check target status before triggering - let the queue processor handle it.
       // This ensures callbacks are never missed due to timing issues.
