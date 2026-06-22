@@ -879,6 +879,129 @@ export class SlackConnector implements GatewayConnector {
     return result.ts;
   }
 
+  /**
+   * Send directly to a Slack channel or thread. Used for proactive outbound
+   * emits where no gateway thread_session_map exists yet.
+   */
+  async sendSlackMessage(req: {
+    channel: string;
+    text: string;
+    blocks?: unknown[];
+    thread_ts?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<{ ts: string; channel: string; thread_ts: string; permalink?: string | null }> {
+    const blocks = req.blocks && req.blocks.length > 0 ? (req.blocks as KnownBlock[]) : undefined;
+    const send = (withBlocks: boolean) =>
+      this.web.chat.postMessage({
+        channel: req.channel,
+        text: req.text,
+        ...(withBlocks && blocks ? { blocks } : {}),
+        ...(req.thread_ts ? { thread_ts: req.thread_ts } : {}),
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+
+    let result: Awaited<ReturnType<typeof send>>;
+    try {
+      result = await send(true);
+    } catch (err) {
+      const code = extractSlackErrorCode(err);
+      if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
+        console.warn(`[slack] Block payload rejected (${code}); retrying direct send as text-only`);
+        result = await send(false);
+      } else {
+        throw err;
+      }
+    }
+
+    if (!result.ok || !result.ts) {
+      const code = extractSlackErrorCode(result);
+      if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
+        const retry = await send(false);
+        if (!retry.ok || !retry.ts) {
+          throw new Error(`Slack API error: ${retry.error ?? 'unknown error'}`);
+        }
+        result = retry;
+      } else {
+        throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
+      }
+    }
+
+    const sentTs = result.ts;
+    if (!sentTs) {
+      throw new Error('Slack API error: missing message timestamp');
+    }
+    let permalink: string | null = null;
+    try {
+      const link = await this.web.chat.getPermalink({ channel: req.channel, message_ts: sentTs });
+      permalink = link.ok ? (link.permalink ?? null) : null;
+    } catch {
+      permalink = null;
+    }
+
+    return {
+      ts: sentTs,
+      channel: req.channel,
+      thread_ts: req.thread_ts ?? sentTs,
+      permalink,
+    };
+  }
+
+  /** Resolve a Slack channel by its human name (with or without #). */
+  async resolveChannelByName(name: string): Promise<{ channel: string; name: string }> {
+    const normalized = name.replace(/^#/, '').trim().toLowerCase();
+    if (!normalized) throw new Error('Slack channel name is required');
+
+    let cursor: string | undefined;
+    do {
+      const result = await this.web.conversations.list({
+        types: 'public_channel,private_channel',
+        limit: 1000,
+        ...(cursor ? { cursor } : {}),
+      });
+
+      if (!result.ok) {
+        throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
+      }
+
+      const channels = (result.channels ?? []) as Array<{
+        id?: string;
+        name?: string;
+        name_normalized?: string;
+        is_archived?: boolean;
+      }>;
+      const match = channels.find((channel) => {
+        if (channel.is_archived) return false;
+        return (channel.name_normalized ?? channel.name ?? '').toLowerCase() === normalized;
+      });
+      if (match?.id) {
+        return { channel: match.id, name: match.name ?? normalized };
+      }
+
+      cursor = result.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+
+    throw new Error(`Slack channel not found: #${normalized}`);
+  }
+
+  /** Resolve a Slack user email to a DM channel with that user. */
+  async openDmByEmail(email: string): Promise<{ channel: string; user_id: string }> {
+    const normalized = email.trim().toLowerCase();
+    if (!normalized) throw new Error('Slack user email is required');
+
+    const userResult = await this.web.users.lookupByEmail({ email: normalized });
+    if (!userResult.ok || !userResult.user?.id) {
+      throw new Error(`Slack user lookup failed: ${userResult.error ?? 'user_not_found'}`);
+    }
+
+    const dmResult = await this.web.conversations.open({ users: userResult.user.id });
+    if (!dmResult.ok || !dmResult.channel?.id) {
+      throw new Error(`Slack DM open failed: ${dmResult.error ?? 'unknown error'}`);
+    }
+
+    return { channel: dmResult.channel.id, user_id: userResult.user.id };
+  }
+
   async startStream(req: {
     threadId: string;
     text?: string;
