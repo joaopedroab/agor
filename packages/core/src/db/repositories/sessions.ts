@@ -358,18 +358,22 @@ export class SessionRepository implements BaseRepository<Session, Partial<Sessio
   /**
    * Find sessions by board ID
    *
-   * Uses materialized board_id column for O(1) indexed lookup.
-   * LEFT JOINs with branches to populate url (board_id already known from filter).
+   * A session relates to a board through its branch (session.branch_id →
+   * branch.board_id), so we filter on the JOINed `branches.board_id`. The
+   * `sessions.board_id` column is intentionally never populated (see
+   * `sessionToInsert`), so filtering on it would always return zero rows —
+   * the branch join is the authoritative source. This still pushes the
+   * filter down to SQL (one indexed JOIN), not an in-memory scan.
    */
   async findByBoard(boardId: string): Promise<Session[]> {
     try {
       const baseUrl = await getBaseUrl();
 
-      // Use materialized board_id column for indexed lookup
+      // Filter on the branch's board_id via the JOIN (sessions.board_id is dead).
       const results = await select(this.db)
         .from(sessions)
-        .leftJoin(branches, eq(sessions.branch_id, branches.branch_id))
-        .where(eq(sessions.board_id, boardId))
+        .innerJoin(branches, eq(sessions.branch_id, branches.branch_id))
+        .where(eq(branches.board_id, boardId))
         .all();
 
       return results.map(
@@ -387,6 +391,75 @@ export class SessionRepository implements BaseRepository<Session, Partial<Sessio
     } catch (error) {
       throw new RepositoryError(
         `Failed to find sessions by board: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Paginated session listing with SQL-side filtering, recency sort, and
+   * limit/offset. Powers the bounded first-paint slices (recent-N and the
+   * board-scoped set) so the cap, the recency ordering, and the board filter all
+   * run in SQL.
+   *
+   * Why SQL and not the generic in-memory path: the Session object exposes its
+   * last-updated time as `last_updated`, but callers sort by the DB column name
+   * `updated_at`. `DrizzleService.sortData` / `paginateClientSide` would look up
+   * `item.updated_at` (undefined) and no-op the sort, then slice an arbitrary
+   * page. Ordering here on the real `sessions.updated_at` column makes the
+   * recent-N slice actually recent. board_id is matched via the branches JOIN
+   * (`sessions.board_id` is never populated — see `sessionToInsert`).
+   *
+   * @returns `{ data, total }` where `total` is the full match count (so Feathers
+   *          pagination and the client `findAll` loop behave correctly).
+   */
+  async findPage(opts: {
+    boardId?: string;
+    archived?: boolean;
+    sortUpdatedAt?: 1 | -1;
+    limit?: number;
+    skip?: number;
+  }): Promise<{ data: Session[]; total: number }> {
+    try {
+      const baseUrl = await getBaseUrl();
+
+      const conditions = [];
+      if (opts.boardId !== undefined) conditions.push(eq(branches.board_id, opts.boardId));
+      if (opts.archived !== undefined) conditions.push(eq(sessions.archived, opts.archived));
+      const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+      // Total matching rows — drives Feathers pagination + the findAll loop.
+      const countQuery = select(this.db, { count: sql<number>`count(*)` })
+        .from(sessions)
+        .leftJoin(branches, eq(sessions.branch_id, branches.branch_id));
+      const countRow = await (whereClause ? countQuery.where(whereClause) : countQuery).one();
+      const total = Number(countRow?.count ?? 0);
+
+      // Page of rows, recency-sorted in SQL on the real `updated_at` column.
+      let dataQuery = select(this.db)
+        .from(sessions)
+        .leftJoin(branches, eq(sessions.branch_id, branches.branch_id));
+      if (whereClause) dataQuery = dataQuery.where(whereClause);
+      if (opts.sortUpdatedAt !== undefined) {
+        dataQuery = dataQuery.orderBy(
+          opts.sortUpdatedAt === -1 ? desc(sessions.updated_at) : sessions.updated_at
+        );
+      }
+      if (opts.limit !== undefined) dataQuery = dataQuery.limit(opts.limit);
+      if (opts.skip) dataQuery = dataQuery.offset(opts.skip);
+
+      const results = await dataQuery.all();
+      const data = results.map(
+        (result: { sessions: SessionRow; branches?: { board_id?: string } | null }) => {
+          const boardId = (result.branches?.board_id ?? null) as UUID | null;
+          return this.rowToSession(result.sessions, boardId, baseUrl);
+        }
+      );
+
+      return { data, total };
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to find sessions page: ${error instanceof Error ? error.message : String(error)}`,
         error
       );
     }
@@ -773,13 +846,20 @@ export class SessionRepository implements BaseRepository<Session, Partial<Sessio
    * (which returns all sessions without filtering).
    *
    * @param userId - User ID to check access for
+   * @param boardId - Optional board filter, pushed down to SQL via the branch
+   *                  join (session → branch → board). Lets callers scope to a
+   *                  single board without an in-memory pass.
    * @returns Array of accessible sessions with urls populated
    */
-  async findAccessibleSessions(userId: UUID): Promise<Session[]> {
+  async findAccessibleSessions(userId: UUID, boardId?: UUID): Promise<Session[]> {
     const baseUrl = await getBaseUrl();
 
     // Join branches for board_id (exposed as Session.branch_board_id).
     // No boards join needed — flat `/s/<short>/` URLs don't carry a slug.
+    const accessCondition = visibleBranchAccessCondition(this.db, userId);
+    const whereCondition = boardId
+      ? and(accessCondition, eq(branches.board_id, boardId))
+      : accessCondition;
     const results = await select(this.db)
       .from(sessions)
       .innerJoin(branches, eq(sessions.branch_id, branches.branch_id))
@@ -787,7 +867,7 @@ export class SessionRepository implements BaseRepository<Session, Partial<Sessio
         branchOwners,
         and(eq(branchOwners.branch_id, branches.branch_id), eq(branchOwners.user_id, userId))
       )
-      .where(visibleBranchAccessCondition(this.db, userId))
+      .where(whereCondition)
       .all();
 
     const seen = new Set<string>();

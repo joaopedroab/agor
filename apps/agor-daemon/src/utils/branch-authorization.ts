@@ -644,19 +644,56 @@ export function scopeSessionQuery(
     const userRole = context.params.user?.role as string | undefined;
     const allowSuperadmin = options?.allowSuperadmin ?? true;
 
+    // Push board_id down to SQL via the branch join (session → branch →
+    // board). The client-side pass below CANNOT filter board_id: sessions
+    // expose the board as `branch_board_id`, never `board_id`, so a generic
+    // `item.board_id === value` would wipe every row. We therefore both
+    // push it to SQL here AND skip it in paginateClientSide.
+    const query = context.params.query as Record<string, unknown> | undefined;
+    const boardId = query?.board_id as UUID | undefined;
+
     // Use optimized repository method (single SQL query with JOINs)
     const accessibleSessions = isSuperAdmin(userRole, allowSuperadmin)
-      ? await sessionRepo.findAll()
-      : await sessionRepo.findAccessibleSessions(userId);
+      ? boardId
+        ? await sessionRepo.findByBoard(boardId)
+        : await sessionRepo.findAll()
+      : await sessionRepo.findAccessibleSessions(userId, boardId);
 
-    // Apply remaining query filters (branch_id, schedule_id, status, etc.)
-    // client-side. Without this pass, `sessions.find({ schedule_id })`
-    // silently returns all accessible sessions — which is what the
-    // ScheduleRunsPanel was hitting before this fix.
-    context.result = paginateClientSide(
-      accessibleSessions,
-      context.params.query as Record<string, unknown> | undefined
-    );
+    // `updated_at` is the ONE sort key paginateClientSide can't order: the
+    // Session object exposes that timestamp as `last_updated`, so its
+    // `item.updated_at` lookup is undefined → a silent no-op. Handle exactly
+    // that single-key case here on the real field and strip it below. EVERY
+    // OTHER sort (created_at, scheduled_run_at, last_updated, …) maps to a real
+    // Session field, so it MUST pass through to paginateClientSide unchanged —
+    // dropping it here would silently break the ScheduleRunsPanel
+    // (`$sort:{scheduled_run_at:-1}`), branch/session/CLI lists
+    // (`$sort:{created_at:-1}`), and the MCP sessions tool (`$sort:{last_updated:-1}`).
+    const sortSpec = query?.$sort as Record<string, 1 | -1> | undefined;
+    const sortKeys = sortSpec ? Object.keys(sortSpec) : [];
+    const isUpdatedAtSort = sortKeys.length === 1 && sortKeys[0] === 'updated_at';
+    if (isUpdatedAtSort) {
+      const dir = sortSpec!.updated_at;
+      accessibleSessions.sort((a, b) => {
+        const av = a.last_updated ?? '';
+        const bv = b.last_updated ?? '';
+        if (av < bv) return dir === -1 ? 1 : -1;
+        if (av > bv) return dir === -1 ? -1 : 1;
+        return 0;
+      });
+    }
+
+    // Apply remaining query filters (branch_id, schedule_id, status, $sort, …)
+    // client-side. Without this pass, `sessions.find({ schedule_id })` silently
+    // returns all accessible sessions — which is what the ScheduleRunsPanel was
+    // hitting before this fix. board_id is already applied SQL-side above; the
+    // `updated_at`-only sort is applied above on the real field, so it's the
+    // only `$sort` we drop here (every other sort flows through).
+    let paginateQuery: Record<string, unknown> = query ?? {};
+    if (isUpdatedAtSort) {
+      const { $sort: _ignoredUpdatedAtSort, ...rest } = paginateQuery;
+      paginateQuery = rest;
+    }
+    context.result = paginateClientSide(accessibleSessions, paginateQuery, new Set(['board_id']));
     return context;
   };
 }
