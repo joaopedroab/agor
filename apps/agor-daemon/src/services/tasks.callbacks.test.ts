@@ -244,18 +244,24 @@ describe('TasksService completion callbacks', () => {
     expect(callbackPrompt).not.toContain('## Original Prompt');
     expect(callbackPrompt).not.toContain('investigate duplicate callbacks');
     expect(messagesFind).toHaveBeenCalledTimes(1);
-    expect(triggerQueueProcessing).toHaveBeenCalledWith(parentSessionId, {});
-    expect(sessionsPatch).toHaveBeenCalledWith(
-      childSessionId,
-      expect.objectContaining({ callback_config: expect.objectContaining({ enabled: false }) })
+    await vi.waitFor(() =>
+      expect(triggerQueueProcessing).toHaveBeenCalledWith(parentSessionId, {})
     );
-    expect(getStoredTask().metadata?.callback_dispatches).toEqual([
-      expect.objectContaining({
-        event: 'session_completion',
-        target_session_id: parentSessionId,
-        queued_task_id: callbackTaskId,
-      }),
-    ]);
+    await vi.waitFor(() =>
+      expect(sessionsPatch).toHaveBeenCalledWith(
+        childSessionId,
+        expect.objectContaining({ callback_config: expect.objectContaining({ enabled: false }) })
+      )
+    );
+    await vi.waitFor(() =>
+      expect(getStoredTask().metadata?.callback_dispatches).toEqual([
+        expect.objectContaining({
+          event: 'session_completion',
+          target_session_id: parentSessionId,
+          queued_task_id: callbackTaskId,
+        }),
+      ])
+    );
   });
 
   it('includeOriginalPrompt=false queues one templated callback without an original prompt section', async () => {
@@ -349,9 +355,11 @@ describe('TasksService completion callbacks', () => {
     expect(callbackPrompt).toContain('## Original Prompt');
     expect(callbackPrompt).toContain('remote session initial prompt');
     expect(callbackPrompt).toContain('Final child result');
-    expect(sessionsPatch).toHaveBeenCalledWith(
-      childSessionId,
-      expect.objectContaining({ callback_config: expect.objectContaining({ enabled: false }) })
+    await vi.waitFor(() =>
+      expect(sessionsPatch).toHaveBeenCalledWith(
+        childSessionId,
+        expect.objectContaining({ callback_config: expect.objectContaining({ enabled: false }) })
+      )
     );
   });
 
