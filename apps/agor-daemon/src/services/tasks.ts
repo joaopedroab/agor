@@ -617,6 +617,10 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
             this.firePostCommit('triggerQueueProcessing', () =>
               sessionsService.triggerQueueProcessing!(task.session_id)
             );
+          } else if (params?.suppressTerminalQueueProcessing) {
+            console.log(
+              `⏭️  [TasksService] Queue trigger suppressed for session ${shortId(task.session_id)} (suppressTerminalQueueProcessing)`
+            );
           }
         } catch (error) {
           console.error('❌ [TasksService] Failed to process task completion:', error);

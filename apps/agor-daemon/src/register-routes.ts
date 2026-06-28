@@ -2168,7 +2168,28 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     const existingLock = sessionTurnLocks.get(sessionId);
     if (existingLock) {
       console.log(`⏳ [Queue] Session turn in progress for ${shortId(sessionId)}, waiting...`);
-      await existingLock.catch(() => undefined);
+
+      // Race the lock against a timeout. A half-open TCP connection can leave
+      // a DB query pending forever, which holds the lock indefinitely and
+      // deadlocks all subsequent prompts for this session. statement_timeout
+      // (60s) handles normal cases; this is the client-side backstop.
+      const LOCK_WAIT_TIMEOUT_MS = 65_000;
+      const outcome = await Promise.race([
+        existingLock.catch(() => undefined).then(() => 'released' as const),
+        new Promise<'timeout'>((resolve) =>
+          setTimeout(() => resolve('timeout'), LOCK_WAIT_TIMEOUT_MS)
+        ),
+      ]);
+
+      if (outcome === 'timeout') {
+        console.error(
+          `❌ [Queue] Session ${shortId(sessionId)}: turn lock held >${LOCK_WAIT_TIMEOUT_MS / 1000}s — ` +
+            `holder may be stuck on a broken DB connection. Skipping this drain trigger; ` +
+            `the next natural trigger (user prompt or task completion) will retry.`
+        );
+        return;
+      }
+
       if (!queueRetryScheduled.has(sessionId)) {
         queueRetryScheduled.add(sessionId);
         setImmediate(async () => {
@@ -2179,6 +2200,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             console.error(`❌ [Queue] Retry failed for session ${shortId(sessionId)}:`, error);
           }
         });
+      } else {
+        console.log(
+          `⏭️  [Queue] Retry already scheduled for session ${shortId(sessionId)}, not queueing another`
+        );
       }
       return;
     }

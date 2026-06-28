@@ -27,6 +27,7 @@ import {
   ScheduleRepository,
   type SessionRepository,
   shortId,
+  tenantDatabaseScope,
   UserMCPOAuthTokenRepository,
   type UsersRepository,
 } from '@agor/core/db';
@@ -2637,39 +2638,59 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             // When a GitHub-connected session finishes its turn, post the last
             // buffered message as a PR/issue comment. Must happen before queue
             // processing so the response is posted before the next prompt starts.
-            setImmediate(async () => {
-              try {
-                const gatewayService = context.app.service('gateway') as unknown as GatewayService;
-                await gatewayService.flushGitHubBuffer(session.session_id);
-                await gatewayService.updateProgress({
-                  session_id: session.session_id,
-                  state: 'done',
-                });
-              } catch (error) {
-                console.warn(
-                  `[gateway] Failed to flush gateway buffers/status for session ${shortId(session.session_id)}:`,
-                  error
-                );
-              }
-            });
-
-            if (shouldDrainQueueAfterSessionPostTurnPatch(session, context.params)) {
-              // Use setImmediate to avoid blocking the patch response
+            //
+            // tenantDatabaseScope.exit() breaks ALS inheritance so this
+            // setImmediate fires outside the outer tenantDatabaseScopeAround
+            // transaction — otherwise the gateway I/O runs inside that
+            // transaction and can leave a zombie idle-in-transaction backend.
+            tenantDatabaseScope.exit(() =>
               setImmediate(async () => {
                 try {
-                  console.log(
-                    `🔄 [SessionsService.after.patch] Session ${shortId(session.session_id)} became promptable (${session.status}), checking for queued tasks...`
-                  );
-
-                  await sessionsService.triggerQueueProcessing(session.session_id, context.params);
+                  const gatewayService = context.app.service(
+                    'gateway'
+                  ) as unknown as GatewayService;
+                  await gatewayService.flushGitHubBuffer(session.session_id);
+                  await gatewayService.updateProgress({
+                    session_id: session.session_id,
+                    state: 'done',
+                  });
                 } catch (error) {
-                  console.error(
-                    `❌ [SessionsService.after.patch] Failed to process queue for session ${shortId(session.session_id)}:`,
+                  console.warn(
+                    `[gateway] Failed to flush gateway buffers/status for session ${shortId(session.session_id)}:`,
                     error
                   );
-                  // Don't throw - queue processing failure shouldn't break session patches
                 }
-              });
+              })
+            );
+
+            if (shouldDrainQueueAfterSessionPostTurnPatch(session, context.params)) {
+              // Same ALS-escape pattern: queue processing must run outside the
+              // outer transaction so it uses a fresh connection and doesn't
+              // block behind the in-flight turn lock from within that transaction.
+              tenantDatabaseScope.exit(() =>
+                setImmediate(async () => {
+                  try {
+                    console.log(
+                      `🔄 [SessionsService.after.patch] Session ${shortId(session.session_id)} became promptable (${session.status}), checking for queued tasks...`
+                    );
+
+                    await sessionsService.triggerQueueProcessing(
+                      session.session_id,
+                      context.params
+                    );
+                  } catch (error) {
+                    console.error(
+                      `❌ [SessionsService.after.patch] Failed to process queue for session ${shortId(session.session_id)}:`,
+                      error
+                    );
+                    // Don't throw - queue processing failure shouldn't break session patches
+                  }
+                })
+              );
+            } else {
+              console.log(
+                `⏭️  [SessionsService.after.patch] Queue drain suppressed for session ${shortId(session.session_id)} (suppressTerminalQueueProcessing or not ready)`
+              );
             }
           }
 
