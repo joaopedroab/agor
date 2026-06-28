@@ -531,14 +531,18 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
           const suppressCompletionCallbacks = params?.suppressCompletionCallbacks === true;
           const suppressBtwCleanup = params?.suppressBtwCleanup === true;
 
+          // STOPPED tasks (user-cancelled or daemon-shutdown cleanup) never notify
+          // parent sessions. A stopped child represents abandoned work — the parent
+          // should not resume or be informed; it has its own lifecycle.
+          const isStop = data.status === TaskStatus.STOPPED;
+
           if (latestTaskId && latestTaskId !== task.task_id) {
             console.log(
               `⏭️ [TasksService] Skipping session terminal-state update - task ${shortId(task.task_id)} is not the latest (latest: ${shortId(latestTaskId)})`
             );
-            // Still process completion callbacks (task completed, callback target needs to know).
-            // Route through the same centralized/idempotent dispatcher used by the normal
-            // completion path so races cannot enqueue duplicate parent callbacks.
-            if (!suppressCompletionCallbacks) {
+            // Process completion callbacks only for naturally-terminal tasks (COMPLETED/FAILED).
+            // STOPPED means the work was abandoned — don't notify the parent.
+            if (!suppressCompletionCallbacks && !isStop) {
               await this.dispatchCompletionCallbacks(task, session, params);
             }
             return result;
@@ -550,7 +554,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
           //
           // For other terminal tasks: Normal completion - set ready_for_prompt=true
           // to allow auto-queue-processing of any pending messages.
-          const isUserInitiatedStop = data.status === TaskStatus.STOPPED;
+          const isUserInitiatedStop = isStop;
 
           if (isUserInitiatedStop) {
             console.log(
@@ -576,7 +580,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
             );
           }
 
-          if (!suppressCompletionCallbacks) {
+          if (!suppressCompletionCallbacks && !isStop) {
             await this.dispatchCompletionCallbacks(task, session, params);
           }
 
