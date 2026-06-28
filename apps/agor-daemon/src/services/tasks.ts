@@ -11,7 +11,7 @@ import {
   renderChildCompletionCallback,
 } from '@agor/core/callbacks/child-completion-template';
 import { PAGINATION, resolveExecutorHeartbeatConfig } from '@agor/core/config';
-import { type Database, shortId, TaskRepository } from '@agor/core/db';
+import { type Database, shortId, TaskRepository, tenantDatabaseScope } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
 import type {
   ContentBlock,
@@ -542,8 +542,17 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
             );
             // Process completion callbacks only for naturally-terminal tasks (COMPLETED/FAILED).
             // STOPPED means the work was abandoned — don't notify the parent.
+            // Fire outside the current ALS transaction scope so callbacks open their own
+            // connection and don't extend this transaction's idle window.
             if (!suppressCompletionCallbacks && !isStop) {
-              await this.dispatchCompletionCallbacks(task, session, params);
+              void tenantDatabaseScope.exit(() =>
+                this.dispatchCompletionCallbacks(task, session, params).catch((err) =>
+                  console.error(
+                    '[TasksService] dispatchCompletionCallbacks (early-return path):',
+                    err
+                  )
+                )
+              );
             }
             return result;
           }
@@ -580,8 +589,16 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
             );
           }
 
+          // Fire callbacks in a fresh scope after this transaction commits. Breaking out
+          // of the current ALS context via exit() makes dispatchCompletionCallbacks open
+          // its own connection/transaction instead of reusing this one, so the outer
+          // transaction is free to commit immediately without waiting on callback I/O.
           if (!suppressCompletionCallbacks && !isStop) {
-            await this.dispatchCompletionCallbacks(task, session, params);
+            void tenantDatabaseScope.exit(() =>
+              this.dispatchCompletionCallbacks(task, session, params).catch((err) =>
+                console.error('[TasksService] dispatchCompletionCallbacks:', err)
+              )
+            );
           }
 
           // "btw" fork origin: auto-archive the ephemeral fork after task completion.

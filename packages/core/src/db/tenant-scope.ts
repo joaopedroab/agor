@@ -2,7 +2,11 @@ import { sql } from 'drizzle-orm';
 import type { TenantID } from '../types/tenant';
 import { tenantDatabaseScope } from './tenant-context';
 
-export { getCurrentTenantDatabase, getCurrentTenantId } from './tenant-context';
+export {
+  getCurrentTenantDatabase,
+  getCurrentTenantId,
+  tenantDatabaseScope,
+} from './tenant-context';
 
 import type { Database } from './client';
 import { isPostgresDatabase } from './database-wrapper';
