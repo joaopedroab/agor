@@ -313,6 +313,12 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
         ...params,
         suppressTerminalSessionStateUpdate: true,
         suppressTerminalQueueProcessing: true,
+        // Suppress callbacks here — dispatchCompletionCallbacks runs inside the
+        // tenantDatabaseScopeAround transaction (it does SELECT session_relationships +
+        // INSERT callback task), extending the transaction's idle time between statements.
+        // This triggered write CONNECTION_CLOSED + zombie idle-in-transaction connections.
+        // We dispatch manually below, after both patches commit, in their own transactions.
+        suppressCompletionCallbacks: true,
       }
     );
     const failedTask = result as Task;
@@ -331,6 +337,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       ...params,
       suppressTerminalQueueProcessing: true,
     };
+    let updatedSession: Session | undefined;
     await this.app
       .service('sessions')
       .patch(
@@ -341,12 +348,27 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
         },
         sessionPatchParams
       )
+      .then((s) => {
+        updatedSession = s as Session;
+      })
       .catch((error: unknown) => {
         console.warn(
           `[executor-heartbeat] Failed to mark session ${shortId(failedTask.session_id)} failed after stale heartbeat:`,
           error instanceof Error ? error.message : String(error)
         );
       });
+    // Dispatch completion callbacks outside the task-patch transaction.
+    // Both patches have committed at this point, so callbacks run in fresh transactions.
+    if (updatedSession) {
+      void this.dispatchCompletionCallbacks(failedTask, updatedSession, params).catch(
+        (error: unknown) => {
+          console.warn(
+            `[executor-heartbeat] Failed to dispatch completion callbacks for task ${shortId(failedTask.task_id)}:`,
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+      );
+    }
     return failedTask;
   }
 

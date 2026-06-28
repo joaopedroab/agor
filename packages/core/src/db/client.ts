@@ -210,9 +210,33 @@ function createPostgresDatabase(config: DbConfig): PostgresJsDatabase<typeof pos
     const options: postgres.Options<Record<string, postgres.PostgresType>> = {
       max: config.pool?.max || 10,
       idle_timeout: config.pool?.idleTimeout || 30,
+      // Recycle connections after 5 minutes so the pool doesn't hold onto
+      // connections that the server-side proxy has silently closed.
+      max_lifetime: 300,
       // Disable prepared statements - they can cause issues with DDL statements like CREATE SCHEMA
       // and with Drizzle's migration system
       prepare: false,
+      // Per-connection parameters set immediately after each connection is
+      // established. These prevent zombie transactions from blocking forever
+      // when the server (or a proxy) closes the underlying socket while a
+      // Drizzle transaction is idle between nested service calls.
+      //
+      // Root cause: tenantDatabaseScopeAround wraps entire service calls
+      // (including all after-hooks) in a single PG transaction. After-hooks
+      // dispatch callbacks and trigger queue processing, so the transaction
+      // can sit idle for seconds between SQL statements. If the server's
+      // idle-in-transaction timeout fires, the server kills the backend but
+      // the Node.js client only discovers this on the next write (COMMIT),
+      // producing "write CONNECTION_CLOSED". The server-side transaction
+      // remains open as a zombie, holding row locks and blocking other queries.
+      connection: {
+        // Kill this backend after 45 s idle inside a transaction. Surfaced as
+        // a real error to the caller so we can log and retry rather than
+        // blocking silently. 45 s is generous for any single service call.
+        idle_in_transaction_session_timeout: '45000',
+        // Hard cap on individual statement execution time.
+        statement_timeout: '60000',
+      },
     };
     if (config.ssl !== undefined) {
       options.ssl = config.ssl;
