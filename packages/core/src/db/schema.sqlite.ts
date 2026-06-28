@@ -221,6 +221,7 @@ export const sessions = sqliteTable(
   },
   (table) => ({
     statusIdx: index('sessions_status_idx').on(table.status),
+    statusReadyIdx: index('sessions_status_ready_idx').on(table.status, table.ready_for_prompt),
     agenticToolIdx: index('sessions_agentic_tool_idx').on(table.agentic_tool),
     boardIdx: index('sessions_board_idx').on(table.board_id),
     branchIdx: index('sessions_branch_idx').on(table.branch_id),
@@ -278,6 +279,9 @@ export const sessionRelationships = sqliteTable(
     sourceIdx: index('session_relationships_source_idx').on(table.source_session_id),
     targetIdx: index('session_relationships_target_idx').on(table.target_session_id),
     callbackIdx: index('session_relationships_callback_idx').on(table.callback_session_id),
+    // Note: no tenant_source/tenant_target composite indexes here — SQLite schema
+    // has no tenant_id column on this table (RLS is Postgres-only). The standalone
+    // source/target indexes above are sufficient for SQLite.
     sourceTargetTypeUnique: uniqueIndex('session_relationships_source_target_type_unique').on(
       table.source_session_id,
       table.target_session_id,

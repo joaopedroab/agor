@@ -221,6 +221,7 @@ export const sessions = pgTable(
   (table) => ({
     tenantIdx: index('sessions_tenant_id_idx').on(table.tenant_id),
     statusIdx: index('sessions_status_idx').on(table.status),
+    statusReadyIdx: index('sessions_status_ready_idx').on(table.status, table.ready_for_prompt),
     agenticToolIdx: index('sessions_agentic_tool_idx').on(table.agentic_tool),
     boardIdx: index('sessions_board_idx').on(table.board_id),
     branchIdx: index('sessions_branch_idx').on(table.branch_id),
@@ -275,6 +276,17 @@ export const sessionRelationships = pgTable(
     sourceIdx: index('session_relationships_source_idx').on(table.source_session_id),
     targetIdx: index('session_relationships_target_idx').on(table.target_session_id),
     callbackIdx: index('session_relationships_callback_idx').on(table.callback_session_id),
+    // Composite indexes so the OR predicate in dispatchCompletionCallbacks
+    // (WHERE source_session_id = $1 OR target_session_id = $2) uses BitmapOr
+    // over these instead of a full tenant table scan via tenant_id_idx.
+    tenantSourceIdx: index('session_relationships_tenant_source_idx').on(
+      table.tenant_id,
+      table.source_session_id
+    ),
+    tenantTargetIdx: index('session_relationships_tenant_target_idx').on(
+      table.tenant_id,
+      table.target_session_id
+    ),
     sourceTargetTypeUnique: uniqueIndex('session_relationships_source_target_type_unique').on(
       table.tenant_id,
       table.source_session_id,
@@ -365,6 +377,8 @@ export const tasks = pgTable(
     sessionIdx: index('tasks_session_idx').on(table.session_id),
     statusIdx: index('tasks_status_idx').on(table.status),
     createdIdx: index('tasks_created_idx').on(table.created_at),
+    // Composite for "latest task for session" queries (ORDER BY created_at DESC LIMIT 1).
+    sessionCreatedIdx: index('tasks_session_created_idx').on(table.session_id, table.created_at),
     queueIdx: index('tasks_queue_idx').on(table.session_id, table.status, table.queue_position),
     // Partial unique index — defense-in-depth for `tasks.createPending` race
     // serialization. Only QUEUED rows are constrained; CREATED/RUNNING/done
