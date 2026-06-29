@@ -1,7 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Database } from './client';
 import { insert } from './database-wrapper';
-import { createTenantScopedDatabaseProxy, runWithTenantDatabaseScope } from './tenant-scope';
+import {
+  createTenantScopedDatabaseProxy,
+  getCurrentTenantId,
+  MissingTenantDatabaseScopeError,
+  requireCurrentTenantId,
+  runWithoutTenantDatabaseScope,
+  runWithSystemDatabaseScope,
+  runWithTenantDatabaseScope,
+} from './tenant-scope';
 
 describe('tenant-scoped database proxy', () => {
   it('routes repository-style calls to the active tenant transaction', async () => {
@@ -123,5 +131,74 @@ describe('tenant-scoped database proxy', () => {
         { id: 'row-3', tenant_id: 'explicit' },
       ],
     ]);
+  });
+
+  it('supports requiring and explicitly escaping the ambient tenant scope', async () => {
+    const base = {
+      run: vi.fn(),
+    };
+    const db = createTenantScopedDatabaseProxy(base as unknown as Database);
+    const seen: Array<string | undefined> = [];
+
+    await runWithTenantDatabaseScope(db, 'tenant-a', async () => {
+      expect(requireCurrentTenantId()).toBe('tenant-a');
+      seen.push(getCurrentTenantId());
+      runWithoutTenantDatabaseScope(() => {
+        seen.push(getCurrentTenantId());
+        expect(() => requireCurrentTenantId()).toThrow('Missing active tenant context');
+      });
+      seen.push(getCurrentTenantId());
+    });
+
+    expect(seen).toEqual(['tenant-a', undefined, 'tenant-a']);
+  });
+
+  it('guarded proxies reject DB access without tenant or system scope', async () => {
+    const base = {
+      marker: vi.fn(() => 'base'),
+    };
+    const db = createTenantScopedDatabaseProxy(base as unknown as Database, {
+      requireScope: true,
+      label: 'test db',
+    });
+
+    expect(() => (db as unknown as { marker(): string }).marker()).toThrow(
+      MissingTenantDatabaseScopeError
+    );
+    expect(() => (db as unknown as { marker(): string }).marker()).toThrow(
+      'Missing tenant database scope for test db access'
+    );
+  });
+  it('guarded proxies allow tenant-scoped and explicit system-scoped DB access', async () => {
+    const base = {
+      run: vi.fn(),
+      marker: vi.fn(() => 'base'),
+    };
+    const db = createTenantScopedDatabaseProxy(base as unknown as Database, {
+      requireScope: true,
+    });
+
+    await runWithTenantDatabaseScope(db, 'tenant-a', async () => {
+      expect((db as unknown as { marker(): string }).marker()).toBe('base');
+    });
+
+    await runWithSystemDatabaseScope(db, 'test global setup', async () => {
+      expect((db as unknown as { marker(): string }).marker()).toBe('base');
+    });
+  });
+
+  it('does not allow switching from explicit system scope into tenant scope', async () => {
+    const base = {
+      marker: vi.fn(() => 'base'),
+    };
+    const db = createTenantScopedDatabaseProxy(base as unknown as Database, {
+      requireScope: true,
+    });
+
+    await expect(
+      runWithSystemDatabaseScope(db, 'test global setup', async () =>
+        runWithTenantDatabaseScope(db, 'tenant-a', async () => undefined)
+      )
+    ).rejects.toThrow(/Cannot enter tenant scope tenant-a from active system database scope/);
   });
 });

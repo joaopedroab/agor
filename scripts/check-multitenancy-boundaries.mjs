@@ -54,6 +54,39 @@ const checks = [
       'apps/agor-daemon/src/setup/socketio.ts': 18,
     },
   },
+
+  {
+    name: 'raw tenant database scope imports',
+    roots: ['apps/agor-daemon/src'],
+    patterns: [/import\s*{[^}]*\btenantDatabaseScope\b[^}]*}\s*from\s*['"]@agor\/core\/db['"]/gs],
+    baseline: {},
+  },
+  {
+    name: 'raw tenant database scope exits',
+    roots: ['packages/core/src', 'apps/agor-daemon/src'],
+    patterns: [/\btenantDatabaseScope\.exit\s*\(/g],
+    baseline: {
+      'packages/core/src/db/tenant-context.ts': 1,
+    },
+  },
+  {
+    name: 'bare daemon setImmediate scheduling',
+    roots: ['apps/agor-daemon/src'],
+    patterns: [/\bsetImmediate\s*\(/g],
+    baseline: {
+      'apps/agor-daemon/src/utils/tenant-db-scope.ts': 1,
+    },
+  },
+  {
+    name: 'raw daemon Database/RawDatabase imports',
+    roots: ['apps/agor-daemon/src'],
+    excludeTests: true,
+    patterns: [
+      /import\s+(?:type\s+)?{[^}]*(?:\bDatabase\b|\bRawDatabase\b)[^}]*}\s*from\s*['"]@agor\/core\/db(?:\/client)?['"]/gs,
+      /import\s+(?:type\s+)?\*\s+as\s+\w+\s+from\s*['"]@agor\/core\/db(?:\/client)?['"]/gs,
+    ],
+    baseline: {},
+  },
   {
     name: 'raw Drizzle transactions',
     roots: ['packages/core/src', 'apps/agor-daemon/src'],
@@ -86,6 +119,7 @@ for (const check of checks) {
   const observed = new Map();
   for (const root of check.roots) {
     for (const file of filesUnder(root)) {
+      if (check.excludeTests && file.endsWith('.test.ts')) continue;
       const count = countMatches(readFileSync(file, 'utf8'), check.patterns);
       if (count > 0) observed.set(file, count);
     }

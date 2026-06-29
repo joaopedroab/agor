@@ -3,12 +3,13 @@ import {
   and,
   branches,
   count,
-  type Database,
   eq,
   gte,
   lt,
+  runWithTenantDatabaseScope,
   select,
   sessions,
+  type TenantScopeAwareDatabase,
   tasks,
 } from '@agor/core/db';
 import {
@@ -17,7 +18,7 @@ import {
   openSourceTelemetryLogger,
   pruneDefaultOpenSourceTelemetryDestination,
 } from '@agor/core/telemetry';
-import type { Session } from '@agor/core/types';
+import type { Session, TenantID } from '@agor/core/types';
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
@@ -43,7 +44,7 @@ function previousUtcDayRange(now = new Date()): { day: string; start: Date; end:
 }
 
 async function countCreatedRows(
-  db: Database,
+  db: TenantScopeAwareDatabase,
   table: typeof tasks | typeof sessions | typeof branches,
   start: Date,
   end: Date
@@ -56,7 +57,7 @@ async function countCreatedRows(
 }
 
 async function addDistinctCreatedBy(
-  db: Database,
+  db: TenantScopeAwareDatabase,
   table: typeof tasks | typeof sessions | typeof branches,
   start: Date,
   end: Date,
@@ -73,7 +74,11 @@ async function addDistinctCreatedBy(
   }
 }
 
-async function getTaskUsageRows(db: Database, start: Date, end: Date): Promise<TaskUsageRow[]> {
+async function getTaskUsageRows(
+  db: TenantScopeAwareDatabase,
+  start: Date,
+  end: Date
+): Promise<TaskUsageRow[]> {
   return (await select(db, {
     taskData: tasks.data,
     agenticTool: sessions.agentic_tool,
@@ -85,7 +90,9 @@ async function getTaskUsageRows(db: Database, start: Date, end: Date): Promise<T
     .all()) as TaskUsageRow[];
 }
 
-export async function flushOpenSourceTelemetryUsageSummary(db: Database): Promise<void> {
+export async function flushOpenSourceTelemetryUsageSummary(
+  db: TenantScopeAwareDatabase
+): Promise<void> {
   if (!openSourceTelemetryLogger.isEnabled()) return;
 
   const { day, start, end } = previousUtcDayRange();
@@ -144,12 +151,22 @@ export async function flushOpenSourceTelemetryUsageSummary(db: Database): Promis
   await saveConfig(pruneDefaultOpenSourceTelemetryDestination(config));
 }
 
-export function startOpenSourceTelemetryUsageSummaryInterval(db: Database): NodeJS.Timeout {
+export interface OpenSourceTelemetryUsageSummaryIntervalOptions {
+  /** Tenant used for daemon-global telemetry scans that have no request auth context. */
+  tenantId: TenantID | string;
+}
+
+export function startOpenSourceTelemetryUsageSummaryInterval(
+  db: TenantScopeAwareDatabase,
+  options: OpenSourceTelemetryUsageSummaryIntervalOptions
+): NodeJS.Timeout {
   // Check hourly, but emit at most once per UTC day. The DB query only runs
   // when the previous day has not yet been reported, keeping steady-state
   // overhead to one config read per hour.
   const run = (): void => {
-    flushOpenSourceTelemetryUsageSummary(db).catch((error) => {
+    runWithTenantDatabaseScope(db, options.tenantId, () =>
+      flushOpenSourceTelemetryUsageSummary(db)
+    ).catch((error) => {
       console.warn(
         '[telemetry] failed to emit usage summary:',
         error instanceof Error ? error.message : String(error)

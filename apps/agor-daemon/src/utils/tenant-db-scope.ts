@@ -4,14 +4,19 @@ import {
   resolveTenantContext,
   TenantResolutionError,
 } from '@agor/core/config';
-import { type Database, getCurrentTenantId, runWithTenantDatabaseScope } from '@agor/core/db';
+import {
+  getCurrentTenantId,
+  runWithoutTenantDatabaseScope,
+  runWithTenantDatabaseScope,
+  type TenantScopeAwareDatabase,
+} from '@agor/core/db';
 import { NotAuthenticated } from '@agor/core/feathers';
-import type { HookContext, TenantID } from '@agor/core/types';
+import type { HookContext, TenantContext, TenantID } from '@agor/core/types';
 import jwt from 'jsonwebtoken';
 import { RUNTIME_JWT_AUDIENCE, RUNTIME_JWT_ISSUER } from '../auth/runtime-tokens.js';
 
 interface TenantDatabaseScopeOptions {
-  db: Database;
+  db: TenantScopeAwareDatabase;
   config: AgorConfig;
   jwtSecret: string;
 }
@@ -28,6 +33,50 @@ function readHeaderValue(
     return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
   }
   return null;
+}
+
+type TenantScopedParams = { tenant?: Pick<TenantContext, 'tenant_id'> } | undefined;
+
+export function resolveTenantIdForDeferredScope(params?: unknown): string | undefined {
+  const scopedParams = params as TenantScopedParams;
+  return scopedParams?.tenant?.tenant_id ?? getCurrentTenantId();
+}
+
+/**
+ * Schedule asynchronous work outside the current ALS store, then re-enter a
+ * fresh tenant database scope for the captured tenant. Use this for delayed
+ * executor/queue/gateway work: bare setImmediate inherits possibly-committed
+ * transaction objects, but a bare runWithoutTenantDatabaseScope loses Postgres
+ * RLS context entirely.
+ */
+export function deferWithTenantDatabaseScope(
+  db: TenantScopeAwareDatabase,
+  params: unknown,
+  work: () => Promise<void>,
+  onError?: (error: unknown) => void
+): void {
+  const tenantId = resolveTenantIdForDeferredScope(params);
+  if (!tenantId) {
+    const error = new Error('Missing tenant context for deferred tenant-scoped work');
+    if (onError) {
+      onError(error);
+    } else {
+      console.error('[tenant-db-scope] Deferred tenant-scoped work skipped:', error);
+    }
+    return;
+  }
+
+  runWithoutTenantDatabaseScope(() => {
+    setImmediate(() => {
+      void runWithTenantDatabaseScope(db, tenantId, work).catch((error) => {
+        if (onError) {
+          onError(error);
+          return;
+        }
+        console.error('[tenant-db-scope] Deferred tenant-scoped work failed:', error);
+      });
+    });
+  });
 }
 
 export function createTenantDatabaseScopeAroundHook(options: TenantDatabaseScopeOptions) {
@@ -54,24 +103,30 @@ export function createTenantDatabaseScopeAroundHook(options: TenantDatabaseScope
       connection?: { tenant?: unknown; data?: { tenant?: unknown } };
     };
     const connectionTenant = params.connection?.tenant ?? params.connection?.data?.tenant;
-    if (
-      connectionTenant &&
-      typeof connectionTenant === 'object' &&
-      'tenant_id' in connectionTenant
-    ) {
-      return connectionTenant as ReturnType<typeof resolveTenantContext>;
-    }
+    const paramsWithConnectionTenant =
+      connectionTenant && typeof connectionTenant === 'object' && 'tenant_id' in connectionTenant
+        ? ({ ...params, tenant: params.tenant ?? connectionTenant } as typeof params)
+        : params;
 
-    const inheritedTenantId = getCurrentTenantId();
-    if (inheritedTenantId) {
-      return { tenant_id: inheritedTenantId as TenantID, source: 'explicit' as const };
+    try {
+      // Resolve explicit/auth/socket tenant context first, even for internal
+      // calls. If this is nested inside a different active tenant scope,
+      // runWithTenantDatabaseScope below will reject the cross-tenant switch
+      // instead of silently inheriting or switching.
+      return resolveTenantContext(multiTenancy, {
+        params: paramsWithConnectionTenant,
+        authPayload:
+          paramsWithConnectionTenant.authentication?.payload ??
+          bearerPayloadFromHeaders(paramsWithConnectionTenant.headers),
+        headers: paramsWithConnectionTenant.headers,
+      });
+    } catch (error) {
+      const inheritedTenantId = getCurrentTenantId();
+      if (error instanceof TenantResolutionError && inheritedTenantId) {
+        return { tenant_id: inheritedTenantId as TenantID, source: 'explicit' as const };
+      }
+      throw error;
     }
-
-    return resolveTenantContext(multiTenancy, {
-      params,
-      authPayload: params.authentication?.payload ?? bearerPayloadFromHeaders(params.headers),
-      headers: params.headers,
-    });
   };
 
   return async (context: HookContext, next: () => Promise<void>): Promise<void> => {
