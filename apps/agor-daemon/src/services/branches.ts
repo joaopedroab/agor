@@ -1795,6 +1795,11 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
       resolvedParams
     );
 
+    // this.patch() calls the raw implementation and bypasses Feathers event
+    // dispatch, so the patched event is not automatically emitted. Emit it
+    // manually so WebSocket clients receive the environment status update.
+    this.app.service('branches').emit('patched', branch);
+
     return branch;
   }
 
