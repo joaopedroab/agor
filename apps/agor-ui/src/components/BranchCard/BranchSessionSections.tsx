@@ -14,7 +14,9 @@ import {
   EyeOutlined,
   LinkOutlined,
   MessageOutlined,
+  MinusSquareOutlined,
   PlusOutlined,
+  PlusSquareOutlined,
   SettingOutlined,
 } from '@ant-design/icons';
 import {
@@ -31,7 +33,7 @@ import {
   theme,
 } from 'antd';
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
 import { useLocalStorage } from '../../hooks/useLocalStorage';
 import { useServiceEnabled } from '../../hooks/useServicesConfig';
@@ -262,6 +264,8 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     session: null,
   });
   const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([]);
+  const previousExpandableKeysRef = useRef<Set<React.Key> | null>(null);
+  const manuallyCollapsedKeysRef = useRef<Set<React.Key>>(new Set());
   const [archivingSessionIds, setArchivingSessionIds] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState('');
   const [sort, setSort] = useLocalStorage<SessionSort>(SESSION_SORT_STORAGE_KEY, 'recent');
@@ -505,6 +509,20 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     () => (isManualSessionsOpen ? buildSessionTree(sortedManualSessions) : []),
     [isManualSessionsOpen, sortedManualSessions]
   );
+  const expandableKeys = useMemo(() => {
+    const collectKeysWithChildren = (nodes: SessionTreeNode[]): React.Key[] => {
+      const keys: React.Key[] = [];
+      for (const node of nodes) {
+        if (node.children && node.children.length > 0) {
+          keys.push(node.key);
+          keys.push(...collectKeysWithChildren(node.children));
+        }
+      }
+      return keys;
+    };
+
+    return collectKeysWithChildren(sessionTreeData);
+  }, [sessionTreeData]);
   const searchResults = useMemo(
     () =>
       isPanel && searchActive
@@ -530,19 +548,55 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   useEffect(() => {
     if (!isManualSessionsOpen) return;
 
-    const collectKeysWithChildren = (nodes: SessionTreeNode[]): React.Key[] => {
-      const keys: React.Key[] = [];
-      for (const node of nodes) {
-        if (node.children && node.children.length > 0) {
-          keys.push(node.key);
-          keys.push(...collectKeysWithChildren(node.children));
+    const expandableKeySet = new Set(expandableKeys);
+    const previousExpandableKeys = previousExpandableKeysRef.current;
+    const manuallyCollapsedKeys = manuallyCollapsedKeysRef.current;
+
+    setExpandedKeys((previousExpandedKeys) => {
+      if (!previousExpandableKeys) {
+        return expandableKeys.filter((key) => !manuallyCollapsedKeys.has(key));
+      }
+
+      const nextExpandedKeys = previousExpandedKeys.filter((key) => expandableKeySet.has(key));
+      const nextExpandedKeySet = new Set(nextExpandedKeys);
+
+      for (const key of expandableKeys) {
+        if (
+          !previousExpandableKeys.has(key) &&
+          !nextExpandedKeySet.has(key) &&
+          !manuallyCollapsedKeys.has(key)
+        ) {
+          nextExpandedKeys.push(key);
+          nextExpandedKeySet.add(key);
         }
       }
-      return keys;
-    };
 
-    setExpandedKeys(collectKeysWithChildren(sessionTreeData));
-  }, [isManualSessionsOpen, sessionTreeData]);
+      return nextExpandedKeys;
+    });
+
+    previousExpandableKeysRef.current = expandableKeySet;
+  }, [expandableKeys, isManualSessionsOpen]);
+
+  const handleSessionTreeExpand = useCallback((keys: React.Key[]) => {
+    setExpandedKeys((previousKeys) => {
+      const nextKeys = [...keys];
+      const previousKeySet = new Set(previousKeys);
+      const nextKeySet = new Set(nextKeys);
+
+      for (const key of previousKeySet) {
+        if (!nextKeySet.has(key)) {
+          manuallyCollapsedKeysRef.current.add(key);
+        }
+      }
+      for (const key of nextKeySet) {
+        if (!previousKeySet.has(key)) {
+          manuallyCollapsedKeysRef.current.delete(key);
+        }
+      }
+
+      return nextKeys;
+    });
+  }, []);
 
   const sessionRowStyle = (session: Session): React.CSSProperties => {
     const isSessionSelected = session.session_id === selectedSessionId;
@@ -702,6 +756,55 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     );
   };
 
+  const renderTreeSwitcherIcon = useCallback(
+    (nodeProps: {
+      eventKey?: React.Key;
+      expanded?: boolean;
+      isLeaf?: boolean;
+      session?: Session;
+    }) => {
+      const key = nodeProps.eventKey;
+      if (nodeProps.isLeaf || key == null) return null;
+
+      const expanded = Boolean(nodeProps.expanded);
+      const sessionTitle = nodeProps.session
+        ? getSessionDisplayTitle(nodeProps.session, { includeAgentFallback: true })
+        : 'session';
+      const Icon = expanded ? MinusSquareOutlined : PlusSquareOutlined;
+
+      return (
+        <button
+          type="button"
+          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${sessionTitle}`}
+          aria-expanded={expanded}
+          onClick={(event) => {
+            event.stopPropagation();
+            setExpandedKeys((previousKeys) => {
+              if (previousKeys.includes(key)) {
+                manuallyCollapsedKeysRef.current.add(key);
+                return previousKeys.filter((expandedKey) => expandedKey !== key);
+              }
+
+              manuallyCollapsedKeysRef.current.delete(key);
+              return [...previousKeys, key];
+            });
+          }}
+          style={{
+            border: 0,
+            background: 'transparent',
+            padding: 0,
+            lineHeight: 0,
+            cursor: 'pointer',
+            color: 'inherit',
+          }}
+        >
+          <Icon />
+        </button>
+      );
+    },
+    []
+  );
+
   const renderSessionNode = (node: SessionTreeNode) => {
     const session = node.session;
     const isActive = isSessionExecuting(session);
@@ -764,8 +867,9 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         className="agor-flat-tree"
         treeData={sessionTreeData}
         expandedKeys={expandedKeys}
-        onExpand={(keys) => setExpandedKeys(keys as React.Key[])}
+        onExpand={(keys) => handleSessionTreeExpand(keys as React.Key[])}
         showLine
+        switcherIcon={renderTreeSwitcherIcon}
         showIcon={false}
         blockNode
         selectable={false}
