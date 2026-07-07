@@ -139,6 +139,7 @@ import {
   recomputeNextRunAt,
   validateScheduleConfig,
 } from './utils/schedule-hooks.js';
+import { deferWithSessionQueueTenantScope } from './utils/session-queue-tenant-scope.js';
 import {
   isTerminalQueueProcessingSuppressed,
   sessionCanStartTask,
@@ -327,6 +328,11 @@ export function shouldDrainQueueAfterSessionPostTurnPatch(
     session.ready_for_prompt === true &&
     !isTerminalQueueProcessingSuppressed(params)
   );
+}
+
+export function getTrustedSessionTenantId(session: unknown): string | undefined {
+  const tenantId = (session as { tenant_id?: unknown } | undefined)?.tenant_id;
+  return typeof tenantId === 'string' && tenantId.length > 0 ? tenantId : undefined;
 }
 
 export async function enrichSessionFindResultWithRemoteRelationships(
@@ -2726,23 +2732,37 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             });
 
             if (shouldDrainQueueAfterSessionPostTurnPatch(session, context.params)) {
+              const sessionTenantId = getTrustedSessionTenantId(session);
               // Same fresh-scope pattern: queue processing must run outside the
               // outer transaction but still inside the session tenant for RLS.
-              deferWithTenantDatabaseScope(db, context.params, async () => {
-                try {
+              // Some completion/background paths have minimal params, so this
+              // relies on params.tenant, current tenant ALS, the already-returned
+              // session row tenant_id, or static tenant config and otherwise
+              // fails closed.
+              deferWithSessionQueueTenantScope(
+                {
+                  db,
+                  config,
+                  sessionId: session.session_id,
+                  params: context.params,
+                  tenantIdHint: sessionTenantId,
+                  label: 'SessionsService.after.patch queue drain',
+                },
+                async (queueParams) => {
                   console.log(
                     `🔄 [SessionsService.after.patch] Session ${shortId(session.session_id)} became promptable (${session.status}), checking for queued tasks...`
                   );
 
-                  await sessionsService.triggerQueueProcessing(session.session_id, context.params);
-                } catch (error) {
+                  await sessionsService.triggerQueueProcessing(session.session_id, queueParams);
+                },
+                (error) => {
                   console.error(
                     `❌ [SessionsService.after.patch] Failed to process queue for session ${shortId(session.session_id)}:`,
                     error
                   );
                   // Don't throw - queue processing failure shouldn't break session patches
                 }
-              });
+              );
             } else {
               console.log(
                 `⏭️  [SessionsService.after.patch] Queue drain suppressed for session ${shortId(session.session_id)} (suppressTerminalQueueProcessing or not ready)`
