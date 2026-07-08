@@ -58,6 +58,7 @@ function makeGatewayHarness(args: {
   existingMapping?: ThreadSessionMap | null;
   connector?: Record<string, unknown>;
   db?: TenantScopeAwareDatabase;
+  externalIdentityUser?: User | null;
 }) {
   const channel = args.channel ?? slackChannel;
   let mapping = args.existingMapping ?? null;
@@ -73,7 +74,12 @@ function makeGatewayHarness(args: {
   }));
   const app = {
     service: (name: string) => {
-      if (name === 'users') return { get: vi.fn(async () => user) };
+      if (name === 'users')
+        return {
+          get: vi.fn(async (id: string) =>
+            args.externalIdentityUser?.user_id === id ? args.externalIdentityUser : user
+          ),
+        };
       if (name === 'sessions') {
         return { create: sessionsCreate, setMCPServers: vi.fn(async () => undefined) };
       }
@@ -109,6 +115,19 @@ function makeGatewayHarness(args: {
   };
   (service as unknown as { channelRepo: typeof channelRepo }).channelRepo = channelRepo;
   (service as unknown as { threadMapRepo: typeof threadMapRepo }).threadMapRepo = threadMapRepo;
+  (
+    service as unknown as {
+      usersRepo: {
+        findByExternalIdentity: (ref: {
+          provider: string;
+          issuer: string;
+          subject: string;
+        }) => Promise<User | null>;
+      };
+    }
+  ).usersRepo = {
+    findByExternalIdentity: vi.fn(async () => args.externalIdentityUser ?? null),
+  };
   (
     service as unknown as { outboundRepo: { findUnconsumedByChannelAndThread: unknown } }
   ).outboundRepo = {
@@ -414,6 +433,116 @@ describe('GatewayService Slack thread catch-up', () => {
     expect(promptCreate).not.toHaveBeenCalled();
     expect(sessionsCreate).not.toHaveBeenCalled();
     expect(threadMapRepo.updateLastMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('GatewayService Telegram alignment', () => {
+  const telegramChannel: GatewayChannel = {
+    ...slackChannel,
+    id: 'chan-telegram',
+    name: 'Telegram Bot',
+    channel_type: 'telegram',
+    channel_key: 'telegram-key',
+    agor_user_id: 'owner-user',
+    config: { bot_token: 'telegram-token' },
+  } as unknown as GatewayChannel;
+
+  const telegramUser: User = {
+    ...user,
+    user_id: 'telegram-user-1',
+    email: 'telegram-user@example.com',
+    name: 'Telegram User',
+  } as unknown as User;
+
+  it('creates a session as the explicitly linked Telegram user', async () => {
+    const { service, sessionsCreate, threadMapRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+    });
+    const usersRepo = (
+      service as unknown as {
+        usersRepo: { findByExternalIdentity: ReturnType<typeof vi.fn> };
+      }
+    ).usersRepo;
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'hello from telegram',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        telegram_username: 'not-an-identity',
+        telegram_message_id: '42',
+      },
+    });
+
+    expect(result).toMatchObject({ success: true, sessionId: 'sess-new', created: true });
+    expect(usersRepo.findByExternalIdentity).toHaveBeenCalledWith({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(sessionsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        created_by: 'telegram-user-1',
+        custom_context: {
+          gateway_source: expect.objectContaining({
+            channel_type: 'telegram',
+            telegram_user_id: '123456789',
+            telegram_username: 'not-an-identity',
+          }),
+        },
+      })
+    );
+    expect(threadMapRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel_id: 'chan-telegram',
+        thread_id: 'telegram:private:123456789',
+        session_id: 'sess-new',
+      })
+    );
+  });
+
+  it('rejects unlinked Telegram users instead of falling back to the channel owner', async () => {
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: null,
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'hello from telegram',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        telegram_username: 'owner-user',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('rejects Telegram messages without a normalized numeric sender id', async () => {
+    const { service, sessionsCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:missing',
+      text: 'hello from telegram',
+      metadata: {
+        telegram_username: 'not-an-identity',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sessionsCreate).not.toHaveBeenCalled();
   });
 });
 

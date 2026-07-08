@@ -39,6 +39,8 @@ import {
   hasConnector,
   normalizeOutbound,
   parseGitHubThreadId,
+  TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
+  TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
 } from '@agor/core/gateway';
 import { resolveSessionDefaults } from '@agor/core/sessions';
 import type {
@@ -525,6 +527,19 @@ function buildGatewayContext(channel: GatewayChannel, data: PostMessageData): Ga
         channelKind,
         userName: (meta.teams_user_name as string) ?? undefined,
         userEmail: (meta.teams_user_email as string) ?? undefined,
+      };
+    }
+
+    case 'telegram': {
+      const username = meta.telegram_username as string | undefined;
+      const firstName = meta.telegram_first_name as string | undefined;
+      const lastName = meta.telegram_last_name as string | undefined;
+      const userName = [firstName, lastName].filter(Boolean).join(' ') || undefined;
+      return {
+        platform: 'telegram',
+        channelKind: meta.telegram_chat_type === 'private' ? 'DM' : undefined,
+        userName,
+        userHandle: username ? `@${username}` : undefined,
       };
     }
 
@@ -1639,12 +1654,14 @@ export class GatewayService {
       channelConfig.align_slack_users === true || data.metadata?.align_slack_users === true;
     const alignGitHubUsers =
       channelConfig.align_github_users === true || data.metadata?.align_github_users === true;
+    const alignTelegramUsers =
+      channel.channel_type === 'telegram' || data.metadata?.align_telegram_users === true;
 
     // Only fetch and use channel owner when NO alignment is active.
     // When alignment is ON, agor_user_id may be empty (the "Post messages as"
     // field is hidden in the UI), so we must not fetch it unconditionally.
     let user: User = null as unknown as User;
-    if (!alignSlackUsers && !alignGitHubUsers) {
+    if (!alignSlackUsers && !alignGitHubUsers && !alignTelegramUsers) {
       if (!channel.agor_user_id) {
         const errMsg =
           'Channel configuration error: no "Post messages as" user set. An admin needs to edit the channel and select a user, or enable user alignment.';
@@ -1672,6 +1689,51 @@ export class GatewayService {
         };
       }
       user = await usersService.get(channel.agor_user_id);
+    }
+
+    // --- Telegram user alignment ---
+    // Telegram MVP deliberately has no owner fallback. The only trusted subject
+    // is the stable numeric message.from.id normalized at the adapter edge.
+    if (alignTelegramUsers && !alignSlackUsers && !alignGitHubUsers) {
+      const telegramUserId =
+        typeof data.metadata?.telegram_external_subject === 'string'
+          ? data.metadata.telegram_external_subject
+          : typeof data.metadata?.telegram_user_id === 'string'
+            ? data.metadata.telegram_user_id
+            : null;
+
+      if (!telegramUserId || !/^[1-9]\d*$/.test(telegramUserId)) {
+        console.log(
+          `[gateway] Telegram user alignment failed: missing numeric Telegram sender id (thread=${data.thread_id})`
+        );
+        return {
+          success: false,
+          sessionId: '',
+          created: false,
+        };
+      }
+
+      const matchedUser = await this.usersRepo.findByExternalIdentity({
+        provider: TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
+        issuer: TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
+        subject: telegramUserId,
+      });
+
+      if (!matchedUser) {
+        console.log(
+          `[gateway] Telegram user alignment failed: no Agor mapping for Telegram user ${telegramUserId} (thread=${data.thread_id})`
+        );
+        return {
+          success: false,
+          sessionId: '',
+          created: false,
+        };
+      }
+
+      console.log(
+        `[gateway] Telegram user aligned via external identity: ${telegramUserId} → Agor user ${shortId(matchedUser.user_id)}`
+      );
+      user = await usersService.get(matchedUser.user_id);
     }
 
     // --- Slack user alignment ---
@@ -1935,6 +1997,21 @@ export class GatewayService {
         }
         // Flag for downstream consumers: only the last message is posted to GitHub
         gatewaySource.last_message_only = true;
+      }
+
+      // Add Telegram-specific metadata for richer context. The user id was
+      // resolved above via external identity and is safe to preserve; username
+      // remains display-only metadata and never participates in identity lookup.
+      if (channel.channel_type === 'telegram') {
+        if (typeof data.metadata?.telegram_user_id === 'string') {
+          gatewaySource.telegram_user_id = data.metadata.telegram_user_id;
+        }
+        if (typeof data.metadata?.telegram_message_id === 'string') {
+          gatewaySource.telegram_message_id = data.metadata.telegram_message_id;
+        }
+        if (typeof data.metadata?.telegram_username === 'string') {
+          gatewaySource.telegram_username = data.metadata.telegram_username;
+        }
       }
 
       const session = await sessionsService.create({

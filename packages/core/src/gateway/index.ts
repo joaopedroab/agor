@@ -34,6 +34,15 @@ export {
   parseThreadId as parseTeamsThreadId,
   TeamsConnector,
 } from './connectors/teams';
+export type {
+  TelegramInboundNormalizationResult,
+  TelegramInboundRejectionReason,
+} from './connectors/telegram';
+export {
+  normalizeTelegramInboundUpdate,
+  TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
+  TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
+} from './connectors/telegram';
 export type { GatewayContext } from './context';
 export { formatGatewayContext } from './context';
 export {
