@@ -160,7 +160,7 @@ const gatewayChannelCreateSchema = z
       .enum(['slack', 'github', 'teams', 'discord', 'whatsapp', 'telegram'])
       .default('slack')
       .describe(
-        'Gateway platform type. Current active connectors are slack, github, teams, and Telegram DM transport MVP.'
+        'Gateway platform type. Current active connectors are slack, github, teams, and Telegram private-DM MVP.'
       ),
     targetBranchId: mcpRequiredId(
       'targetBranchId',
@@ -507,6 +507,24 @@ function redactGatewayChannel(channel: GatewayChannel): GatewayChannelSummary {
   };
 }
 
+function gatewayChannelNextSteps(channel: GatewayChannel): string[] {
+  const base = [
+    'Verify the channel in Settings > Gateway Channels or with agor_gateway_channels_list.',
+    'Channel credentials, env vars, and inbound channel keys are intentionally redacted from MCP responses.',
+  ];
+
+  if (channel.channel_type !== 'telegram') {
+    return base;
+  }
+
+  return [
+    ...base,
+    'Telegram is explicit-link-only: inbound private DM text is accepted only when the stable numeric Telegram user.id is already linked to exactly one Agor user.',
+    'Telegram listening is disabled/no-op unless the channel is enabled, config.bot_token is present, config.enable_polling is true, and config.transport_disabled is not true.',
+    'Telegram outbound/proactive replies, groups, attachments, Mini Apps, setup wizard, webhooks, and provider mutation are not implemented in the MVP.',
+  ];
+}
+
 function toServiceCreateData(args: z.infer<typeof gatewayChannelCreateSchema>) {
   return {
     name: args.name,
@@ -622,7 +640,7 @@ export function registerGatewayChannelTools(server: McpServer, ctx: McpContext):
     'agor_gateway_channels_list',
     {
       description:
-        'List gateway channel definitions (admin-only). Returns Slack/GitHub/Teams channel metadata with tokens, app passwords, private keys, webhook secrets, env var values, and inbound channel keys redacted. Use this to discover gatewayChannelId values for agor_gateway_channels_update.',
+        'List gateway channel definitions (admin-only). Returns Slack/GitHub/Teams/Telegram channel metadata with tokens, app passwords, private keys, webhook secrets, env var values, and inbound channel keys redacted. Telegram channels are explicit-link-only and do not listen unless enabled with bot_token and opt-in polling. Use this to discover gatewayChannelId values for agor_gateway_channels_update.',
       annotations: { readOnlyHint: true },
       inputSchema: z.strictObject({
         includeDisabled: z
@@ -672,7 +690,7 @@ export function registerGatewayChannelTools(server: McpServer, ctx: McpContext):
     'agor_gateway_channels_create',
     {
       description:
-        'Create a gateway channel definition (admin-only) through the same gateway-channels service used by the UI. Current connectors: Slack, GitHub, Teams. Slack example config: { bot_token, app_token, connection_mode:"socket", enable_channels:true, require_mention:true, allowed_channel_ids:["C123"] }. Secrets are encrypted by the service and returned redacted; prefer environment/template references where possible because raw secrets in tool arguments may appear in the MCP transcript.',
+        'Create a gateway channel definition (admin-only) through the same gateway-channels service used by the UI. Current connectors: Slack, GitHub, Teams, and Telegram private-DM MVP. Slack example config: { bot_token, app_token, connection_mode:"socket", enable_channels:true, require_mention:true, allowed_channel_ids:["C123"] }. Telegram example config: { bot_token, enable_polling:true } and remains no-op unless enabled with explicit polling; it accepts private DM text only, requires an existing numeric user.id link, has no owner fallback, and has no outbound/proactive replies or provider mutation. Secrets are encrypted by the service and returned redacted; prefer environment/template references where possible because raw secrets in tool arguments may appear in the MCP transcript.',
       annotations: { destructiveHint: false, idempotentHint: false },
       inputSchema: gatewayChannelCreateSchema,
     },
@@ -684,10 +702,7 @@ export function registerGatewayChannelTools(server: McpServer, ctx: McpContext):
 
       return textResult({
         gateway_channel: redactGatewayChannel(created),
-        next_steps: [
-          'Verify the channel in Settings > Gateway Channels or with agor_gateway_channels_list.',
-          'Channel credentials, env vars, and inbound channel keys are intentionally redacted from MCP responses.',
-        ],
+        next_steps: gatewayChannelNextSteps(created),
       });
     }
   );
@@ -744,7 +759,7 @@ export function registerGatewayChannelTools(server: McpServer, ctx: McpContext):
 
       return textResult({
         gateway_channel: redactGatewayChannel(updated),
-        next_steps: ['Verify with agor_gateway_channels_list.'],
+        next_steps: gatewayChannelNextSteps(updated),
       });
     }
   );

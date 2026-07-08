@@ -125,6 +125,11 @@ describe('agor_gateway_channels MCP tools', () => {
 
   it('requires bot_token only for enabled Telegram channel creation', async () => {
     const tools = await captureTools();
+    expect(tools.agor_gateway_channels_create.cfg.description).toContain('Telegram private-DM MVP');
+    expect(tools.agor_gateway_channels_create.cfg.description).toContain(
+      'no outbound/proactive replies or provider mutation'
+    );
+
     const enabledWithoutToken = tools.agor_gateway_channels_create.cfg.inputSchema.safeParse({
       name: 'Telegram DM',
       targetBranchId: 'branch-1',
@@ -154,6 +159,55 @@ describe('agor_gateway_channels MCP tools', () => {
       config: { bot_token: 'telegram-token-placeholder' },
     });
     expect(enabledWithToken.success).toBe(true);
+  });
+
+  it('redacts Telegram bot_token and returns explicit-link-only operator warnings', async () => {
+    const app = makeFakeApp({
+      'gateway-channels': {
+        create: async (data: Record<string, unknown>) => ({
+          id: 'chan-telegram',
+          created_by: 'admin-1',
+          name: data.name,
+          channel_type: data.channel_type,
+          target_branch_id: data.target_branch_id,
+          agor_user_id: data.agor_user_id,
+          channel_key: 'raw-channel-key',
+          config: { ...(data.config as Record<string, unknown>) },
+          agentic_config: data.agentic_config,
+          enabled: data.enabled,
+          created_at: '2026-07-08T00:00:00.000Z',
+          updated_at: '2026-07-08T00:00:00.000Z',
+          last_message_at: null,
+        }),
+      },
+    });
+
+    const tools = await captureTools('admin', app);
+    const result = await tools.agor_gateway_channels_create.handler({
+      name: 'Telegram DM',
+      channelType: 'telegram',
+      targetBranchId: 'branch-1',
+      agorUserId: 'user-runner',
+      enabled: true,
+      config: {
+        bot_token: 'telegram-secret-token',
+        enable_polling: true,
+      },
+    });
+    const payload = JSON.parse(result.content[0].text);
+    const serialized = JSON.stringify(payload);
+
+    expect(payload.gateway_channel.channel_key).toBe('••••••••');
+    expect(payload.gateway_channel.config.bot_token).toBe('••••••••');
+    expect(serialized).not.toContain('telegram-secret-token');
+    expect(serialized).not.toContain('raw-channel-key');
+    expect(payload.next_steps).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('explicit-link-only'),
+        expect.stringContaining('disabled/no-op unless'),
+        expect.stringContaining('outbound/proactive replies'),
+      ])
+    );
   });
 
   it('creates through gateway-channels service and redacts returned secrets', async () => {

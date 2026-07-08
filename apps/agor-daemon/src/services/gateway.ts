@@ -1557,7 +1557,7 @@ export class GatewayService {
       throw new Error('Channel is disabled');
     }
 
-    // Telegram command boundary for the transport-free MVP. Commands such as
+    // Telegram command boundary for the explicit-link-only MVP. Commands such as
     // `/link` are reserved for explicit account-link flows and must not create
     // or prompt sessions merely because the sender is already linked.
     if (channel.channel_type === 'telegram') {

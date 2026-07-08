@@ -10,19 +10,19 @@ heroImage: '/screenshots/marketing/agor-marketing-slack-thread.png'
 
 **Security — Think Before Enabling**
 
-A Message Gateway channel opens an external pathway (Slack DM, GitHub `@mention`) that can prompt agents holding your branch's full surface area: code, MCP servers, env vars, and any credentials in scope. Worth thinking through before you flip it on, but not categorically dangerous.
+A Message Gateway channel opens an external pathway (Slack DM, GitHub `@mention`, Teams chat, or opt-in Telegram DM polling) that can prompt agents holding your branch's full surface area: code, MCP servers, env vars, and any credentials in scope. Worth thinking through before you flip it on, but not categorically dangerous.
 
 Things working in your favor:
 
-- **Email-based user matching.** Inbound Slack messages are aligned to Agor users via the `users:read.email` scope; GitHub mentions are aligned via `user_map` (login → email) or the sender's public GitHub email. When a match exists, the spawned session is attributed to that real Agor user — so prompts run under their identity and audit trail, not as a generic bot. Unmatched senders are rejected (or surfaced to admins).
+- **Explicit user matching.** Inbound Slack messages are aligned to Agor users via the `users:read.email` scope; GitHub mentions are aligned via `user_map` (login → email) or the sender's public GitHub email; Telegram DMs are aligned only through an explicit link to the sender's stable numeric Telegram `user.id`. When a match exists, the spawned session is attributed to that real Agor user — so prompts run under their identity and audit trail, not as a generic bot. Unmatched senders are rejected (or surfaced to admins).
 - **Encrypted credentials at rest.** Bot tokens, app tokens, and private keys are stored encrypted in the daemon database.
-- **Outbound-only transport.** Slack uses Socket Mode and GitHub uses API polling — no public webhook URLs to defend.
+- **Narrow transports.** Slack uses Socket Mode, GitHub uses API polling, Teams uses the Bot Framework webhook, and Telegram uses polling only when you explicitly opt in with a bot token and `enable_polling`.
 - **Per-channel agent config.** Permission modes, model, and MCP server attachments are scoped to the channel, not global.
 
 Things that still warrant caution:
 
-- **Channels open external pathways into agent context.** Anyone who can DM the bot (or `@mention` it on a watched repo) can ask the agent to read, write, or execute code on the target branch. If the channel runs in `trust` mode with broad MCP access, that pathway is effectively a remote prompt seat — treat it as such.
-- **Restrict who can reach the bot.** Limit Slack DM scope (private workspace or app distribution settings); narrow GitHub `watch_repos` to repos where mentions are intended.
+- **Channels open external pathways into agent context.** Anyone who can reach the configured bot surface (DM, chat, or watched repo mention) can ask the agent to read, write, or execute code on the target branch. If the channel runs in `trust` mode with broad MCP access, that pathway is effectively a remote prompt seat — treat it as such.
+- **Restrict who can reach the bot.** Limit Slack DM scope (private workspace or app distribution settings), narrow GitHub `watch_repos` to repos where mentions are intended, and keep Telegram polling disabled unless the bot token and explicit user links are ready.
 - **Use dedicated branches.** Don't point channels at branches holding production secrets. Create isolated branches scoped to gateway use.
 - **Pick the right permission mode.** `supervised` or `manual` modes preserve human-in-the-loop on tool calls; `trust` is fine for bounded, well-understood automations but removes that gate.
 - **Mind the [Unix isolation mode](/guide/multiplayer-unix-isolation).** In `simple` mode the agent runs as the daemon user; in `strict` mode it runs as the matched Agor user's Unix identity, which is what you want when channels span teams.
@@ -34,7 +34,7 @@ Things that still warrant caution:
 
 The Message Gateway connects external messaging platforms to Agor's agent sessions. Mention your Slack bot in a channel thread or mention `@agor` on a GitHub PR, and Agor spins up a coding session on the right branch with the right agent — then routes responses back to the platform. In Slack channels, every prompt requires an explicit bot mention; Agor catches the bot up on intervening thread replies when it is mentioned again.
 
-> Currently supports **Slack**, **GitHub**, and **Microsoft Teams**. Telegram is planned as a native Gateway Channel; Discord and WhatsApp connectors are also planned.
+> Currently supports **Slack**, **GitHub**, **Microsoft Teams**, and a narrow **Telegram private-DM MVP**. Discord and WhatsApp connectors are planned.
 
 <img
   src="/screenshots/marketing/agor-marketing-slack-thread.png"
@@ -56,7 +56,7 @@ You can create multiple channels for the same or different branches. For example
 - **"Scout"** — Claude Code (Sonnet 4.5) on a lighter review branch, trust mode, no MCP servers
 - **"Codex Runner"** — Codex on a `superset-frontend` branch for quick JS tasks
 
-Gateway channels keep an internal per-channel key for Agor's generic inbound endpoint, but supported integrations usually do not require you to copy it anywhere. The Slack integration uses Socket Mode and the GitHub integration uses API polling — both are outbound-only, so no public webhook URLs are needed.
+Gateway channels keep an internal per-channel key for Agor's generic inbound endpoint, but supported integrations usually do not require you to copy it anywhere. Slack uses Socket Mode, GitHub uses API polling, Teams uses the Bot Framework webhook, and Telegram uses opt-in Bot API polling for private DMs only.
 
 ## How It Works
 
@@ -66,7 +66,7 @@ When a message arrives from a platform (e.g., a Slack bot mention or a GitHub `@
 2. **Map thread to session.** If this is a new platform thread, create a fresh Agor session on the channel's target branch with the channel's agentic tool configuration. If this thread has been seen before for this gateway channel, route the mention to the existing session. Multiple Slack bots can participate in the same Slack thread; each bot gets its own mapping.
 3. **Send prompt.** The message text is sent to the session via Agor's standard prompt flow — task creation, executor spawn, the full pipeline.
 4. **Agent runs.** The coding agent (Claude Code, Codex, etc.) processes the prompt with full access to the branch, MCP servers, and any configured tools.
-5. **Route response back.** When the agent produces a response, Agor's outbound routing hook intercepts it and posts it back into the same platform thread. Formatting is adapted per platform (Slack mrkdwn conversion, GitHub markdown pass-through).
+5. **Route response back when supported.** When the agent produces a response, Agor's outbound routing hook can post it back into the same platform thread for outbound-capable connectors. Formatting is adapted per platform (Slack mrkdwn conversion, GitHub markdown pass-through). Telegram outbound replies are intentionally disabled in the MVP.
 6. **Repeat.** Slack follow-ups require another explicit mention. When mentioned again, Agor fetches intervening Slack thread replies and includes them as catch-up context before prompting the agent.
 
 ```
@@ -311,23 +311,18 @@ In a 1:1 chat, just message the bot. In a channel, post `@agor review this threa
 
 Follow-up messages in the same conversation continue the same session — the agent has full conversation history.
 
-## Planned Telegram Integration
+## Telegram Private-DM MVP
 
-Telegram is being prepared as a native Message Gateway channel, but it does not
-have live transport yet. There is no Telegram polling loop, webhook handler, or
-send/receive connector in the current release.
+Telegram is available as a native Message Gateway channel for a narrow, safe MVP. It is disabled/no-op unless an admin creates an enabled `telegram` channel with a `bot_token` and explicitly sets `config.enable_polling: true`. The connector uses Telegram Bot API `getUpdates` polling only; it does not configure webhooks, call BotFather, or mutate Telegram provider settings.
 
-The planned MVP is intentionally narrow and safe by default:
+Current capabilities and limits:
 
-- **Private DM text only.** Group chats, channels, attachments, and rich media are outside the MVP.
-- **Explicit user linking.** A Telegram sender must be linked to an Agor user by the stable numeric Telegram `user.id`. Telegram usernames are display metadata only and are not trusted for identity.
-- **No owner fallback for aligned senders.** If a Telegram sender is not linked, the gateway should reject the message rather than running it as the channel owner.
-- **Normal Agor authority model.** Gateway-created sessions still use the channel's target branch, permission configuration, sandboxing, MCP attachments, and approval gates.
-- **Approvals stay in Agor.** Plain Telegram replies such as “yes” are not approvals for destructive tool calls or provider mutations.
-
-You may see `telegram` in low-level channel type schemas while this foundation is
-in place. Treat it as planned/non-listening until the connector setup is
-documented here.
+- **Private DM text only.** Group chats, supergroups, channels, attachments, rich media, and Mini Apps are rejected.
+- **Explicit numeric user link only.** A Telegram sender must already be linked to an Agor user by the stable numeric Telegram `user.id`. Telegram usernames, first names, and last names are display metadata only and are never trusted for identity.
+- **No owner fallback.** If a Telegram sender is missing, unlinked, or ambiguously linked to more than one Agor user, the gateway rejects the message instead of running it as the channel owner.
+- **No self-service setup flow yet.** There is no Telegram setup wizard, webhook handler, or provider-side setup automation in this MVP. `/link` commands are reserved for future explicit-link flows and do not create sessions or mutate links today.
+- **Inbound only.** Telegram DMs can create or continue Agor sessions, but Agor does not send outbound or proactive Telegram replies. Agent progress and responses remain visible in Agor.
+- **Normal Agor authority model.** Gateway-created sessions still use the channel's target branch, permission configuration, sandboxing, MCP attachments, and approval gates. Plain Telegram replies such as “yes” are not approvals for destructive tool calls or provider mutations.
 
 ## Agentic Tool Configuration
 
@@ -349,7 +344,7 @@ The gateway is built as a set of loosely coupled components:
 - **Gateway Service** (`/gateway`) — Orchestrates inbound routing (platform to session) and outbound routing (session to platform). Custom FeathersJS service.
 - **Gateway Channels** (`/gateway-channels`) — CRUD for channel configurations with encrypted credential storage.
 - **Thread-Session Map** (`/thread-session-map`) — Persists the mapping between platform thread IDs and Agor session IDs.
-- **Connector Layer** — Platform-agnostic `GatewayConnector` interface with a registry pattern. Currently: `SlackConnector` (Socket Mode), `GitHubConnector` (API polling), and `TeamsConnector` (Bot Framework webhook). Telegram is reserved as a planned native channel type but has no registered connector yet. Adding a new platform means implementing `sendMessage()` and optionally `startListening()`.
+- **Connector Layer** — Platform-agnostic `GatewayConnector` interface with a registry pattern. Currently: `SlackConnector` (Socket Mode), `GitHubConnector` (API polling), `TeamsConnector` (Bot Framework webhook), and `TelegramConnector` (opt-in `getUpdates` polling for private text DMs only; outbound disabled). Adding a new platform means implementing `sendMessage()` and optionally `startListening()`.
 - **Outbound Hook** — FeathersJS `after.create` hook on the messages service. Fire-and-forget; never blocks message creation.
 
 ### Adding a New Platform

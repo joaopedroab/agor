@@ -341,6 +341,17 @@ describe('TelegramConnector polling lifecycle', () => {
     expect(deleteWebhook).not.toHaveBeenCalled();
   });
 
+  it('fails closed if outbound send is reached directly', async () => {
+    const connector = new TelegramConnector({
+      bot_token: 'telegram-token',
+      enable_polling: true,
+    });
+
+    await expect(connector.sendMessage()).rejects.toThrow(
+      'Telegram outbound sending is not implemented'
+    );
+  });
+
   it('does not poll disabled, kill-switched, or tokenless connector configs', async () => {
     const getUpdates = vi.fn(async () => []);
 
