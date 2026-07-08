@@ -59,6 +59,8 @@ function makeGatewayHarness(args: {
   connector?: Record<string, unknown>;
   db?: TenantScopeAwareDatabase;
   externalIdentityUser?: User | null;
+  externalIdentityUsers?: User[];
+  alignmentUser?: User | null;
 }) {
   const channel = args.channel ?? slackChannel;
   let mapping = args.existingMapping ?? null;
@@ -123,10 +125,23 @@ function makeGatewayHarness(args: {
           issuer: string;
           subject: string;
         }) => Promise<User | null>;
+        findUsersByExternalIdentity: (ref: {
+          provider: string;
+          issuer: string;
+          subject: string;
+        }) => Promise<User[]>;
+        findByEmailForAlignment: (email: string) => Promise<User | null>;
       };
     }
   ).usersRepo = {
     findByExternalIdentity: vi.fn(async () => args.externalIdentityUser ?? null),
+    findUsersByExternalIdentity: vi.fn(
+      async () =>
+        args.externalIdentityUsers ?? (args.externalIdentityUser ? [args.externalIdentityUser] : [])
+    ),
+    findByEmailForAlignment: vi.fn(async () =>
+      args.alignmentUser === undefined ? user : args.alignmentUser
+    ),
   };
   (
     service as unknown as { outboundRepo: { findUnconsumedByChannelAndThread: unknown } }
@@ -461,7 +476,7 @@ describe('GatewayService Telegram alignment', () => {
     });
     const usersRepo = (
       service as unknown as {
-        usersRepo: { findByExternalIdentity: ReturnType<typeof vi.fn> };
+        usersRepo: { findUsersByExternalIdentity: ReturnType<typeof vi.fn> };
       }
     ).usersRepo;
 
@@ -478,7 +493,7 @@ describe('GatewayService Telegram alignment', () => {
     });
 
     expect(result).toMatchObject({ success: true, sessionId: 'sess-new', created: true });
-    expect(usersRepo.findByExternalIdentity).toHaveBeenCalledWith({
+    expect(usersRepo.findUsersByExternalIdentity).toHaveBeenCalledWith({
       provider: 'telegram',
       issuer: 'telegram',
       subject: '123456789',
@@ -518,6 +533,211 @@ describe('GatewayService Telegram alignment', () => {
         telegram_user_id: '123456789',
         telegram_external_subject: '123456789',
         telegram_username: 'owner-user',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('ignores Slack alignment metadata for Telegram and still fails closed when unlinked', async () => {
+    const slackAlignedUser = {
+      ...user,
+      user_id: 'slack-aligned-user',
+      email: 'slack-aligned@example.com',
+    } as unknown as User;
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: null,
+      alignmentUser: slackAlignedUser,
+    });
+    const usersRepo = (
+      service as unknown as {
+        usersRepo: {
+          findUsersByExternalIdentity: ReturnType<typeof vi.fn>;
+          findByEmailForAlignment: ReturnType<typeof vi.fn>;
+        };
+      }
+    ).usersRepo;
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'hello from telegram',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        align_slack_users: true,
+        slack_user_email: 'slack-aligned@example.com',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(usersRepo.findUsersByExternalIdentity).toHaveBeenCalledWith({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(usersRepo.findByEmailForAlignment).not.toHaveBeenCalled();
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('ignores GitHub alignment config/metadata for Telegram and still fails closed when unlinked', async () => {
+    const githubAlignedUser = {
+      ...user,
+      user_id: 'github-aligned-user',
+      email: 'github-aligned@example.com',
+    } as unknown as User;
+    const githubAlignedTelegramChannel = {
+      ...telegramChannel,
+      config: {
+        bot_token: 'telegram-token',
+        align_github_users: true,
+        user_map: {
+          octocat: 'github-aligned@example.com',
+        },
+      },
+    } as unknown as GatewayChannel;
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: githubAlignedTelegramChannel,
+      externalIdentityUser: null,
+      alignmentUser: githubAlignedUser,
+    });
+    const usersRepo = (
+      service as unknown as {
+        usersRepo: {
+          findUsersByExternalIdentity: ReturnType<typeof vi.fn>;
+          findByEmailForAlignment: ReturnType<typeof vi.fn>;
+        };
+      }
+    ).usersRepo;
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'hello from telegram',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        align_github_users: true,
+        github_user: 'octocat',
+        github_user_email: 'github-aligned@example.com',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(usersRepo.findUsersByExternalIdentity).toHaveBeenCalledWith({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(usersRepo.findByEmailForAlignment).not.toHaveBeenCalled();
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('uses the unique Telegram link even when cross-provider alignment flags are present', async () => {
+    const crossProviderAlignedUser = {
+      ...user,
+      user_id: 'cross-provider-aligned-user',
+      email: 'cross-provider-aligned@example.com',
+    } as unknown as User;
+    const crossAlignedTelegramChannel = {
+      ...telegramChannel,
+      config: {
+        bot_token: 'telegram-token',
+        align_github_users: true,
+        user_map: {
+          octocat: 'cross-provider-aligned@example.com',
+        },
+      },
+    } as unknown as GatewayChannel;
+    const { service, sessionsCreate } = makeGatewayHarness({
+      channel: crossAlignedTelegramChannel,
+      externalIdentityUser: telegramUser,
+      alignmentUser: crossProviderAlignedUser,
+    });
+    const usersRepo = (
+      service as unknown as {
+        usersRepo: {
+          findUsersByExternalIdentity: ReturnType<typeof vi.fn>;
+          findByEmailForAlignment: ReturnType<typeof vi.fn>;
+        };
+      }
+    ).usersRepo;
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'hello from telegram',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        align_slack_users: true,
+        align_github_users: true,
+        slack_user_email: 'cross-provider-aligned@example.com',
+        github_user: 'octocat',
+        github_user_email: 'cross-provider-aligned@example.com',
+      },
+    });
+
+    expect(result).toMatchObject({ success: true, sessionId: 'sess-new', created: true });
+    expect(usersRepo.findUsersByExternalIdentity).toHaveBeenCalledWith({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(usersRepo.findByEmailForAlignment).not.toHaveBeenCalled();
+    expect(sessionsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        created_by: 'telegram-user-1',
+      })
+    );
+  });
+
+  it('rejects duplicate Telegram links instead of guessing a user', async () => {
+    const secondTelegramUser = {
+      ...telegramUser,
+      user_id: 'telegram-user-2',
+      email: 'telegram-user-2@example.com',
+    } as unknown as User;
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUsers: [telegramUser, secondTelegramUser],
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'hello from telegram',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        telegram_username: 'not-an-identity',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('handles Telegram link commands without creating sessions', async () => {
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/link abc_DEF-1234',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        telegram_username: 'not-an-identity',
       },
     });
 

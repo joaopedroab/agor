@@ -35,13 +35,20 @@ export {
   TeamsConnector,
 } from './connectors/teams';
 export type {
+  TelegramAuthRejectionReason,
+  TelegramCommandIntent,
+  TelegramInboundAuthDecision,
   TelegramInboundNormalizationResult,
   TelegramInboundRejectionReason,
+  TelegramLinkedUserCandidate,
 } from './connectors/telegram';
 export {
+  decideTelegramInboundAuth,
   normalizeTelegramInboundUpdate,
+  parseTelegramCommandIntent,
   TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
   TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
+  telegramExternalIdentityRef,
 } from './connectors/telegram';
 export type { GatewayContext } from './context';
 export { formatGatewayContext } from './context';

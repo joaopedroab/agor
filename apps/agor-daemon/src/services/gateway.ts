@@ -31,6 +31,7 @@ import type {
   SlackThreadHistoryResult,
 } from '@agor/core/gateway';
 import {
+  decideTelegramInboundAuth,
   formatGatewayContext,
   formatGatewayFollowUpRoutingMessage,
   formatGatewaySessionCreatedMessage,
@@ -39,8 +40,10 @@ import {
   hasConnector,
   normalizeOutbound,
   parseGitHubThreadId,
+  parseTelegramCommandIntent,
   TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
   TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
+  telegramExternalIdentityRef,
 } from '@agor/core/gateway';
 import { resolveSessionDefaults } from '@agor/core/sessions';
 import type {
@@ -1547,6 +1550,26 @@ export class GatewayService {
       throw new Error('Channel is disabled');
     }
 
+    // Telegram command boundary for the transport-free MVP. Commands such as
+    // `/link` are reserved for explicit account-link flows and must not create
+    // or prompt sessions merely because the sender is already linked.
+    if (channel.channel_type === 'telegram') {
+      const telegramCommand = parseTelegramCommandIntent(
+        data.text,
+        data.metadata?.telegram_external_subject ?? data.metadata?.telegram_user_id
+      );
+      if (telegramCommand.kind !== 'regular_message') {
+        console.log(
+          `[gateway] Telegram command boundary handled ${telegramCommand.kind} without creating a session (thread=${data.thread_id})`
+        );
+        return {
+          success: false,
+          sessionId: '',
+          created: false,
+        };
+      }
+    }
+
     // 2. Look up existing thread mapping
     let existingMapping = await this.threadMapRepo.findByChannelAndThread(
       channel.id,
@@ -1650,10 +1673,15 @@ export class GatewayService {
       get: (id: string) => Promise<User>;
     };
     const channelConfig = channel.config as Record<string, unknown>;
+    const isTelegramChannel = channel.channel_type === 'telegram';
+    // Telegram has a distinct explicit-link boundary: never let stray
+    // Slack/GitHub alignment config or inbound metadata decide its user.
     const alignSlackUsers =
-      channelConfig.align_slack_users === true || data.metadata?.align_slack_users === true;
+      !isTelegramChannel &&
+      (channelConfig.align_slack_users === true || data.metadata?.align_slack_users === true);
     const alignGitHubUsers =
-      channelConfig.align_github_users === true || data.metadata?.align_github_users === true;
+      !isTelegramChannel &&
+      (channelConfig.align_github_users === true || data.metadata?.align_github_users === true);
     const alignTelegramUsers =
       channel.channel_type === 'telegram' || data.metadata?.align_telegram_users === true;
 
@@ -1695,14 +1723,11 @@ export class GatewayService {
     // Telegram MVP deliberately has no owner fallback. The only trusted subject
     // is the stable numeric message.from.id normalized at the adapter edge.
     if (alignTelegramUsers && !alignSlackUsers && !alignGitHubUsers) {
-      const telegramUserId =
-        typeof data.metadata?.telegram_external_subject === 'string'
-          ? data.metadata.telegram_external_subject
-          : typeof data.metadata?.telegram_user_id === 'string'
-            ? data.metadata.telegram_user_id
-            : null;
+      const identityRef = telegramExternalIdentityRef(
+        data.metadata?.telegram_external_subject ?? data.metadata?.telegram_user_id
+      );
 
-      if (!telegramUserId || !/^[1-9]\d*$/.test(telegramUserId)) {
+      if (!identityRef) {
         console.log(
           `[gateway] Telegram user alignment failed: missing numeric Telegram sender id (thread=${data.thread_id})`
         );
@@ -1713,15 +1738,19 @@ export class GatewayService {
         };
       }
 
-      const matchedUser = await this.usersRepo.findByExternalIdentity({
+      const matchedUsers = await this.usersRepo.findUsersByExternalIdentity({
         provider: TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
         issuer: TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
-        subject: telegramUserId,
+        subject: identityRef.subject,
+      });
+      const authDecision = decideTelegramInboundAuth({
+        telegramUserId: identityRef.subject,
+        linkedUsers: matchedUsers,
       });
 
-      if (!matchedUser) {
+      if (!authDecision.ok) {
         console.log(
-          `[gateway] Telegram user alignment failed: no Agor mapping for Telegram user ${telegramUserId} (thread=${data.thread_id})`
+          `[gateway] Telegram user alignment failed: ${authDecision.reason} for Telegram user ${identityRef.subject} (thread=${data.thread_id})`
         );
         return {
           success: false,
@@ -1731,9 +1760,9 @@ export class GatewayService {
       }
 
       console.log(
-        `[gateway] Telegram user aligned via external identity: ${telegramUserId} → Agor user ${shortId(matchedUser.user_id)}`
+        `[gateway] Telegram user aligned via external identity: ${authDecision.telegramUserId} → Agor user ${shortId(authDecision.agorUserId)}`
       );
-      user = await usersService.get(matchedUser.user_id);
+      user = await usersService.get(authDecision.agorUserId);
     }
 
     // --- Slack user alignment ---

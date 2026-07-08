@@ -212,8 +212,55 @@ describe('UsersRepository external identity links', () => {
       issuer: 'telegram',
       subject: '123456789',
     });
+    const allMatches = await repo.findUsersByExternalIdentity({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
 
     expect(found).toBeNull();
+    expect(allMatches.map((user) => user.user_id).sort()).toEqual(
+      [firstUserId, secondUserId].sort()
+    );
+  });
+
+  dbTest('lists and revokes explicit external identity links for one user', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const userId = await makeUser(repo);
+
+    await repo.linkExternalIdentity(userId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+      name: 'telegram_username',
+      last_login_at: '2026-07-08T12:00:00.000Z',
+    });
+
+    expect(await repo.listExternalIdentities(userId)).toEqual([
+      {
+        key: externalIdentityKey('telegram', 'telegram', '123456789'),
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+        name: 'telegram_username',
+        last_login_at: '2026-07-08T12:00:00.000Z',
+      },
+    ]);
+
+    await repo.unlinkExternalIdentity(userId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+
+    expect(await repo.listExternalIdentities(userId)).toEqual([]);
+    expect(
+      await repo.findByExternalIdentity({
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+      })
+    ).toBeNull();
   });
 
   dbTest('generic user updates preserve external identity links', async ({ db }) => {

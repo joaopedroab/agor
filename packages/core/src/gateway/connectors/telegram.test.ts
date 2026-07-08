@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeTelegramInboundUpdate } from './telegram';
+import {
+  decideTelegramInboundAuth,
+  normalizeTelegramInboundUpdate,
+  parseTelegramCommandIntent,
+  telegramExternalIdentityRef,
+} from './telegram';
 
 describe('normalizeTelegramInboundUpdate', () => {
   it('accepts private text DMs and uses numeric from.id as the external subject', () => {
@@ -109,5 +114,101 @@ describe('normalizeTelegramInboundUpdate', () => {
 
     expect(first.ok && first.message.metadata?.telegram_external_subject).toBe('111');
     expect(second.ok && second.message.metadata?.telegram_external_subject).toBe('222');
+  });
+});
+
+describe('Telegram explicit link/auth helpers', () => {
+  it('builds external identity refs from stable numeric Telegram ids only', () => {
+    expect(telegramExternalIdentityRef(123456789)).toEqual({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(telegramExternalIdentityRef('123456789')).toEqual({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(telegramExternalIdentityRef('username')).toBeNull();
+    expect(telegramExternalIdentityRef(0)).toBeNull();
+  });
+
+  it('resolves exactly one explicitly linked Agor user', () => {
+    expect(
+      decideTelegramInboundAuth({
+        telegramUserId: 123456789,
+        linkedUsers: [{ user_id: 'agor-user-1' }],
+      })
+    ).toEqual({
+      ok: true,
+      telegramUserId: '123456789',
+      agorUserId: 'agor-user-1',
+    });
+  });
+
+  it('fails closed for unlinked Telegram users', () => {
+    expect(
+      decideTelegramInboundAuth({
+        telegramUserId: 123456789,
+        linkedUsers: [],
+      })
+    ).toEqual({
+      ok: false,
+      reason: 'unlinked_user',
+      telegramUserId: '123456789',
+    });
+  });
+
+  it('fails closed for duplicate/ambiguous Telegram links', () => {
+    expect(
+      decideTelegramInboundAuth({
+        telegramUserId: 123456789,
+        linkedUsers: [{ user_id: 'agor-user-1' }, { user_id: 'agor-user-2' }],
+      })
+    ).toEqual({
+      ok: false,
+      reason: 'ambiguous_link',
+      telegramUserId: '123456789',
+    });
+  });
+
+  it('does not use usernames as a fallback identity', () => {
+    expect(
+      decideTelegramInboundAuth({
+        telegramUserId: 'trusted_username',
+        linkedUsers: [{ user_id: 'agor-user-1' }],
+      })
+    ).toEqual({ ok: false, reason: 'missing_numeric_sender_id' });
+  });
+});
+
+describe('Telegram command/link boundary', () => {
+  it('parses /link help without mutating or requiring identity', () => {
+    expect(parseTelegramCommandIntent('/link')).toEqual({ kind: 'link_help' });
+    expect(parseTelegramCommandIntent('/link@AgorBot')).toEqual({ kind: 'link_help' });
+  });
+
+  it('parses /link token verification intent only with a numeric Telegram sender id', () => {
+    expect(parseTelegramCommandIntent('/link abc_DEF-1234', 123456789)).toEqual({
+      kind: 'link_token',
+      token: 'abc_DEF-1234',
+      telegramUserId: '123456789',
+    });
+    expect(parseTelegramCommandIntent('/link abc_DEF-1234', 'username')).toEqual({
+      kind: 'invalid_link_token',
+      reason: 'missing_numeric_sender_id',
+    });
+  });
+
+  it('rejects unsafe link token shapes and marks other slash commands unsupported', () => {
+    expect(parseTelegramCommandIntent('/link short', 123456789)).toEqual({
+      kind: 'invalid_link_token',
+      reason: 'invalid_token',
+    });
+    expect(parseTelegramCommandIntent('/new please')).toEqual({
+      kind: 'unsupported_command',
+      command: 'new',
+    });
+    expect(parseTelegramCommandIntent('regular prompt')).toEqual({ kind: 'regular_message' });
   });
 });

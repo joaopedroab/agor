@@ -324,25 +324,87 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
    * issuer="telegram", subject=<numeric Telegram user.id>).
    */
   async findByExternalIdentity(ref: ExternalIdentityRef): Promise<InternalUser | null> {
-    const key = externalIdentityKey(ref.provider, ref.issuer, ref.subject);
-    const rows = await select(this.db).from(users).all();
-    const matches: UserRow[] = [];
-    for (const row of rows) {
-      const identities = getExternalIdentities((row as UserRow).data as StoredUserData);
-      if (identities.some((identity) => identity.key === key)) {
-        matches.push(row as UserRow);
-      }
-    }
+    const matches = await this.findUsersByExternalIdentity(ref);
     if (matches.length === 0) return null;
     if (matches.length > 1) {
       console.warn(
         `[users] Ambiguous external identity link for provider=${ref.provider} issuer=${ref.issuer} subject=${ref.subject}: ${matches
-          .map((row) => shortId(row.user_id))
+          .map((user) => shortId(user.user_id))
           .join(', ')}`
       );
       return null;
     }
-    return this.rowToUser(matches[0]);
+    return matches[0];
+  }
+
+  /**
+   * Return every user currently carrying an explicit external identity link.
+   *
+   * Gateway auth boundaries can use this to fail closed on duplicate persisted
+   * links instead of treating "not exactly one" as an implicit fallback path.
+   */
+  async findUsersByExternalIdentity(ref: ExternalIdentityRef): Promise<InternalUser[]> {
+    const key = externalIdentityKey(ref.provider, ref.issuer, ref.subject);
+    const rows = await select(this.db).from(users).all();
+    const matches: InternalUser[] = [];
+    for (const row of rows) {
+      const userRow = row as UserRow;
+      const identities = getExternalIdentities(userRow.data as StoredUserData);
+      if (identities.some((identity) => identity.key === key)) {
+        matches.push(this.rowToUser(userRow));
+      }
+    }
+    return matches;
+  }
+
+  /**
+   * List explicit external identities for one user.
+   *
+   * This keeps listing/revocation inside the repository boundary without
+   * exposing the raw encrypted user-data blob to future admin services.
+   */
+  async listExternalIdentities(userId: string): Promise<UserExternalIdentity[]> {
+    const fullId = await this.resolveId(userId);
+    const row = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
+    if (!row) {
+      throw new EntityNotFoundError('User', userId);
+    }
+    const data = ((row as UserRow).data ?? {}) as StoredUserData;
+    return [...getExternalIdentities(data)];
+  }
+
+  /**
+   * Remove one explicit external identity link from a user.
+   *
+   * This is a local account-link revocation boundary only; it does not call any
+   * provider APIs or revoke provider-side credentials.
+   */
+  async unlinkExternalIdentity(userId: string, ref: ExternalIdentityRef): Promise<InternalUser> {
+    const fullId = await this.resolveId(userId);
+    const row = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
+    if (!row) {
+      throw new EntityNotFoundError('User', userId);
+    }
+
+    const data = ((row as UserRow).data ?? {}) as StoredUserData;
+    const key = externalIdentityKey(ref.provider, ref.issuer, ref.subject);
+    const external_identities = getExternalIdentities(data).filter(
+      (identity) => identity.key !== key
+    );
+
+    await update(this.db, users)
+      .set({
+        data: { ...data, external_identities },
+        updated_at: new Date(),
+      })
+      .where(eq(users.user_id, fullId))
+      .run();
+
+    const updated = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
+    if (!updated) {
+      throw new RepositoryError('Failed to retrieve updated user');
+    }
+    return this.rowToUser(updated as UserRow);
   }
 
   /**
