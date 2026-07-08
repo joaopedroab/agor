@@ -195,6 +195,13 @@ function hasListeningConfig(channel: GatewayChannel): boolean {
       );
     case 'teams':
       return !!(config.app_id && config.app_password);
+    case 'telegram':
+      return (
+        config.enable_polling === true &&
+        config.transport_disabled !== true &&
+        typeof config.bot_token === 'string' &&
+        config.bot_token.trim().length > 0
+      );
     default:
       return false;
   }
@@ -2386,6 +2393,11 @@ export class GatewayService {
       return { routed: false };
     }
 
+    if (channel.channel_type === 'telegram') {
+      console.log('[gateway] Telegram outbound routing is not implemented; skipping send');
+      return { routed: false, channelType: 'telegram' };
+    }
+
     // Check if we have a connector for this channel type
     if (!hasConnector(channel.channel_type as ChannelType)) {
       console.warn(`[gateway] No connector for channel type: ${channel.channel_type}`);
@@ -2542,7 +2554,7 @@ export class GatewayService {
   }
 
   /**
-   * Start Socket Mode listeners for all enabled channels that support it.
+   * Start listeners for all enabled channels that support it.
    * Called once at daemon startup. Inbound messages are routed through
    * the gateway's create() method (same path as webhook POST).
    */
@@ -2666,7 +2678,7 @@ export class GatewayService {
 
         await connector.startListening(callback);
         this.activeListeners.set(channel.id, connector);
-        console.log(`[gateway] Socket Mode listener started for channel "${channel.name}"`);
+        console.log(`[gateway] Listener started for channel "${channel.name}"`);
       } catch (error) {
         console.error(`[gateway] Failed to start listener for channel "${channel.name}":`, error);
       }

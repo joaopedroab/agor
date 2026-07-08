@@ -159,7 +159,9 @@ const gatewayChannelCreateSchema = z
     channelType: z
       .enum(['slack', 'github', 'teams', 'discord', 'whatsapp', 'telegram'])
       .default('slack')
-      .describe('Gateway platform type. Current active connectors are slack, github, and teams.'),
+      .describe(
+        'Gateway platform type. Current active connectors are slack, github, teams, and Telegram DM transport MVP.'
+      ),
     targetBranchId: mcpRequiredId(
       'targetBranchId',
       'Branch',
@@ -220,7 +222,7 @@ const gatewayChannelCreateSchema = z
         code: 'custom',
         path: ['config', 'bot_token'],
         message:
-          'config.bot_token is required to create an enabled Telegram gateway channel. Telegram transport is not implemented yet; create the channel disabled if you are only preparing configuration.',
+          'config.bot_token is required to create an enabled Telegram gateway channel. Set config.enable_polling=true only when you explicitly want polling transport to start.',
       });
     }
   });

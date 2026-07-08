@@ -37,17 +37,27 @@ export {
 export type {
   TelegramAuthRejectionReason,
   TelegramCommandIntent,
+  TelegramConfig,
+  TelegramConnectorOptions,
+  TelegramGetUpdatesRequest,
   TelegramInboundAuthDecision,
   TelegramInboundNormalizationResult,
   TelegramInboundRejectionReason,
   TelegramLinkedUserCandidate,
+  TelegramTransportFailure,
+  TelegramTransportRejectionReason,
+  TelegramTransportResult,
+  TelegramTransportSuccess,
+  TelegramUpdateClient,
 } from './connectors/telegram';
 export {
   decideTelegramInboundAuth,
+  handleTelegramUpdate,
   normalizeTelegramInboundUpdate,
   parseTelegramCommandIntent,
   TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
   TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
+  TelegramConnector,
   telegramExternalIdentityRef,
 } from './connectors/telegram';
 export type { GatewayContext } from './context';

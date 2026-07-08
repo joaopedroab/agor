@@ -764,6 +764,82 @@ describe('GatewayService Telegram alignment', () => {
     expect(result).toEqual({ success: false, sessionId: '', created: false });
     expect(sessionsCreate).not.toHaveBeenCalled();
   });
+
+  it('does not perform Telegram outbound sends through routeMessage', async () => {
+    const sendMessage = vi.fn(async () => 'should-not-send');
+    const { service } = makeGatewayHarness({
+      channel: telegramChannel,
+      existingMapping: makeMapping({
+        channel_id: telegramChannel.id,
+        thread_id: 'telegram:private:123456789',
+        metadata: {
+          telegram_user_id: '123456789',
+        },
+      }),
+      connector: { sendMessage },
+    });
+
+    const result = await service.routeMessage({
+      session_id: 'sess-1',
+      message: 'assistant response',
+    });
+
+    expect(result).toEqual({ routed: false, channelType: 'telegram' });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('starts Telegram polling only for enabled channels with explicit polling and bot_token', async () => {
+    const enabledPollingChannel = {
+      ...telegramChannel,
+      id: 'chan-telegram-polling',
+      config: {
+        bot_token: 'telegram-token',
+        enable_polling: true,
+        poll_interval_ms: 60_000,
+      },
+    } as unknown as GatewayChannel;
+    const disabledPollingChannel = {
+      ...telegramChannel,
+      id: 'chan-telegram-disabled',
+      enabled: false,
+      config: { bot_token: 'telegram-token', enable_polling: true },
+    } as unknown as GatewayChannel;
+    const noTokenChannel = {
+      ...telegramChannel,
+      id: 'chan-telegram-no-token',
+      config: { enable_polling: true },
+    } as unknown as GatewayChannel;
+    const killSwitchChannel = {
+      ...telegramChannel,
+      id: 'chan-telegram-kill-switch',
+      config: { bot_token: 'telegram-token', enable_polling: true, transport_disabled: true },
+    } as unknown as GatewayChannel;
+
+    const service = new GatewayService({ run: vi.fn() } as never, { service: vi.fn() } as never);
+    (
+      service as unknown as { channelRepo: { findAll: () => Promise<GatewayChannel[]> } }
+    ).channelRepo = {
+      findAll: vi.fn(async () => [
+        enabledPollingChannel,
+        disabledPollingChannel,
+        noTokenChannel,
+        killSwitchChannel,
+      ]),
+    };
+
+    try {
+      await service.startListeners();
+
+      const activeListeners = (service as unknown as { activeListeners: Map<string, unknown> })
+        .activeListeners;
+      expect(activeListeners.has('chan-telegram-polling')).toBe(true);
+      expect(activeListeners.has('chan-telegram-disabled')).toBe(false);
+      expect(activeListeners.has('chan-telegram-no-token')).toBe(false);
+      expect(activeListeners.has('chan-telegram-kill-switch')).toBe(false);
+    } finally {
+      await service.stopListeners();
+    }
+  });
 });
 
 describe('GatewayService Slack system message routing', () => {

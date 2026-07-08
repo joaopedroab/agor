@@ -1,14 +1,15 @@
 /**
  * Telegram inbound normalization helpers.
  *
- * This file intentionally does not implement polling, webhooks, outbound
- * sends, attachment downloads, groups, channels, or Mini Apps. It is the
- * adapter-edge boundary for converting one raw Telegram Bot API update into
- * Agor's provider-agnostic InboundMessage shape once a future transport has
- * already authenticated and delivered the raw update.
+ * This file intentionally does not implement webhooks, outbound sends,
+ * attachment downloads, groups, channels, Mini Apps, or provider mutation.
+ * It is the adapter-edge boundary for converting one raw Telegram Bot API
+ * update into Agor's provider-agnostic InboundMessage shape and, when explicitly
+ * enabled, polling Telegram getUpdates without changing remote provider state.
  */
 
-import type { InboundMessage } from '../connector';
+import type { ChannelType } from '../../types/gateway';
+import type { GatewayConnector, InboundMessage } from '../connector';
 
 export const TELEGRAM_EXTERNAL_IDENTITY_PROVIDER = 'telegram';
 export const TELEGRAM_EXTERNAL_IDENTITY_ISSUER = 'telegram';
@@ -88,6 +89,20 @@ export type TelegramInboundNormalizationResult =
   | TelegramInboundNormalizationSuccess
   | TelegramInboundNormalizationFailure;
 
+export type TelegramTransportRejectionReason = TelegramInboundRejectionReason | 'rate_limited';
+
+export interface TelegramTransportSuccess {
+  ok: true;
+  message: InboundMessage;
+}
+
+export interface TelegramTransportFailure {
+  ok: false;
+  reason: TelegramTransportRejectionReason;
+}
+
+export type TelegramTransportResult = TelegramTransportSuccess | TelegramTransportFailure;
+
 export type TelegramAuthRejectionReason =
   | 'missing_numeric_sender_id'
   | 'unlinked_user'
@@ -117,6 +132,32 @@ export type TelegramCommandIntent =
   | { kind: 'link_token'; token: string; telegramUserId: string }
   | { kind: 'invalid_link_token'; reason: 'missing_numeric_sender_id' | 'invalid_token' }
   | { kind: 'unsupported_command'; command: string };
+
+export interface TelegramConfig {
+  bot_token?: string;
+  enable_polling?: boolean;
+  transport_disabled?: boolean;
+  poll_interval_ms?: number;
+  poll_timeout_seconds?: number;
+}
+
+export interface TelegramGetUpdatesRequest {
+  botToken: string;
+  offset?: number;
+  timeoutSeconds?: number;
+}
+
+export interface TelegramUpdateClient {
+  getUpdates(req: TelegramGetUpdatesRequest): Promise<unknown[]>;
+}
+
+export interface TelegramConnectorOptions {
+  client?: TelegramUpdateClient;
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
+  rateLimit?: (message: InboundMessage) => boolean;
+  now?: () => Date;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -230,6 +271,28 @@ function hasUnsupportedMessageContent(message: Record<string, unknown>): boolean
   return UNSUPPORTED_MESSAGE_FIELDS.some((field) => field in message);
 }
 
+function getUpdateId(update: unknown): number | undefined {
+  if (!isRecord(update)) return undefined;
+  const updateId = update.update_id;
+  return typeof updateId === 'number' && Number.isSafeInteger(updateId) && updateId >= 0
+    ? updateId
+    : undefined;
+}
+
+function isValidBotToken(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function pollingIntervalMs(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1000 ? value : 10_000;
+}
+
+function pollingTimeoutSeconds(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.min(Math.floor(value), 50)
+    : undefined;
+}
+
 /**
  * Normalize one Telegram Bot API update into the gateway inbound message shape.
  *
@@ -269,6 +332,7 @@ export function normalizeTelegramInboundUpdate(
     return { ok: false, reason: 'empty_text' };
   }
 
+  const updateId = getUpdateId(update);
   const messageId =
     typeof message.message_id === 'number' && Number.isSafeInteger(message.message_id)
       ? String(message.message_id)
@@ -291,6 +355,7 @@ export function normalizeTelegramInboundUpdate(
         telegram_identity_provider: TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
         telegram_identity_issuer: TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
         telegram_external_subject: fromId,
+        ...(typeof updateId === 'number' ? { telegram_update_id: updateId } : {}),
         ...(messageId ? { telegram_message_id: messageId } : {}),
         ...(typeof from?.username === 'string' ? { telegram_username: from.username } : {}),
         ...(typeof from?.first_name === 'string' ? { telegram_first_name: from.first_name } : {}),
@@ -298,4 +363,174 @@ export function normalizeTelegramInboundUpdate(
       },
     },
   };
+}
+
+/**
+ * Testable transport bridge from a raw Telegram update into the gateway inbound
+ * callback. This owns only Telegram edge-shape normalization, non-secret audit
+ * metadata, and an optional rate-limit seam; user auth remains in GatewayService.
+ */
+export function handleTelegramUpdate(
+  update: unknown,
+  callback: (msg: InboundMessage) => void,
+  opts: {
+    transport?: 'polling' | 'webhook' | 'test';
+    rateLimit?: (message: InboundMessage) => boolean;
+    now?: () => Date;
+  } = {}
+): TelegramTransportResult {
+  const normalized = normalizeTelegramInboundUpdate(update);
+  if (!normalized.ok) {
+    return { ok: false, reason: normalized.reason };
+  }
+
+  const auditMetadata: Record<string, unknown> = {
+    ...(normalized.message.metadata ?? {}),
+    telegram_transport: opts.transport ?? 'test',
+    telegram_received_at: (opts.now ?? (() => new Date()))().toISOString(),
+  };
+  const message = {
+    ...normalized.message,
+    metadata: auditMetadata,
+  };
+
+  if (opts.rateLimit && !opts.rateLimit(message)) {
+    return { ok: false, reason: 'rate_limited' };
+  }
+
+  callback(message);
+  return { ok: true, message };
+}
+
+class FetchTelegramUpdateClient implements TelegramUpdateClient {
+  async getUpdates(req: TelegramGetUpdatesRequest): Promise<unknown[]> {
+    const url = new URL(`https://api.telegram.org/bot${req.botToken}/getUpdates`);
+    if (typeof req.offset === 'number') {
+      url.searchParams.set('offset', String(req.offset));
+    }
+    if (typeof req.timeoutSeconds === 'number') {
+      url.searchParams.set('timeout', String(req.timeoutSeconds));
+    }
+    // Keep the default fetch dependency inside the polling-only path so tests
+    // and disabled channels never touch the network.
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Telegram getUpdates failed with HTTP ${response.status}`);
+    }
+    const body = await response.json();
+    if (!isRecord(body) || body.ok !== true || !Array.isArray(body.result)) {
+      throw new Error('Telegram getUpdates returned an unexpected response shape');
+    }
+    return body.result;
+  }
+}
+
+export class TelegramConnector implements GatewayConnector {
+  readonly channelType: ChannelType = 'telegram';
+
+  private readonly config: TelegramConfig;
+  private readonly client: TelegramUpdateClient;
+  private readonly setIntervalFn: typeof setInterval;
+  private readonly clearIntervalFn: typeof clearInterval;
+  private readonly rateLimit?: (message: InboundMessage) => boolean;
+  private readonly now?: () => Date;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private polling = false;
+  private nextOffset: number | undefined;
+
+  constructor(config: Record<string, unknown>, options: TelegramConnectorOptions = {}) {
+    this.config = config as TelegramConfig;
+    this.client = options.client ?? new FetchTelegramUpdateClient();
+    this.setIntervalFn = options.setInterval ?? setInterval;
+    this.clearIntervalFn = options.clearInterval ?? clearInterval;
+    this.rateLimit = options.rateLimit;
+    this.now = options.now;
+  }
+
+  /**
+   * Outbound Telegram sends are intentionally out of Slice 4 scope.
+   * GatewayService skips Telegram outbound before reaching this method; this
+   * failure boundary exists only to satisfy the connector interface safely.
+   */
+  async sendMessage(): Promise<string> {
+    throw new Error('Telegram outbound sending is not implemented');
+  }
+
+  formatMessage(markdown: string): string {
+    return markdown;
+  }
+
+  async startListening(callback: (msg: InboundMessage) => void): Promise<void> {
+    if (this.config.transport_disabled === true) {
+      console.log('[telegram] Polling disabled by transport kill switch');
+      return;
+    }
+    if (this.config.enable_polling !== true) {
+      console.log('[telegram] Polling not enabled; listener not started');
+      return;
+    }
+    if (!isValidBotToken(this.config.bot_token)) {
+      throw new Error('Telegram connector requires bot_token to start polling');
+    }
+    if (this.pollTimer) {
+      return;
+    }
+
+    const intervalMs = pollingIntervalMs(this.config.poll_interval_ms);
+    this.pollTimer = this.setIntervalFn(() => {
+      void this.pollOnce(callback);
+    }, intervalMs);
+    console.log(`[telegram] Polling listener started (interval: ${intervalMs}ms)`);
+  }
+
+  async pollOnce(callback: (msg: InboundMessage) => void): Promise<void> {
+    if (this.polling) {
+      console.warn('[telegram] Poll tick skipped (previous tick still running)');
+      return;
+    }
+    if (this.config.transport_disabled === true || this.config.enable_polling !== true) {
+      return;
+    }
+    if (!isValidBotToken(this.config.bot_token)) {
+      throw new Error('Telegram connector requires bot_token to poll updates');
+    }
+
+    this.polling = true;
+    try {
+      const timeoutSeconds = pollingTimeoutSeconds(this.config.poll_timeout_seconds);
+      const updates = await this.client.getUpdates({
+        botToken: this.config.bot_token,
+        ...(typeof this.nextOffset === 'number' ? { offset: this.nextOffset } : {}),
+        ...(typeof timeoutSeconds === 'number' ? { timeoutSeconds } : {}),
+      });
+
+      for (const update of updates) {
+        handleTelegramUpdate(update, callback, {
+          transport: 'polling',
+          rateLimit: this.rateLimit,
+          now: this.now,
+        });
+        const updateId = getUpdateId(update);
+        if (typeof updateId === 'number') {
+          this.nextOffset = updateId + 1;
+        }
+      }
+    } catch (error) {
+      console.warn(
+        '[telegram] Poll tick failed:',
+        error instanceof Error ? error.message : String(error)
+      );
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  async stopListening(): Promise<void> {
+    if (this.pollTimer) {
+      this.clearIntervalFn(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.polling = false;
+    console.log('[telegram] Polling listener stopped');
+  }
 }

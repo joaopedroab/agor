@@ -11,6 +11,7 @@ import type { GatewayConnector } from './connector';
 import { GitHubConnector } from './connectors/github';
 import { SlackConnector } from './connectors/slack';
 import { TeamsConnector } from './connectors/teams';
+import { TelegramConnector } from './connectors/telegram';
 
 type ConnectorFactory = (config: Record<string, unknown>) => GatewayConnector;
 
@@ -20,6 +21,7 @@ const connectors = new Map<ChannelType, ConnectorFactory>();
 connectors.set('slack', (config) => new SlackConnector(config));
 connectors.set('github', (config) => new GitHubConnector(config));
 connectors.set('teams', (config) => new TeamsConnector(config));
+connectors.set('telegram', (config) => new TelegramConnector(config));
 
 /**
  * Get a connector instance for the given channel type
