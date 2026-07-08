@@ -6,6 +6,7 @@
  * the public DTO (User.agentic_tools) exposes boolean presence flags only.
  */
 
+import { createHash } from 'node:crypto';
 import type {
   AgenticToolName,
   AgenticToolsConfig,
@@ -13,6 +14,7 @@ import type {
   InternalUser,
   StoredAgenticTools,
   User,
+  UserExternalIdentity,
   UUID,
 } from '@agor/core/types';
 import { toAgenticToolsStatus } from '@agor/core/types';
@@ -30,6 +32,37 @@ import {
   RepositoryError,
   resolveByShortIdPrefix,
 } from './base';
+
+export interface ExternalIdentityRef {
+  provider: string;
+  issuer: string;
+  subject: string;
+}
+
+export interface LinkExternalIdentityInput extends ExternalIdentityRef {
+  email?: string;
+  name?: string;
+  last_login_at?: string;
+}
+
+type StoredUserData = UserRow['data'] & {
+  external_identities?: UserExternalIdentity[];
+};
+
+/**
+ * Stable lookup key for explicit external account links.
+ *
+ * Keep this aligned with launch-auth's identity key shape so a local Agor user
+ * can own stable identities from multiple external surfaces without a new
+ * provider-specific table for each gateway.
+ */
+export function externalIdentityKey(provider: string, issuer: string, subject: string): string {
+  return createHash('sha256').update(`${provider}\0${issuer}\0${subject}`).digest('hex');
+}
+
+function getExternalIdentities(data: StoredUserData | null | undefined): UserExternalIdentity[] {
+  return Array.isArray(data?.external_identities) ? data.external_identities : [];
+}
 
 /**
  * Users repository implementation
@@ -91,6 +124,7 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
       password?: string;
       agentic_tools_raw?: StoredAgenticTools;
       env_vars_raw?: SchemaUserInsert['data']['env_vars'];
+      external_identities_raw?: UserExternalIdentity[];
     }
   ): SchemaUserInsert {
     const now = new Date();
@@ -131,6 +165,9 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
         // not represented on the public DTO. `update()` threads the raw value
         // from the existing row so a generic field update doesn't wipe them.
         env_vars: user.env_vars_raw,
+        // Stable external account links are internal user data. Preserve them
+        // across generic profile/preference updates just like credential blobs.
+        external_identities: user.external_identities_raw,
         default_agentic_config: user.default_agentic_config,
       },
     };
@@ -279,6 +316,97 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
   }
 
   /**
+   * Find a user by an explicitly linked external identity.
+   *
+   * Used by gateway providers that have a stable external account identifier
+   * but no trustworthy email address. The lookup is intentionally generic:
+   * callers decide the provider/issuer namespace (e.g. provider="telegram",
+   * issuer="telegram", subject=<numeric Telegram user.id>).
+   */
+  async findByExternalIdentity(ref: ExternalIdentityRef): Promise<InternalUser | null> {
+    const key = externalIdentityKey(ref.provider, ref.issuer, ref.subject);
+    const rows = await select(this.db).from(users).all();
+    const matches: UserRow[] = [];
+    for (const row of rows) {
+      const identities = getExternalIdentities((row as UserRow).data as StoredUserData);
+      if (identities.some((identity) => identity.key === key)) {
+        matches.push(row as UserRow);
+      }
+    }
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      console.warn(
+        `[users] Ambiguous external identity link for provider=${ref.provider} issuer=${ref.issuer} subject=${ref.subject}: ${matches
+          .map((row) => shortId(row.user_id))
+          .join(', ')}`
+      );
+      return null;
+    }
+    return this.rowToUser(matches[0]);
+  }
+
+  /**
+   * Link or refresh one external identity on an existing user.
+   *
+   * This writes only `users.data.external_identities`; it does not create users,
+   * merge by email, or imply that a gateway may fall back to a channel owner.
+   */
+  async linkExternalIdentity(
+    userId: string,
+    input: LinkExternalIdentityInput
+  ): Promise<InternalUser> {
+    const fullId = await this.resolveId(userId);
+    const row = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
+    if (!row) {
+      throw new EntityNotFoundError('User', userId);
+    }
+
+    const data = ((row as UserRow).data ?? {}) as StoredUserData;
+    const key = externalIdentityKey(input.provider, input.issuer, input.subject);
+    const rows = (await select(this.db).from(users).all()) as UserRow[];
+    const owner = rows.find((candidate) => {
+      if (candidate.user_id === fullId) return false;
+      const identities = getExternalIdentities(candidate.data as StoredUserData);
+      return identities.some((identity) => identity.key === key);
+    });
+    if (owner) {
+      throw new RepositoryError(
+        `External identity ${input.provider}:${input.issuer}:${input.subject} is already linked to another user`
+      );
+    }
+
+    const identity: UserExternalIdentity = {
+      key,
+      provider: input.provider,
+      issuer: input.issuer,
+      subject: input.subject,
+      ...(input.email ? { email: input.email } : {}),
+      ...(input.name ? { name: input.name } : {}),
+      last_login_at: input.last_login_at ?? new Date().toISOString(),
+    };
+    const existing = getExternalIdentities(data);
+    const external_identities = existing.some((candidate) => candidate.key === key)
+      ? existing.map((candidate) =>
+          candidate.key === key ? { ...candidate, ...identity } : candidate
+        )
+      : [...existing, identity];
+
+    await update(this.db, users)
+      .set({
+        data: { ...data, external_identities },
+        updated_at: new Date(),
+      })
+      .where(eq(users.user_id, fullId))
+      .run();
+
+    const updated = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
+    if (!updated) {
+      throw new RepositoryError('Failed to retrieve updated user');
+    }
+    return this.rowToUser(updated as UserRow);
+  }
+
+  /**
    * Find all users
    */
   async findAll(): Promise<InternalUser[]> {
@@ -317,12 +445,16 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
     const merged = { ...current, ...updates } as Partial<InternalUser> & {
       agentic_tools_raw?: StoredAgenticTools;
       env_vars_raw?: SchemaUserInsert['data']['env_vars'];
+      external_identities_raw?: UserExternalIdentity[];
     };
     if (rawRow?.data.agentic_tools) {
       merged.agentic_tools_raw = rawRow.data.agentic_tools as StoredAgenticTools;
     }
     if (rawRow?.data.env_vars) {
       merged.env_vars_raw = rawRow.data.env_vars;
+    }
+    if (rawRow?.data.external_identities) {
+      merged.external_identities_raw = rawRow.data.external_identities;
     }
     const insertData = this.userToInsert(merged);
 

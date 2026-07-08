@@ -178,6 +178,15 @@ export class GatewayChannelRepository
       throw new RepositoryError('GatewayChannel must have a created_by');
     }
 
+    const channelType = data.channel_type ?? 'slack';
+    const enabled = data.enabled ?? true;
+    const config = data.config ?? {};
+    if (channelType === 'telegram' && enabled && !config.bot_token) {
+      throw new RepositoryError(
+        'config.bot_token is required to create or enable a Telegram gateway channel'
+      );
+    }
+
     const encryptedAgenticConfig = encryptAgenticConfig(
       (data.agentic_config as unknown as Record<string, unknown> | null) ?? null
     );
@@ -188,13 +197,13 @@ export class GatewayChannelRepository
       updated_at: new Date(data.updated_at ?? now),
       created_by: data.created_by,
       name: data.name ?? 'Untitled Channel',
-      channel_type: data.channel_type ?? 'slack',
+      channel_type: channelType,
       target_branch_id: data.target_branch_id ?? '',
       agor_user_id: data.agor_user_id ?? '',
       channel_key: data.channel_key ?? generateId(),
-      enabled: data.enabled ?? true,
+      enabled,
       last_message_at: data.last_message_at ? new Date(data.last_message_at) : null,
-      config: data.config ? encryptConfig(data.config) : {},
+      config: encryptConfig(config),
       agentic_config: encryptedAgenticConfig,
     };
   }

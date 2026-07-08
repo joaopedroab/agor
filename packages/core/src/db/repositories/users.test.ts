@@ -17,7 +17,7 @@ import { beforeAll, describe, expect } from 'vitest';
 import { select, update } from '../database-wrapper';
 import { users } from '../schema';
 import { dbTest } from '../test-helpers';
-import { UsersRepository } from './users';
+import { externalIdentityKey, UsersRepository } from './users';
 
 // Force real AES encryption for these tests so non-secret values that contain
 // `:` (URLs, ports) round-trip correctly. The dev-mode fallback in
@@ -82,6 +82,171 @@ describe('UsersRepository.findByEmailForAlignment', () => {
     });
 
     const found = await repo.findByEmailForAlignment(`ambiguous-${suffix}@example.com`);
+
+    expect(found).toBeNull();
+  });
+});
+
+describe('UsersRepository external identity links', () => {
+  dbTest('links and finds a user by stable provider issuer subject', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const userId = await makeUser(repo);
+    const linkedAt = '2026-07-08T12:00:00.000Z';
+
+    await repo.linkExternalIdentity(userId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+      name: 'telegram_username',
+      last_login_at: linkedAt,
+    });
+
+    const found = await repo.findByExternalIdentity({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(found?.user_id).toBe(userId);
+
+    const row = await select(db).from(users).where(eq(users.user_id, userId)).one();
+    expect(row?.data.external_identities).toEqual([
+      {
+        key: externalIdentityKey('telegram', 'telegram', '123456789'),
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+        name: 'telegram_username',
+        last_login_at: linkedAt,
+      },
+    ]);
+  });
+
+  dbTest('refreshes an existing external identity without duplicating it', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const userId = await makeUser(repo);
+
+    await repo.linkExternalIdentity(userId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+      name: 'old_username',
+      last_login_at: '2026-07-08T12:00:00.000Z',
+    });
+    await repo.linkExternalIdentity(userId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+      name: 'new_username',
+      last_login_at: '2026-07-08T12:05:00.000Z',
+    });
+
+    const row = await select(db).from(users).where(eq(users.user_id, userId)).one();
+    expect(row?.data.external_identities).toHaveLength(1);
+    expect(row?.data.external_identities?.[0]).toMatchObject({
+      subject: '123456789',
+      name: 'new_username',
+      last_login_at: '2026-07-08T12:05:00.000Z',
+    });
+  });
+
+  dbTest('rejects linking the same external identity to another user', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const firstUserId = await makeUser(repo);
+    const secondUserId = await makeUser(repo);
+
+    await repo.linkExternalIdentity(firstUserId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+      name: 'telegram_username',
+    });
+
+    await expect(
+      repo.linkExternalIdentity(secondUserId, {
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+        name: 'other_telegram_username',
+      })
+    ).rejects.toThrow(
+      'External identity telegram:telegram:123456789 is already linked to another user'
+    );
+
+    const found = await repo.findByExternalIdentity({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(found?.user_id).toBe(firstUserId);
+  });
+
+  dbTest('does not guess when persisted external identity links are ambiguous', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const firstUserId = await makeUser(repo);
+    const secondUserId = await makeUser(repo);
+
+    await repo.linkExternalIdentity(firstUserId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+      name: 'telegram_username',
+    });
+
+    const firstRow = await select(db).from(users).where(eq(users.user_id, firstUserId)).one();
+    const secondRow = await select(db).from(users).where(eq(users.user_id, secondUserId)).one();
+    expect(firstRow?.data.external_identities).toHaveLength(1);
+    expect(secondRow).toBeTruthy();
+
+    await update(db, users)
+      .set({
+        data: {
+          ...secondRow?.data,
+          external_identities: firstRow?.data.external_identities,
+        },
+      })
+      .where(eq(users.user_id, secondUserId))
+      .run();
+
+    const found = await repo.findByExternalIdentity({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+
+    expect(found).toBeNull();
+  });
+
+  dbTest('generic user updates preserve external identity links', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const userId = await makeUser(repo);
+
+    await repo.linkExternalIdentity(userId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+      name: 'telegram_username',
+      last_login_at: '2026-07-08T12:00:00.000Z',
+    });
+    await repo.update(userId, { name: 'Renamed User' });
+
+    const found = await repo.findByExternalIdentity({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(found?.user_id).toBe(userId);
+    expect(found?.name).toBe('Renamed User');
+  });
+
+  dbTest('does not guess unlinked external identities', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    await makeUser(repo);
+
+    const found = await repo.findByExternalIdentity({
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '987654321',
+    });
 
     expect(found).toBeNull();
   });

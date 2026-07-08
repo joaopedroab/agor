@@ -34,7 +34,7 @@ Things that still warrant caution:
 
 The Message Gateway connects external messaging platforms to Agor's agent sessions. Mention your Slack bot in a channel thread or mention `@agor` on a GitHub PR, and Agor spins up a coding session on the right branch with the right agent — then routes responses back to the platform. In Slack channels, every prompt requires an explicit bot mention; Agor catches the bot up on intervening thread replies when it is mentioned again.
 
-> Currently supports **Slack**, **GitHub**, and **Microsoft Teams**. Discord, WhatsApp, and Telegram connectors are planned.
+> Currently supports **Slack**, **GitHub**, and **Microsoft Teams**. Telegram is planned as a native Gateway Channel; Discord and WhatsApp connectors are also planned.
 
 <img
   src="/screenshots/marketing/agor-marketing-slack-thread.png"
@@ -311,6 +311,24 @@ In a 1:1 chat, just message the bot. In a channel, post `@agor review this threa
 
 Follow-up messages in the same conversation continue the same session — the agent has full conversation history.
 
+## Planned Telegram Integration
+
+Telegram is being prepared as a native Message Gateway channel, but it does not
+have live transport yet. There is no Telegram polling loop, webhook handler, or
+send/receive connector in the current release.
+
+The planned MVP is intentionally narrow and safe by default:
+
+- **Private DM text only.** Group chats, channels, attachments, and rich media are outside the MVP.
+- **Explicit user linking.** A Telegram sender must be linked to an Agor user by the stable numeric Telegram `user.id`. Telegram usernames are display metadata only and are not trusted for identity.
+- **No owner fallback for aligned senders.** If a Telegram sender is not linked, the gateway should reject the message rather than running it as the channel owner.
+- **Normal Agor authority model.** Gateway-created sessions still use the channel's target branch, permission configuration, sandboxing, MCP attachments, and approval gates.
+- **Approvals stay in Agor.** Plain Telegram replies such as “yes” are not approvals for destructive tool calls or provider mutations.
+
+You may see `telegram` in low-level channel type schemas while this foundation is
+in place. Treat it as planned/non-listening until the connector setup is
+documented here.
+
 ## Agentic Tool Configuration
 
 Each channel can define its own agent configuration, overriding the user's defaults:
@@ -331,7 +349,7 @@ The gateway is built as a set of loosely coupled components:
 - **Gateway Service** (`/gateway`) — Orchestrates inbound routing (platform to session) and outbound routing (session to platform). Custom FeathersJS service.
 - **Gateway Channels** (`/gateway-channels`) — CRUD for channel configurations with encrypted credential storage.
 - **Thread-Session Map** (`/thread-session-map`) — Persists the mapping between platform thread IDs and Agor session IDs.
-- **Connector Layer** — Platform-agnostic `GatewayConnector` interface with a registry pattern. Currently: `SlackConnector` (Socket Mode), `GitHubConnector` (API polling), and `TeamsConnector` (Bot Framework webhook). Adding a new platform means implementing `sendMessage()` and optionally `startListening()`.
+- **Connector Layer** — Platform-agnostic `GatewayConnector` interface with a registry pattern. Currently: `SlackConnector` (Socket Mode), `GitHubConnector` (API polling), and `TeamsConnector` (Bot Framework webhook). Telegram is reserved as a planned native channel type but has no registered connector yet. Adding a new platform means implementing `sendMessage()` and optionally `startListening()`.
 - **Outbound Hook** — FeathersJS `after.create` hook on the messages service. Fire-and-forget; never blocks message creation.
 
 ### Adding a New Platform

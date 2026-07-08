@@ -123,6 +123,39 @@ describe('agor_gateway_channels MCP tools', () => {
     );
   });
 
+  it('requires bot_token only for enabled Telegram channel creation', async () => {
+    const tools = await captureTools();
+    const enabledWithoutToken = tools.agor_gateway_channels_create.cfg.inputSchema.safeParse({
+      name: 'Telegram DM',
+      targetBranchId: 'branch-1',
+      channelType: 'telegram',
+      enabled: true,
+      config: {},
+    });
+    expect(enabledWithoutToken.success).toBe(false);
+    expect(String(enabledWithoutToken.error)).toContain(
+      'config.bot_token is required to create an enabled Telegram gateway channel'
+    );
+
+    const disabledPlaceholder = tools.agor_gateway_channels_create.cfg.inputSchema.safeParse({
+      name: 'Telegram DM',
+      targetBranchId: 'branch-1',
+      channelType: 'telegram',
+      enabled: false,
+      config: {},
+    });
+    expect(disabledPlaceholder.success).toBe(true);
+
+    const enabledWithToken = tools.agor_gateway_channels_create.cfg.inputSchema.safeParse({
+      name: 'Telegram DM',
+      targetBranchId: 'branch-1',
+      channelType: 'telegram',
+      enabled: true,
+      config: { bot_token: 'telegram-token-placeholder' },
+    });
+    expect(enabledWithToken.success).toBe(true);
+  });
+
   it('creates through gateway-channels service and redacts returned secrets', async () => {
     const createCalls: Array<{ data: Record<string, unknown>; params: unknown }> = [];
     const app = makeFakeApp({

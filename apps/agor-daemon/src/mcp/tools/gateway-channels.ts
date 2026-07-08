@@ -215,6 +215,14 @@ const gatewayChannelCreateSchema = z
         }
       }
     }
+    if (value.channelType === 'telegram' && value.enabled !== false && !config.bot_token) {
+      issue.addIssue({
+        code: 'custom',
+        path: ['config', 'bot_token'],
+        message:
+          'config.bot_token is required to create an enabled Telegram gateway channel. Telegram transport is not implemented yet; create the channel disabled if you are only preparing configuration.',
+      });
+    }
   });
 
 const slackThreadHistorySchema = z

@@ -63,4 +63,44 @@ describe('GatewayChannelRepository', () => {
     expect(channel.name).toBe('Test Channel');
     expect(channel.id).toBeDefined();
   });
+
+  dbTest('requires bot_token for enabled Telegram channels', async ({ db }) => {
+    const branch = await seedBranch(db);
+    const repo = new GatewayChannelRepository(db);
+    const userId = generateId() as UUID;
+
+    await expect(
+      repo.create({
+        name: 'Telegram',
+        created_by: userId,
+        channel_type: 'telegram',
+        target_branch_id: branch.branch_id as UUID,
+        enabled: true,
+        config: {},
+      })
+    ).rejects.toThrow(
+      'config.bot_token is required to create or enable a Telegram gateway channel'
+    );
+
+    const disabled = await repo.create({
+      name: 'Telegram Disabled',
+      created_by: userId,
+      channel_type: 'telegram',
+      target_branch_id: branch.branch_id as UUID,
+      enabled: false,
+      config: {},
+    });
+    expect(disabled.enabled).toBe(false);
+
+    const enabled = await repo.create({
+      name: 'Telegram Enabled',
+      created_by: userId,
+      channel_type: 'telegram',
+      target_branch_id: branch.branch_id as UUID,
+      enabled: true,
+      config: { bot_token: 'telegram-token-placeholder' },
+    });
+    expect(enabled.enabled).toBe(true);
+    expect(enabled.config.bot_token).toBe('telegram-token-placeholder');
+  });
 });
