@@ -71,17 +71,112 @@ describe('normalizeTelegramInboundUpdate', () => {
     ).toEqual({ ok: false, reason: 'missing_sender_id' });
   });
 
+  it('normalizes Telegram documents with caption as untrusted attachment metadata', () => {
+    const result = normalizeTelegramInboundUpdate({
+      update_id: 1001,
+      message: {
+        message_id: 43,
+        date: 1_788_888_888,
+        chat: { id: 123456789, type: 'private' },
+        from: { id: 123456789, is_bot: false },
+        caption: 'please inspect this',
+        document: {
+          file_id: 'telegram-file-id',
+          file_name: '../unsafe:name.pdf',
+          mime_type: 'application/pdf',
+          file_size: 1234,
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      message: {
+        text: 'please inspect this',
+        attachments: [
+          {
+            id: 'telegram-file-id',
+            kind: 'file',
+            filename: 'unsafe_name.pdf',
+            mimeType: 'application/pdf',
+            sizeBytes: 1234,
+            caption: 'please inspect this',
+            metadata: {
+              telegram_file_id: 'telegram-file-id',
+              telegram_attachment_type: 'document',
+            },
+          },
+        ],
+      },
+    });
+  });
+
+  it('normalizes Telegram photos as safe image attachments', () => {
+    const result = normalizeTelegramInboundUpdate({
+      update_id: 1002,
+      message: {
+        message_id: 44,
+        date: 1_788_888_888,
+        chat: { id: 123456789, type: 'private' },
+        from: { id: 123456789, is_bot: false },
+        photo: [
+          { file_id: 'small-photo', width: 90, height: 90, file_size: 100 },
+          { file_id: 'large-photo', width: 1280, height: 720, file_size: 2000 },
+        ],
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      message: {
+        text: 'Telegram attachment received.',
+        attachments: [
+          {
+            id: 'large-photo',
+            kind: 'image',
+            filename: 'telegram-photo-44.jpg',
+            mimeType: 'image/jpeg',
+            sizeBytes: 2000,
+            metadata: {
+              telegram_file_id: 'large-photo',
+              telegram_attachment_type: 'photo',
+            },
+          },
+        ],
+      },
+    });
+  });
+
   it.each([
-    ['photo', { photo: [{ file_id: 'file' }], caption: 'caption' }],
-    ['document', { document: { file_id: 'file' } }],
     ['voice', { voice: { file_id: 'file' } }],
-    ['web_app_data', { web_app_data: { data: '{}' } }],
-  ])('rejects non-text/attachment-like messages: %s', (_label, extraMessageFields) => {
+    ['video', { video: { file_id: 'file' } }],
+    ['audio', { audio: { file_id: 'file' } }],
+  ])('normalizes unsupported Telegram media as an attachment rejection: %s', (_label, extraMessageFields) => {
     const result = normalizeTelegramInboundUpdate({
       message: {
         chat: { type: 'private' },
         from: { id: 123456789, is_bot: false },
-        text: 'hello',
+        ...extraMessageFields,
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      message: {
+        attachmentRejection: {
+          reason: 'unsupported_type',
+        },
+      },
+    });
+  });
+
+  it.each([
+    ['web_app_data', { web_app_data: { data: '{}' } }],
+  ])('rejects non-text/non-attachment messages: %s', (_label, extraMessageFields) => {
+    const result = normalizeTelegramInboundUpdate({
+      message: {
+        chat: { type: 'private' },
+        from: { id: 123456789, is_bot: false },
         ...extraMessageFields,
       },
     });
@@ -411,6 +506,159 @@ describe('TelegramConnector outbound private DM replies', () => {
       chatId: '123456789',
       text: 'plain response',
     });
+  });
+
+  it('downloads attachments through getFile plus file download without exposing provider URLs', async () => {
+    const getFile = vi.fn(async () => ({
+      fileId: 'telegram-file-id',
+      filePath: 'documents/file.pdf',
+      fileSize: 4,
+    }));
+    const downloadFile = vi.fn(async () => new Uint8Array([1, 2, 3, 4]));
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN' },
+      { client: { getUpdates: vi.fn(async () => []), getFile, downloadFile } }
+    );
+
+    await expect(
+      connector.downloadAttachment({
+        maxBytes: 10,
+        attachment: {
+          id: 'telegram-file-id',
+          kind: 'file',
+          filename: '../unsafe.pdf',
+          mimeType: 'application/pdf',
+          metadata: { telegram_file_id: 'telegram-file-id' },
+        },
+      })
+    ).resolves.toEqual({
+      bytes: new Uint8Array([1, 2, 3, 4]),
+      filename: 'unsafe.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 4,
+    });
+    expect(getFile).toHaveBeenCalledWith({
+      botToken: '123456:SAFE_TOKEN',
+      fileId: 'telegram-file-id',
+    });
+    expect(downloadFile).toHaveBeenCalledWith({
+      botToken: '123456:SAFE_TOKEN',
+      filePath: 'documents/file.pdf',
+      maxBytes: 10,
+    });
+  });
+
+  it('fails closed for oversized attachment metadata before downloading bytes', async () => {
+    const getFile = vi.fn();
+    const downloadFile = vi.fn();
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN' },
+      { client: { getUpdates: vi.fn(async () => []), getFile, downloadFile } }
+    );
+
+    await expect(
+      connector.downloadAttachment({
+        maxBytes: 10,
+        attachment: {
+          id: 'telegram-file-id',
+          kind: 'file',
+          filename: 'big.pdf',
+          mimeType: 'application/pdf',
+          sizeBytes: 11,
+          metadata: { telegram_file_id: 'telegram-file-id' },
+        },
+      })
+    ).rejects.toThrow('size limit');
+    expect(getFile).not.toHaveBeenCalled();
+    expect(downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('redacts Telegram token and file id from download errors', async () => {
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN' },
+      {
+        client: {
+          getUpdates: vi.fn(async () => []),
+          getFile: vi.fn(async () => {
+            throw new Error(
+              'failed https://api.telegram.org/bot123456:SAFE_TOKEN/getFile?file_id=secret-file-id'
+            );
+          }),
+          downloadFile: vi.fn(),
+        },
+      }
+    );
+
+    await expect(
+      connector.downloadAttachment({
+        maxBytes: 10,
+        attachment: {
+          id: 'secret-file-id',
+          kind: 'file',
+          filename: 'secret.pdf',
+          mimeType: 'application/pdf',
+          metadata: { telegram_file_id: 'secret-file-id' },
+        },
+      })
+    ).rejects.toThrow(/redacted-telegram-token/);
+    await expect(
+      connector.downloadAttachment({
+        maxBytes: 10,
+        attachment: {
+          id: 'secret-file-id',
+          kind: 'file',
+          filename: 'secret.pdf',
+          mimeType: 'application/pdf',
+          metadata: { telegram_file_id: 'secret-file-id' },
+        },
+      })
+    ).rejects.not.toThrow(/SAFE_TOKEN|secret-file-id/);
+  });
+
+  it('redacts Telegram file paths and download URLs from download errors', async () => {
+    const fileId = 'secret-file-id';
+    const filePath = 'documents/raw-secret-file-path.pdf';
+    const downloadUrl = `https://api.telegram.org/file/bot123456:SAFE_TOKEN/${filePath}`;
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN' },
+      {
+        client: {
+          getUpdates: vi.fn(async () => []),
+          getFile: vi.fn(async () => ({
+            fileId,
+            filePath,
+            fileSize: 4,
+          })),
+          downloadFile: vi.fn(async () => {
+            throw new Error(
+              `failed ${downloadUrl} for path ${filePath} and id ${fileId} with token 123456:SAFE_TOKEN`
+            );
+          }),
+        },
+      }
+    );
+
+    let thrown: Error | undefined;
+    try {
+      await connector.downloadAttachment({
+        maxBytes: 10,
+        attachment: {
+          id: fileId,
+          kind: 'file',
+          filename: 'secret.pdf',
+          mimeType: 'application/pdf',
+          metadata: { telegram_file_id: fileId },
+        },
+      });
+    } catch (error) {
+      thrown = error instanceof Error ? error : new Error(String(error));
+    }
+
+    expect(thrown?.message).toContain('[redacted-telegram-file-url]');
+    expect(thrown?.message).not.toContain('123456:SAFE_TOKEN');
+    expect(thrown?.message).not.toContain(fileId);
+    expect(thrown?.message).not.toContain(filePath);
+    expect(thrown?.message).not.toContain(downloadUrl);
   });
 
   it('formats rich markdown as Telegram HTML with escaped untrusted text', async () => {

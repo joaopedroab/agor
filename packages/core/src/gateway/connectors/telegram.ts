@@ -1,15 +1,22 @@
 /**
  * Telegram inbound normalization helpers.
  *
- * This file intentionally does not implement webhooks, attachment downloads,
- * groups, channels, Mini Apps, or provider mutation.
+ * This file intentionally does not implement webhooks, groups, channels, Mini
+ * Apps, or provider mutation. Supported private-DM attachments are normalized
+ * to metadata and downloaded only through the explicit connector seam.
  * It is the adapter-edge boundary for converting one raw Telegram Bot API
  * update into Agor's provider-agnostic InboundMessage shape and, when explicitly
  * enabled, polling Telegram getUpdates without changing remote provider state.
  */
 
 import type { ChannelType } from '../../types/gateway';
-import type { GatewayConnector, InboundMessage, OutboundPayload } from '../connector';
+import type {
+  GatewayConnector,
+  InboundAttachment,
+  InboundAttachmentRejection,
+  InboundMessage,
+  OutboundPayload,
+} from '../connector';
 
 export const TELEGRAM_EXTERNAL_IDENTITY_PROVIDER = 'telegram';
 export const TELEGRAM_EXTERNAL_IDENTITY_ISSUER = 'telegram';
@@ -19,18 +26,15 @@ const TELEGRAM_LINK_TOKEN_PATTERN = /^[A-Za-z0-9_-]{8,256}$/;
 const TELEGRAM_HTML_PARSE_MODE = 'HTML';
 const TELEGRAM_MESSAGE_MAX_CHARS = 4096;
 const TELEGRAM_RICH_BLOCK_TYPE = 'telegram_html';
+const TELEGRAM_ATTACHMENT_FILE_REF_KEY = 'telegram_file_id';
+const TELEGRAM_ATTACHMENT_PHOTO_MIME = 'image/jpeg';
+const TELEGRAM_ATTACHMENT_DEFAULT_TEXT = 'Telegram attachment received.';
+const TELEGRAM_FILE_DOWNLOAD_URL_PATTERN = /https:\/\/api\.telegram\.org\/file\/bot[^\s"'<>)]*/g;
 
 const UNSUPPORTED_MESSAGE_FIELDS = [
-  'audio',
-  'document',
   'animation',
   'game',
-  'photo',
   'sticker',
-  'video',
-  'video_note',
-  'voice',
-  'caption',
   'contact',
   'dice',
   'location',
@@ -157,9 +161,28 @@ export interface TelegramSendMessageRequest {
   parseMode?: 'HTML';
 }
 
+export interface TelegramGetFileRequest {
+  botToken: string;
+  fileId: string;
+}
+
+export interface TelegramFileInfo {
+  fileId: string;
+  filePath: string;
+  fileSize?: number;
+}
+
+export interface TelegramDownloadFileRequest {
+  botToken: string;
+  filePath: string;
+  maxBytes: number;
+}
+
 export interface TelegramUpdateClient {
   getUpdates(req: TelegramGetUpdatesRequest): Promise<unknown[]>;
   sendMessage?(req: TelegramSendMessageRequest): Promise<string>;
+  getFile?(req: TelegramGetFileRequest): Promise<TelegramFileInfo>;
+  downloadFile?(req: TelegramDownloadFileRequest): Promise<Uint8Array>;
 }
 
 interface TelegramHtmlOutboundBlock {
@@ -181,6 +204,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+function positiveSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
 function numericTelegramId(value: unknown): string | null {
   if (typeof value === 'number') {
     if (!Number.isSafeInteger(value) || value <= 0) {
@@ -199,6 +230,143 @@ function rawNumericTelegramId(value: unknown): string | null {
     return null;
   }
   return String(value);
+}
+
+function captionText(message: Record<string, unknown>): string | undefined {
+  const caption = nonEmptyString(message.caption);
+  return caption ?? undefined;
+}
+
+function sanitizeTelegramFilename(value: unknown, fallback: string): string {
+  const raw = nonEmptyString(value) ?? fallback;
+  const basename = raw.split(/[\\/]/).filter(Boolean).pop() ?? fallback;
+  const sanitized = basename
+    .replace(/\.\./g, '_')
+    .replace(/[/\\:*?"<>|]/g, '_')
+    .replace(/\.+$/g, '')
+    .trim()
+    .slice(0, 200);
+  return sanitized || fallback;
+}
+
+function inferTelegramDocumentMime(value: unknown): string {
+  return nonEmptyString(value)?.split(';')[0].trim().toLowerCase() || 'application/octet-stream';
+}
+
+function makeAttachmentRejection(
+  reason: InboundAttachmentRejection['reason'],
+  message: string,
+  attachmentKind?: string
+): InboundAttachmentRejection {
+  return {
+    reason,
+    message,
+    ...(attachmentKind ? { attachmentKind } : {}),
+  };
+}
+
+function pickTelegramPhotoAttachment(
+  message: Record<string, unknown>,
+  messageId: string | undefined
+): InboundAttachment | InboundAttachmentRejection | null {
+  if (!Array.isArray(message.photo)) return null;
+  const candidates = message.photo
+    .filter(isRecord)
+    .map((photo) => {
+      const fileId = nonEmptyString(photo.file_id);
+      if (!fileId) return null;
+      const width = positiveSafeInteger(photo.width);
+      const height = positiveSafeInteger(photo.height);
+      const fileSize = positiveSafeInteger(photo.file_size);
+      const score = (width ?? 0) * (height ?? 0);
+      return { fileId, width, height, fileSize, score };
+    })
+    .filter((photo): photo is NonNullable<typeof photo> => photo !== null)
+    .sort((a, b) => b.score - a.score || (b.fileSize ?? 0) - (a.fileSize ?? 0));
+
+  const selected = candidates[0];
+  if (!selected) {
+    return makeAttachmentRejection(
+      'missing_file_id',
+      'Telegram photo did not include a file id.',
+      'photo'
+    );
+  }
+
+  const filename = sanitizeTelegramFilename(
+    undefined,
+    `telegram-photo-${messageId ?? selected.fileId}.jpg`
+  );
+  return {
+    id: selected.fileId,
+    kind: 'image',
+    filename,
+    mimeType: TELEGRAM_ATTACHMENT_PHOTO_MIME,
+    ...(selected.fileSize ? { sizeBytes: selected.fileSize } : {}),
+    ...(captionText(message) ? { caption: captionText(message) } : {}),
+    metadata: {
+      [TELEGRAM_ATTACHMENT_FILE_REF_KEY]: selected.fileId,
+      telegram_attachment_type: 'photo',
+      ...(selected.width ? { telegram_photo_width: selected.width } : {}),
+      ...(selected.height ? { telegram_photo_height: selected.height } : {}),
+    },
+  };
+}
+
+function pickTelegramDocumentAttachment(
+  message: Record<string, unknown>
+): InboundAttachment | InboundAttachmentRejection | null {
+  if (!isRecord(message.document)) return null;
+  const fileId = nonEmptyString(message.document.file_id);
+  if (!fileId) {
+    return makeAttachmentRejection(
+      'missing_file_id',
+      'Telegram document did not include a file id.',
+      'document'
+    );
+  }
+  const mimeType = inferTelegramDocumentMime(message.document.mime_type);
+  const filename = sanitizeTelegramFilename(
+    message.document.file_name,
+    `telegram-document-${fileId}`
+  );
+  const fileSize = positiveSafeInteger(message.document.file_size);
+  return {
+    id: fileId,
+    kind: 'file',
+    filename,
+    mimeType,
+    ...(fileSize ? { sizeBytes: fileSize } : {}),
+    ...(captionText(message) ? { caption: captionText(message) } : {}),
+    metadata: {
+      [TELEGRAM_ATTACHMENT_FILE_REF_KEY]: fileId,
+      telegram_attachment_type: 'document',
+    },
+  };
+}
+
+function pickTelegramAttachment(
+  message: Record<string, unknown>,
+  messageId: string | undefined
+): { attachments?: InboundAttachment[]; rejection?: InboundAttachmentRejection } {
+  const unsupportedMediaKind = ['audio', 'video', 'voice', 'video_note'].find(
+    (field) => field in message
+  );
+  if (unsupportedMediaKind) {
+    return {
+      rejection: makeAttachmentRejection(
+        'unsupported_type',
+        'Telegram audio/video/voice attachments are not accepted yet by the existing Agor upload allowlist.',
+        unsupportedMediaKind
+      ),
+    };
+  }
+
+  const attachment =
+    pickTelegramDocumentAttachment(message) ?? pickTelegramPhotoAttachment(message, messageId);
+  if (!attachment) return {};
+  if ('reason' in attachment) return { rejection: attachment };
+  return { attachments: [attachment] };
 }
 
 export function normalizeTelegramExternalSubject(value: unknown): string | null {
@@ -325,7 +493,8 @@ function sanitizeTelegramError(
   sensitiveTexts: ReadonlyArray<string | undefined> = []
 ): string {
   const raw = error instanceof Error ? error.message : String(error);
-  let sanitized = raw.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[redacted-telegram-token]');
+  let sanitized = raw.replace(TELEGRAM_FILE_DOWNLOAD_URL_PATTERN, '[redacted-telegram-file-url]');
+  sanitized = sanitized.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[redacted-telegram-token]');
   sanitized = sanitized.replace(/\b\d{5,}:[A-Za-z0-9_-]{10,}\b/g, '[redacted-telegram-token]');
   if (botToken) {
     sanitized = sanitized.split(botToken).join('[redacted-telegram-token]');
@@ -336,6 +505,10 @@ function sanitizeTelegramError(
     }
   }
   return sanitized;
+}
+
+function buildTelegramFileDownloadUrl(botToken: string, filePath: string): string {
+  return `https://api.telegram.org/file/bot${botToken}/${filePath}`;
 }
 
 function htmlEscape(value: string): string {
@@ -554,9 +727,10 @@ function isTelegramRichFormatError(error: unknown): boolean {
 /**
  * Normalize one Telegram Bot API update into the gateway inbound message shape.
  *
- * MVP accepts only private, human, text-only DMs. Identity is the stable numeric
- * `message.from.id` only; usernames are preserved as display metadata but never
- * become the external subject.
+ * Accepts only private, human DMs. Text/caption plus safe file metadata are
+ * normalized; provider bytes must be fetched later through the connector
+ * download seam. Identity is the stable numeric `message.from.id` only;
+ * usernames are display metadata and never become the external subject.
  */
 export function normalizeTelegramInboundUpdate(
   update: unknown
@@ -581,13 +755,8 @@ export function normalizeTelegramInboundUpdate(
     return { ok: false, reason: 'bot_sender' };
   }
 
-  if (hasUnsupportedMessageContent(message) || typeof message.text !== 'string') {
+  if (hasUnsupportedMessageContent(message)) {
     return { ok: false, reason: 'unsupported_message_content' };
-  }
-
-  const text = message.text.trim();
-  if (!text) {
-    return { ok: false, reason: 'empty_text' };
   }
 
   const updateId = getUpdateId(update);
@@ -595,6 +764,11 @@ export function normalizeTelegramInboundUpdate(
     typeof message.message_id === 'number' && Number.isSafeInteger(message.message_id)
       ? String(message.message_id)
       : undefined;
+  const attachmentResult = pickTelegramAttachment(message, messageId);
+  const text = nonEmptyString(message.text) ?? captionText(message) ?? '';
+  if (!text && !attachmentResult.attachments?.length && !attachmentResult.rejection) {
+    return { ok: false, reason: 'empty_text' };
+  }
   const timestamp =
     typeof message.date === 'number' && Number.isFinite(message.date)
       ? new Date(message.date * 1000).toISOString()
@@ -604,9 +778,11 @@ export function normalizeTelegramInboundUpdate(
     ok: true,
     message: {
       threadId: `telegram:private:${fromId}`,
-      text,
+      text: text || TELEGRAM_ATTACHMENT_DEFAULT_TEXT,
       userId: fromId,
       timestamp,
+      ...(attachmentResult.attachments ? { attachments: attachmentResult.attachments } : {}),
+      ...(attachmentResult.rejection ? { attachmentRejection: attachmentResult.rejection } : {}),
       metadata: {
         telegram_chat_type: 'private',
         telegram_user_id: fromId,
@@ -714,6 +890,78 @@ class FetchTelegramUpdateClient implements TelegramUpdateClient {
     }
     return String(messageId);
   }
+
+  async getFile(req: TelegramGetFileRequest): Promise<TelegramFileInfo> {
+    const url = new URL(`https://api.telegram.org/bot${req.botToken}/getFile`);
+    url.searchParams.set('file_id', req.fileId);
+    const response = await fetch(url);
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
+    }
+    if (!response.ok) {
+      const description =
+        isRecord(body) && typeof body.description === 'string' ? `: ${body.description}` : '';
+      throw new Error(`Telegram getFile failed with HTTP ${response.status}${description}`);
+    }
+    if (!isRecord(body) || body.ok !== true || !isRecord(body.result)) {
+      throw new Error('Telegram getFile returned an unexpected response shape');
+    }
+    const filePath = body.result.file_path;
+    if (typeof filePath !== 'string' || !filePath.trim()) {
+      throw new Error('Telegram getFile response is missing file_path');
+    }
+    return {
+      fileId: req.fileId,
+      filePath,
+      ...(positiveSafeInteger(body.result.file_size)
+        ? { fileSize: positiveSafeInteger(body.result.file_size) }
+        : {}),
+    };
+  }
+
+  async downloadFile(req: TelegramDownloadFileRequest): Promise<Uint8Array> {
+    const response = await fetch(buildTelegramFileDownloadUrl(req.botToken, req.filePath));
+    const contentLength = Number.parseInt(response.headers.get('content-length') ?? '', 10);
+    if (Number.isFinite(contentLength) && contentLength > req.maxBytes) {
+      throw new Error('Telegram file exceeds configured attachment size limit');
+    }
+    if (!response.ok) {
+      throw new Error(`Telegram file download failed with HTTP ${response.status}`);
+    }
+    if (response.body) {
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > req.maxBytes) {
+            throw new Error('Telegram file exceeds configured attachment size limit');
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return bytes;
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > req.maxBytes) {
+      throw new Error('Telegram file exceeds configured attachment size limit');
+    }
+    return bytes;
+  }
 }
 
 export class TelegramConnector implements GatewayConnector {
@@ -806,6 +1054,70 @@ export class TelegramConnector implements GatewayConnector {
     }
 
     return firstMessageId ?? '';
+  }
+
+  async downloadAttachment(req: { attachment: InboundAttachment; maxBytes: number }): Promise<{
+    bytes: Uint8Array;
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+  }> {
+    if (this.config.transport_disabled === true) {
+      throw new Error('Telegram transport is disabled');
+    }
+    if (!isValidBotToken(this.config.bot_token)) {
+      throw new Error('Telegram connector requires bot_token to download attachments');
+    }
+    if (!this.client.getFile || !this.client.downloadFile) {
+      throw new Error('Telegram connector client does not support attachment downloads');
+    }
+    if (typeof req.attachment.sizeBytes === 'number' && req.attachment.sizeBytes > req.maxBytes) {
+      throw new Error('Telegram attachment exceeds configured size limit');
+    }
+
+    const fileId = nonEmptyString(req.attachment.metadata?.[TELEGRAM_ATTACHMENT_FILE_REF_KEY]);
+    if (!fileId) {
+      throw new Error('Telegram attachment is missing a file id');
+    }
+
+    let fileInfo: TelegramFileInfo | undefined;
+    try {
+      fileInfo = await this.client.getFile({
+        botToken: this.config.bot_token,
+        fileId,
+      });
+      if (typeof fileInfo.fileSize === 'number' && fileInfo.fileSize > req.maxBytes) {
+        throw new Error('Telegram attachment exceeds configured size limit');
+      }
+      const bytes = await this.client.downloadFile({
+        botToken: this.config.bot_token,
+        filePath: fileInfo.filePath,
+        maxBytes: req.maxBytes,
+      });
+      if (bytes.byteLength > req.maxBytes) {
+        throw new Error('Telegram attachment exceeds configured size limit');
+      }
+      return {
+        bytes,
+        filename: sanitizeTelegramFilename(req.attachment.filename, `telegram-file-${fileId}`),
+        mimeType: req.attachment.mimeType,
+        sizeBytes: bytes.byteLength,
+      };
+    } catch (error) {
+      throw new Error(
+        `Telegram attachment download failed: ${sanitizeTelegramError(
+          error,
+          this.config.bot_token,
+          [
+            fileId,
+            fileInfo?.filePath,
+            fileInfo?.filePath
+              ? buildTelegramFileDownloadUrl(this.config.bot_token, fileInfo.filePath)
+              : undefined,
+          ]
+        )}`
+      );
+    }
   }
 
   formatMessage(markdown: string): OutboundPayload {

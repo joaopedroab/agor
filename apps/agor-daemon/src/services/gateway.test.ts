@@ -1,3 +1,6 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import type { TenantScopeAwareDatabase } from '@agor/core/db';
 import { attachHiddenTenant, getCurrentTenantId, runWithTenantDatabaseScope } from '@agor/core/db';
 import type { GatewayChannel, ThreadSessionMap, User } from '@agor/core/types';
@@ -159,6 +162,17 @@ function makeGatewayHarness(args: {
   (service as unknown as { hasActiveChannels: boolean }).hasActiveChannels = true;
 
   return { service, promptCreate, sessionsCreate, channelRepo, threadMapRepo };
+}
+
+async function withTemporaryAgorHome<T>(work: (homeDir: string) => Promise<T>): Promise<T> {
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agor-gateway-test-home-'));
+  const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homeDir);
+  try {
+    return await work(homeDir);
+  } finally {
+    homedirSpy.mockRestore();
+    await fs.rm(homeDir, { recursive: true, force: true });
+  }
 }
 
 describe('gateway tenant metadata helpers', () => {
@@ -903,6 +917,192 @@ describe('GatewayService Telegram alignment', () => {
 
     expect(result).toEqual({ success: false, sessionId: '', created: false });
     expect(sessionsCreate).not.toHaveBeenCalled();
+  });
+
+  it('stores Telegram document attachments and prompts the linked session with Agor-owned file paths', async () => {
+    await withTemporaryAgorHome(async (homeDir) => {
+      const downloadAttachment = vi.fn(async () => ({
+        bytes: new Uint8Array([37, 80, 68, 70]),
+        filename: '../Unsafe:Report.pdf',
+        mimeType: 'application/pdf',
+        sizeBytes: 4,
+      }));
+      const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+        channel: telegramChannel,
+        externalIdentityUser: telegramUser,
+        connector: { downloadAttachment, sendMessage: vi.fn() },
+      });
+
+      const result = await service.create({
+        channel_key: 'telegram-key',
+        thread_id: 'telegram:private:123456789',
+        text: 'please review the attachment',
+        attachments: [
+          {
+            id: 'telegram-file-id',
+            kind: 'file',
+            filename: '../Unsafe:Report.pdf',
+            mimeType: 'application/pdf',
+            sizeBytes: 4,
+            caption: 'please review the attachment',
+            metadata: { telegram_file_id: 'telegram-file-id' },
+          },
+        ],
+        metadata: {
+          telegram_user_id: '123456789',
+          telegram_external_subject: '123456789',
+        },
+      });
+
+      expect(result).toMatchObject({ success: true, sessionId: 'sess-new', created: true });
+      expect(downloadAttachment).toHaveBeenCalledWith({
+        maxBytes: 50 * 1024 * 1024,
+        attachment: expect.objectContaining({
+          id: 'telegram-file-id',
+        }),
+      });
+      expect(sessionsCreate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          custom_context: {
+            gateway_source: expect.objectContaining({
+              attachment_count: 1,
+              attachment_mime_types: ['application/pdf'],
+            }),
+          },
+        })
+      );
+      const uploadDir = path.join(homeDir, '.agor', 'uploads');
+      await expect(fs.readdir(uploadDir)).resolves.toHaveLength(1);
+      const prompt = promptCreate.mock.calls[0][0].prompt as string;
+      expect(prompt).toContain('Attached files:');
+      expect(prompt).toContain(uploadDir);
+      expect(prompt).toContain('application/pdf');
+      expect(prompt).toContain('Unsafe_Report');
+      expect(prompt).toContain('external gateway');
+      expect(prompt).toContain('Attachment captions (untrusted):');
+      expect(prompt).not.toContain('telegram-file-id');
+      expect(prompt).not.toContain('telegram-token');
+    });
+  });
+
+  it('rejects unsupported Telegram attachment types for linked users without creating sessions', async () => {
+    const sendMessage = vi.fn(async () => 'unsupported-message-1');
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'Telegram attachment received.',
+      attachmentRejection: {
+        reason: 'unsupported_type',
+        message: 'voice is not supported',
+        attachmentKind: 'voice',
+      },
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('not supported yet'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('rejects Telegram attachment downloads that fail without leaking tokens or file ids', async () => {
+    const sendMessage = vi.fn(async () => 'failure-message-1');
+    const downloadAttachment = vi.fn(async () => {
+      throw new Error('provider URL bot123456:telegram-token secret-file-id');
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage, downloadAttachment },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'file attached',
+      attachments: [
+        {
+          id: 'secret-file-id',
+          kind: 'file',
+          filename: 'secret.pdf',
+          mimeType: 'application/pdf',
+          sizeBytes: 4,
+          metadata: { telegram_file_id: 'secret-file-id' },
+        },
+      ],
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('could not safely attach'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+    const warnText = warnSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(warnText).toContain('[redacted-telegram-token]');
+    expect(warnText).not.toContain('bot123456:telegram-token');
+    expect(warnText).not.toContain('secret-file-id');
+    warnSpy.mockRestore();
+  });
+
+  it('rejects oversized Telegram attachments before download and without creating sessions', async () => {
+    const sendMessage = vi.fn(async () => 'oversized-message-1');
+    const downloadAttachment = vi.fn();
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage, downloadAttachment },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'big file',
+      attachments: [
+        {
+          id: 'big-file-id',
+          kind: 'file',
+          filename: 'big.pdf',
+          mimeType: 'application/pdf',
+          sizeBytes: 51 * 1024 * 1024,
+          metadata: { telegram_file_id: 'big-file-id' },
+        },
+      ],
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(downloadAttachment).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('too large'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
   });
 
   it('routes mapped Telegram sessions through connector sendMessage', async () => {

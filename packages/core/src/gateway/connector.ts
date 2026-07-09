@@ -8,6 +8,27 @@
 import type { ChannelType, SlackTestResult } from '../types/gateway';
 
 /**
+ * Provider-normalized file/media metadata carried with an inbound gateway
+ * message. The bytes are not embedded here; callers must use the connector's
+ * download seam so provider URLs/tokens never enter prompts or transcripts.
+ */
+export interface InboundAttachment {
+  id: string;
+  kind: 'file' | 'image';
+  filename: string;
+  mimeType: string;
+  sizeBytes?: number;
+  caption?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface InboundAttachmentRejection {
+  reason: 'unsupported_type' | 'oversized' | 'missing_file_id' | 'unsupported_mime_type';
+  message: string;
+  attachmentKind?: string;
+}
+
+/**
  * Inbound message from a messaging platform
  */
 export interface InboundMessage {
@@ -15,6 +36,8 @@ export interface InboundMessage {
   text: string;
   userId: string;
   timestamp: string;
+  attachments?: InboundAttachment[];
+  attachmentRejection?: InboundAttachmentRejection;
   metadata?: Record<string, unknown>;
 }
 
@@ -63,6 +86,19 @@ export interface GatewayConnector {
     blocks?: unknown[];
     metadata?: Record<string, unknown>;
   }): Promise<string>;
+
+  /**
+   * Download an inbound attachment through the provider SDK/API boundary.
+   *
+   * Implementations must enforce `maxBytes` before returning and must not expose
+   * provider-private URLs or tokens to the caller.
+   */
+  downloadAttachment?(req: { attachment: InboundAttachment; maxBytes: number }): Promise<{
+    bytes: Uint8Array;
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+  }>;
 
   /**
    * Delete a previously sent platform message when supported.

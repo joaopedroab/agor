@@ -204,17 +204,14 @@ describe('agor_gateway_channels MCP tools', () => {
     expect(payload.gateway_channel.config.bot_token).toBe('••••••••');
     expect(serialized).not.toContain('telegram-secret-token');
     expect(serialized).not.toContain('raw-channel-key');
-    expect(payload.next_steps).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining('explicit-link-only'),
-        expect.stringContaining('agor_users_telegram_link_token_create'),
-        expect.stringContaining('disabled/no-op unless'),
-        expect.stringContaining(
-          'supports local /link token verification plus rich markdown replies with safe plain-text fallback for mapped private DM sessions'
-        ),
-        expect.stringContaining('proactive emits'),
-      ])
+    expect(serialized).toContain('explicit-link-only');
+    expect(serialized).toContain('agor_users_telegram_link_token_create');
+    expect(serialized).toContain('disabled/no-op unless');
+    expect(serialized).toContain(
+      'supports local /link token verification, rich markdown replies with safe plain-text fallback, and inbound document/photo attachments'
     );
+    expect(serialized).toMatch(/proactive emits/i);
+    expect(serialized).toContain('50 MB per-file limit');
   });
 
   it('creates through gateway-channels service and redacts returned secrets', async () => {

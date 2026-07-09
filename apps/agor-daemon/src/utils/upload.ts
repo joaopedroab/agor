@@ -60,6 +60,72 @@ export function getUploadDirectory(): string {
   return path.join(getAgorHome(), 'uploads');
 }
 
+export function normalizeUploadMimeType(mimeType: string): string {
+  return (mimeType || '').split(';')[0].trim().toLowerCase();
+}
+
+export function sanitizeUploadFilename(originalName: string, timestamp = Date.now()): string {
+  const basename = path.basename(originalName || 'upload');
+  const sanitized = basename
+    .replace(/\.\./g, '_')
+    .replace(/[/\\:*?"<>|]/g, '_')
+    .replace(/\.+$/g, '')
+    .substring(0, 200);
+  const safeName = sanitized || 'upload';
+  const ext = path.extname(safeName);
+  const nameWithoutExt = safeName.slice(0, -ext.length || undefined);
+  return `${nameWithoutExt}_${timestamp}${ext}`;
+}
+
+export async function writeUploadedBuffer(args: {
+  bytes: Uint8Array;
+  filename: string;
+  mimeType: string;
+  now?: () => number;
+}): Promise<{ filename: string; path: string; size: number; mimeType: string }> {
+  const mime = normalizeUploadMimeType(args.mimeType);
+  if (!ALLOWED_UPLOAD_MIME_TYPES.has(mime)) {
+    const err = new Error(`Unsupported file type: ${mime || 'unknown'}`) as Error & {
+      status?: number;
+      code?: string;
+    };
+    err.status = 415;
+    err.code = 'UNSUPPORTED_MEDIA_TYPE';
+    throw err;
+  }
+  if (args.bytes.byteLength > MAX_UPLOAD_FILE_SIZE) {
+    const err = new Error(`File is larger than ${MAX_UPLOAD_FILE_SIZE} bytes`) as Error & {
+      status?: number;
+      code?: string;
+    };
+    err.status = 413;
+    err.code = 'PAYLOAD_TOO_LARGE';
+    throw err;
+  }
+
+  const dest = getUploadDirectory();
+  await fs.mkdir(dest, { recursive: true });
+  const baseTimestamp = args.now?.() ?? Date.now();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const filename = sanitizeUploadFilename(args.filename, baseTimestamp + attempt);
+    const fullPath = path.join(dest, filename);
+    try {
+      await fs.writeFile(fullPath, args.bytes, { flag: 'wx' });
+      return {
+        filename,
+        path: fullPath,
+        size: args.bytes.byteLength,
+        mimeType: mime,
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt === 4) {
+        throw error;
+      }
+    }
+  }
+  throw new Error('Failed to allocate upload filename');
+}
+
 export function validateUploadDestinationQuery(destination: unknown): void {
   if (destination == null || destination === '') return;
   if (Array.isArray(destination)) {
@@ -115,22 +181,7 @@ export function createUploadStorage() {
     },
 
     filename: (_req, file, cb) => {
-      // Sanitize filename to prevent path traversal attacks while preserving readability
-      // 1. Extract basename to remove any path components
-      const basename = path.basename(file.originalname);
-
-      // 2. Remove only truly dangerous characters (preserve spaces, unicode, etc.)
-      const sanitized = basename
-        .replace(/\.\./g, '_') // Remove path traversal attempts
-        .replace(/[/\\:*?"<>|]/g, '_') // Remove filesystem-unsafe chars (Windows + Unix)
-        .replace(/\.+$/g, '') // Remove trailing dots (Windows issue)
-        .substring(0, 200); // Limit length (leave room for timestamp)
-
-      // 3. Add timestamp suffix to prevent overwrites (but keep it human-readable)
-      const timestamp = Date.now();
-      const ext = path.extname(sanitized);
-      const nameWithoutExt = sanitized.slice(0, -ext.length || undefined);
-      const uniqueFilename = `${nameWithoutExt}_${timestamp}${ext}`;
+      const uniqueFilename = sanitizeUploadFilename(file.originalname);
 
       if (DEBUG_UPLOAD) {
         console.log(
@@ -168,7 +219,7 @@ export function createUploadMiddleware() {
     },
     fileFilter: (_req, file, cb) => {
       // Match on the bare MIME (drop any `; charset=...` parameters).
-      const mime = (file.mimetype || '').split(';')[0].trim().toLowerCase();
+      const mime = normalizeUploadMimeType(file.mimetype || '');
       if (!ALLOWED_UPLOAD_MIME_TYPES.has(mime)) {
         if (DEBUG_UPLOAD) {
           console.warn(`🚫 [Upload Storage] Rejecting MIME ${mime} for ${file.originalname}`);
