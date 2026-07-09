@@ -795,6 +795,36 @@ describe('GatewayService Telegram alignment', () => {
     expect(channelRepo.updateLastMessage).toHaveBeenCalledWith('chan-telegram');
   });
 
+  it('passes Telegram connector-formatted rich payloads through the normal routeMessage path', async () => {
+    const sendMessage = vi.fn(async () => 'telegram-message-42');
+    const formatMessage = vi.fn(() => ({
+      text: '**assistant response**',
+      blocks: [{ type: 'telegram_html', parse_mode: 'HTML', text: '<b>assistant response</b>' }],
+    }));
+    const { service } = makeGatewayHarness({
+      channel: telegramChannel,
+      existingMapping: makeMapping({
+        channel_id: telegramChannel.id,
+        thread_id: 'telegram:private:123456789',
+      }),
+      connector: { sendMessage, formatMessage },
+    });
+
+    const result = await service.routeMessage({
+      session_id: 'sess-1',
+      message: '**assistant response**',
+    });
+
+    expect(result).toEqual({ routed: true, channelType: 'telegram' });
+    expect(formatMessage).toHaveBeenCalledWith('**assistant response**');
+    expect(sendMessage).toHaveBeenCalledWith({
+      threadId: 'telegram:private:123456789',
+      text: '**assistant response**',
+      blocks: [{ type: 'telegram_html', parse_mode: 'HTML', text: '<b>assistant response</b>' }],
+      metadata: undefined,
+    });
+  });
+
   it('does not route Telegram outbound for unmapped sessions', async () => {
     const sendMessage = vi.fn(async () => 'should-not-send');
     const { service, channelRepo, threadMapRepo } = makeGatewayHarness({

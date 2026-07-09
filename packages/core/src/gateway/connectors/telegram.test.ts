@@ -3,6 +3,7 @@ import { getConnector, hasConnector } from '../connector-registry';
 import {
   decideTelegramInboundAuth,
   handleTelegramUpdate,
+  markdownToTelegramHtml,
   normalizeTelegramInboundUpdate,
   parseTelegramCommandIntent,
   parseTelegramPrivateThreadId,
@@ -410,6 +411,115 @@ describe('TelegramConnector outbound private DM replies', () => {
       chatId: '123456789',
       text: 'plain response',
     });
+  });
+
+  it('formats rich markdown as Telegram HTML with escaped untrusted text', async () => {
+    const input = [
+      '**Bold** and _italic_ with [docs](https://agor.live)',
+      'Inline `a < b && c`',
+      '- list-like item <safe>',
+      '',
+      '```ts',
+      'const tag = "<script>";',
+      '```',
+    ].join('\n');
+
+    const html = markdownToTelegramHtml(input);
+
+    expect(html).toContain('<b>Bold</b>');
+    expect(html).toContain('<i>italic</i>');
+    expect(html).toContain('<a href="https://agor.live">docs</a>');
+    expect(html).toContain('<code>a &lt; b &amp;&amp; c</code>');
+    expect(html).toContain('- list-like item &lt;safe&gt;');
+    expect(html).toContain(
+      '<pre><code class="language-ts">const tag = &quot;&lt;script&gt;&quot;;</code></pre>'
+    );
+    expect(html).not.toContain('<script>');
+  });
+
+  it('sends formatted Telegram HTML with parse mode for connector-formatted messages', async () => {
+    const sendMessage = vi.fn(async () => '42');
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN' },
+      { client: { getUpdates: vi.fn(async () => []), sendMessage } }
+    );
+    const payload = connector.formatMessage('**Bold** [link](https://agor.live) `code`');
+
+    await expect(
+      connector.sendMessage({
+        threadId: 'telegram:private:123456789',
+        text: payload.text,
+        blocks: payload.blocks,
+      })
+    ).resolves.toBe('42');
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      botToken: '123456:SAFE_TOKEN',
+      chatId: '123456789',
+      text: '<b>Bold</b> <a href="https://agor.live">link</a> <code>code</code>',
+      parseMode: 'HTML',
+    });
+  });
+
+  it('retries once as plain text when Telegram rejects rich formatting', async () => {
+    const sendMessage = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Bad Request: can't parse entities"))
+      .mockResolvedValueOnce('fallback-42');
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN' },
+      { client: { getUpdates: vi.fn(async () => []), sendMessage } }
+    );
+    const payload = connector.formatMessage('**Bold** unsafe');
+
+    await expect(
+      connector.sendMessage({
+        threadId: 'telegram:private:123456789',
+        text: payload.text,
+        blocks: payload.blocks,
+      })
+    ).resolves.toBe('fallback-42');
+
+    expect(sendMessage).toHaveBeenNthCalledWith(1, {
+      botToken: '123456:SAFE_TOKEN',
+      chatId: '123456789',
+      text: '<b>Bold</b> unsafe',
+      parseMode: 'HTML',
+    });
+    expect(sendMessage).toHaveBeenNthCalledWith(2, {
+      botToken: '123456:SAFE_TOKEN',
+      chatId: '123456789',
+      text: '**Bold** unsafe',
+    });
+  });
+
+  it('splits long Telegram replies into bounded chunks before sending', async () => {
+    const sendMessage = vi
+      .fn()
+      .mockResolvedValueOnce('first')
+      .mockResolvedValueOnce('second')
+      .mockResolvedValueOnce('third');
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN' },
+      { client: { getUpdates: vi.fn(async () => []), sendMessage } }
+    );
+    const longMarkdown = `${'&'.repeat(2_000)}\n${'x'.repeat(4_200)}`;
+    const payload = connector.formatMessage(longMarkdown);
+
+    await expect(
+      connector.sendMessage({
+        threadId: 'telegram:private:123456789',
+        text: payload.text,
+        blocks: payload.blocks,
+      })
+    ).resolves.toBe('first');
+
+    expect(sendMessage.mock.calls.length).toBeGreaterThan(1);
+    for (const call of sendMessage.mock.calls) {
+      const req = call[0];
+      expect(req.chatId).toBe('123456789');
+      expect(req.text.length).toBeLessThanOrEqual(4096);
+    }
   });
 
   it('rejects invalid/non-private/non-numeric thread IDs before sending', async () => {

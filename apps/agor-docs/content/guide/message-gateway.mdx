@@ -66,7 +66,7 @@ When a message arrives from a platform (e.g., a Slack bot mention or a GitHub `@
 2. **Map thread to session.** If this is a new platform thread, create a fresh Agor session on the channel's target branch with the channel's agentic tool configuration. If this thread has been seen before for this gateway channel, route the mention to the existing session. Multiple Slack bots can participate in the same Slack thread; each bot gets its own mapping.
 3. **Send prompt.** The message text is sent to the session via Agor's standard prompt flow — task creation, executor spawn, the full pipeline.
 4. **Agent runs.** The coding agent (Claude Code, Codex, etc.) processes the prompt with full access to the branch, MCP servers, and any configured tools.
-5. **Route response back when supported.** When the agent produces a response, Agor's outbound routing hook can post it back into the same platform thread for outbound-capable connectors. Formatting is adapted per platform (Slack mrkdwn conversion, GitHub markdown pass-through). Telegram supports text-only request/reply outbound for mapped private DM sessions; proactive sends, groups/channels, attachments, rich markdown formatting, and self-service `/link` remain later work.
+5. **Route response back when supported.** When the agent produces a response, Agor's outbound routing hook can post it back into the same platform thread for outbound-capable connectors. Formatting is adapted per platform (Slack mrkdwn conversion, GitHub markdown pass-through). Telegram supports request/reply outbound for mapped private DM sessions with Telegram-safe rich markdown formatting and plain-text fallback; proactive sends, groups/channels, attachments, and self-service `/link` remain later work.
 6. **Repeat.** Slack follow-ups require another explicit mention. When mentioned again, Agor fetches intervening Slack thread replies and includes them as catch-up context before prompting the agent.
 
 ```
@@ -321,7 +321,7 @@ Current capabilities and limits:
 - **Explicit numeric user link only.** A Telegram sender must already be linked to an Agor user by the stable numeric Telegram `user.id`. For admin/test setup, create this local link before enabling polling; otherwise inbound DMs are rejected instead of creating sessions. Telegram usernames, first names, and last names are display metadata only and are never trusted for identity.
 - **No owner fallback.** If a Telegram sender is missing, unlinked, or ambiguously linked to more than one Agor user, the gateway rejects the message instead of running it as the channel owner.
 - **No self-service setup flow yet.** There is no Telegram setup wizard, webhook handler, or provider-side setup automation in this MVP. `/link` commands are reserved for future explicit-link flows and do not create sessions or mutate links today.
-- **Inbound only.** Telegram DMs can create or continue Agor sessions, but Agor does not send outbound or proactive Telegram replies. Agent progress and responses remain visible in Agor.
+- **Mapped DM replies with safe formatting.** Telegram DMs can create or continue Agor sessions, and agent replies to those mapped private-DM sessions are sent back with Telegram-safe rich markdown basics (bold, italic, links, inline code, fenced code, and list-like text). If Telegram rejects a rich payload, Agor retries once as plain text. Proactive sends, attachments, groups/channels, and self-service `/link` remain later work.
 - **Normal Agor authority model.** Gateway-created sessions still use the channel's target branch, permission configuration, sandboxing, MCP attachments, and approval gates. Plain Telegram replies such as “yes” are not approvals for destructive tool calls or provider mutations.
 
 ## Agentic Tool Configuration
@@ -344,7 +344,7 @@ The gateway is built as a set of loosely coupled components:
 - **Gateway Service** (`/gateway`) — Orchestrates inbound routing (platform to session) and outbound routing (session to platform). Custom FeathersJS service.
 - **Gateway Channels** (`/gateway-channels`) — CRUD for channel configurations with encrypted credential storage.
 - **Thread-Session Map** (`/thread-session-map`) — Persists the mapping between platform thread IDs and Agor session IDs.
-- **Connector Layer** — Platform-agnostic `GatewayConnector` interface with a registry pattern. Currently: `SlackConnector` (Socket Mode), `GitHubConnector` (API polling), `TeamsConnector` (Bot Framework webhook), and `TelegramConnector` (opt-in `getUpdates` polling for private text DMs plus text-only replies to mapped private DM sessions). Adding a new platform means implementing `sendMessage()` and optionally `startListening()`.
+- **Connector Layer** — Platform-agnostic `GatewayConnector` interface with a registry pattern. Currently: `SlackConnector` (Socket Mode), `GitHubConnector` (API polling), `TeamsConnector` (Bot Framework webhook), and `TelegramConnector` (opt-in `getUpdates` polling for private text DMs plus rich-markdown replies with plain-text fallback to mapped private DM sessions). Adding a new platform means implementing `sendMessage()` and optionally `startListening()`.
 - **Outbound Hook** — FeathersJS `after.create` hook on the messages service. Fire-and-forget; never blocks message creation.
 
 ### Adding a New Platform

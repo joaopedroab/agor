@@ -2,20 +2,23 @@
  * Telegram inbound normalization helpers.
  *
  * This file intentionally does not implement webhooks, attachment downloads,
- * groups, channels, Mini Apps, rich markdown, or provider mutation.
+ * groups, channels, Mini Apps, or provider mutation.
  * It is the adapter-edge boundary for converting one raw Telegram Bot API
  * update into Agor's provider-agnostic InboundMessage shape and, when explicitly
  * enabled, polling Telegram getUpdates without changing remote provider state.
  */
 
 import type { ChannelType } from '../../types/gateway';
-import type { GatewayConnector, InboundMessage } from '../connector';
+import type { GatewayConnector, InboundMessage, OutboundPayload } from '../connector';
 
 export const TELEGRAM_EXTERNAL_IDENTITY_PROVIDER = 'telegram';
 export const TELEGRAM_EXTERNAL_IDENTITY_ISSUER = 'telegram';
 
 const TELEGRAM_LINK_COMMAND = 'link';
 const TELEGRAM_LINK_TOKEN_PATTERN = /^[A-Za-z0-9_-]{8,256}$/;
+const TELEGRAM_HTML_PARSE_MODE = 'HTML';
+const TELEGRAM_MESSAGE_MAX_CHARS = 4096;
+const TELEGRAM_RICH_BLOCK_TYPE = 'telegram_html';
 
 const UNSUPPORTED_MESSAGE_FIELDS = [
   'audio',
@@ -151,11 +154,19 @@ export interface TelegramSendMessageRequest {
   botToken: string;
   chatId: string;
   text: string;
+  parseMode?: 'HTML';
 }
 
 export interface TelegramUpdateClient {
   getUpdates(req: TelegramGetUpdatesRequest): Promise<unknown[]>;
   sendMessage?(req: TelegramSendMessageRequest): Promise<string>;
+}
+
+interface TelegramHtmlOutboundBlock {
+  type: typeof TELEGRAM_RICH_BLOCK_TYPE;
+  parse_mode: typeof TELEGRAM_HTML_PARSE_MODE;
+  text: string;
+  source: string;
 }
 
 export interface TelegramConnectorOptions {
@@ -308,17 +319,236 @@ export function parseTelegramPrivateThreadId(threadId: string): string {
   return match[1];
 }
 
-function sanitizeTelegramError(error: unknown, botToken?: string, messageText?: string): string {
+function sanitizeTelegramError(
+  error: unknown,
+  botToken?: string,
+  sensitiveTexts: ReadonlyArray<string | undefined> = []
+): string {
   const raw = error instanceof Error ? error.message : String(error);
   let sanitized = raw.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[redacted-telegram-token]');
   sanitized = sanitized.replace(/\b\d{5,}:[A-Za-z0-9_-]{10,}\b/g, '[redacted-telegram-token]');
   if (botToken) {
     sanitized = sanitized.split(botToken).join('[redacted-telegram-token]');
   }
-  if (messageText) {
-    sanitized = sanitized.split(messageText).join('[redacted-message]');
+  for (const text of sensitiveTexts) {
+    if (text) {
+      sanitized = sanitized.split(text).join('[redacted-message]');
+    }
   }
   return sanitized;
+}
+
+function htmlEscape(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function isSafeTelegramLink(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function findClosingMarkdownParen(value: string, start: number): number {
+  for (let i = start; i < value.length; i++) {
+    if (value[i] === '\\') {
+      i++;
+      continue;
+    }
+    if (value[i] === ')') return i;
+  }
+  return -1;
+}
+
+function parseTelegramInlineMarkdown(value: string): string {
+  let out = '';
+  let index = 0;
+
+  while (index < value.length) {
+    if (value[index] === '`') {
+      const end = value.indexOf('`', index + 1);
+      if (end > index + 1) {
+        out += `<code>${htmlEscape(value.slice(index + 1, end))}</code>`;
+        index = end + 1;
+        continue;
+      }
+    }
+
+    if (value.startsWith('[', index)) {
+      const labelEnd = value.indexOf(']', index + 1);
+      if (labelEnd > index + 1 && value[labelEnd + 1] === '(') {
+        const urlEnd = findClosingMarkdownParen(value, labelEnd + 2);
+        if (urlEnd > labelEnd + 2) {
+          const label = value.slice(index + 1, labelEnd);
+          const url = value.slice(labelEnd + 2, urlEnd).trim();
+          if (isSafeTelegramLink(url)) {
+            out += `<a href="${htmlEscape(url)}">${parseTelegramInlineMarkdown(label)}</a>`;
+            index = urlEnd + 1;
+            continue;
+          }
+        }
+      }
+    }
+
+    const twoCharMarker = value.slice(index, index + 2);
+    if (twoCharMarker === '**' || twoCharMarker === '__') {
+      const end = value.indexOf(twoCharMarker, index + 2);
+      if (end > index + 2) {
+        out += `<b>${parseTelegramInlineMarkdown(value.slice(index + 2, end))}</b>`;
+        index = end + 2;
+        continue;
+      }
+    }
+
+    const oneCharMarker = value[index];
+    if (oneCharMarker === '*' || oneCharMarker === '_') {
+      const end = value.indexOf(oneCharMarker, index + 1);
+      if (end > index + 1) {
+        out += `<i>${parseTelegramInlineMarkdown(value.slice(index + 1, end))}</i>`;
+        index = end + 1;
+        continue;
+      }
+    }
+
+    out += htmlEscape(value[index]);
+    index++;
+  }
+
+  return out;
+}
+
+function normalizeTelegramCodeLanguage(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed || !/^[A-Za-z0-9_+-]{1,32}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+export function markdownToTelegramHtml(markdown: string): string {
+  const lines = markdown.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const out: string[] = [];
+  let inFence = false;
+  let fenceLanguage: string | null = null;
+  let codeLines: string[] = [];
+
+  const flushCode = (): void => {
+    const code = htmlEscape(codeLines.join('\n'));
+    out.push(
+      fenceLanguage
+        ? `<pre><code class="language-${htmlEscape(fenceLanguage)}">${code}</code></pre>`
+        : `<pre>${code}</pre>`
+    );
+    codeLines = [];
+    fenceLanguage = null;
+  };
+
+  for (const line of lines) {
+    const fenceMatch = /^```\s*([A-Za-z0-9_+-]{0,32})\s*$/.exec(line);
+    if (fenceMatch) {
+      if (inFence) {
+        flushCode();
+        inFence = false;
+      } else {
+        inFence = true;
+        fenceLanguage = normalizeTelegramCodeLanguage(fenceMatch[1]);
+      }
+      continue;
+    }
+
+    if (inFence) {
+      codeLines.push(line);
+      continue;
+    }
+
+    out.push(parseTelegramInlineMarkdown(line));
+  }
+
+  if (inFence) {
+    flushCode();
+  }
+
+  return out.join('\n');
+}
+
+function telegramHtmlBlockFromMarkdown(markdown: string): TelegramHtmlOutboundBlock {
+  return {
+    type: TELEGRAM_RICH_BLOCK_TYPE,
+    parse_mode: TELEGRAM_HTML_PARSE_MODE,
+    text: markdownToTelegramHtml(markdown),
+    source: markdown,
+  };
+}
+
+function extractTelegramHtmlBlock(blocks?: unknown[]): TelegramHtmlOutboundBlock | null {
+  if (!blocks) return null;
+  const block = blocks.find((candidate) => {
+    if (!isRecord(candidate)) return false;
+    return (
+      candidate.type === TELEGRAM_RICH_BLOCK_TYPE &&
+      candidate.parse_mode === TELEGRAM_HTML_PARSE_MODE &&
+      typeof candidate.text === 'string' &&
+      typeof candidate.source === 'string'
+    );
+  });
+  return (block as TelegramHtmlOutboundBlock | undefined) ?? null;
+}
+
+function splitAtNaturalBoundary(value: string, maxChars: number): [string, string] {
+  if (value.length <= maxChars) return [value, ''];
+  const window = value.slice(0, maxChars + 1);
+  const newlineAt = window.lastIndexOf('\n');
+  const spaceAt = window.lastIndexOf(' ');
+  const splitAt = Math.max(newlineAt, spaceAt);
+  const index = splitAt > 0 ? splitAt + (window[splitAt] === '\n' ? 1 : 0) : maxChars;
+  return [value.slice(0, index), value.slice(index)];
+}
+
+function splitTelegramText(
+  value: string,
+  render: (chunk: string) => string = (chunk) => chunk
+): string[] {
+  if (value.length === 0) return [''];
+
+  const chunks: string[] = [];
+  const queue = [value];
+
+  while (queue.length > 0) {
+    const current = queue.shift() ?? '';
+    if (
+      current.length <= TELEGRAM_MESSAGE_MAX_CHARS &&
+      render(current).length <= TELEGRAM_MESSAGE_MAX_CHARS
+    ) {
+      chunks.push(current);
+      continue;
+    }
+
+    const [head, tail] = splitAtNaturalBoundary(
+      current,
+      Math.max(1, Math.min(TELEGRAM_MESSAGE_MAX_CHARS, Math.floor(current.length / 2)))
+    );
+    if (!head || head === current) {
+      chunks.push(current.slice(0, TELEGRAM_MESSAGE_MAX_CHARS));
+      const rest = current.slice(TELEGRAM_MESSAGE_MAX_CHARS);
+      if (rest) queue.unshift(rest);
+      continue;
+    }
+
+    queue.unshift(...(tail ? [head, tail] : [head]));
+  }
+
+  return chunks;
+}
+
+function isTelegramRichFormatError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:can't|cannot|could not)\s+parse|parse entities|unsupported start tag|can't find end tag|entity/i.test(
+    message
+  );
 }
 
 /**
@@ -459,14 +689,24 @@ class FetchTelegramUpdateClient implements TelegramUpdateClient {
       body: JSON.stringify({
         chat_id: req.chatId,
         text: req.text,
+        ...(req.parseMode ? { parse_mode: req.parseMode } : {}),
       }),
     });
-    if (!response.ok) {
-      throw new Error(`Telegram sendMessage failed with HTTP ${response.status}`);
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
     }
-    const body = await response.json();
+    if (!response.ok) {
+      const description =
+        isRecord(body) && typeof body.description === 'string' ? `: ${body.description}` : '';
+      throw new Error(`Telegram sendMessage failed with HTTP ${response.status}${description}`);
+    }
     if (!isRecord(body) || body.ok !== true || !isRecord(body.result)) {
-      throw new Error('Telegram sendMessage returned an unexpected response shape');
+      const description =
+        isRecord(body) && typeof body.description === 'string' ? `: ${body.description}` : '';
+      throw new Error(`Telegram sendMessage returned an unexpected response shape${description}`);
     }
     const messageId = body.result.message_id;
     if (typeof messageId !== 'number' && typeof messageId !== 'string') {
@@ -499,11 +739,13 @@ export class TelegramConnector implements GatewayConnector {
   }
 
   /**
-   * Send a text-only reply to a private Telegram DM thread.
+   * Send a reply to a private Telegram DM thread.
    *
-   * Rich markdown, attachments, groups/channels, and proactive emits are
-   * intentionally out of this connector slice. Structured blocks are ignored
-   * and `text` is sent without parse_mode so Telegram receives plain text.
+   * Rich markdown is carried as an opaque Telegram HTML block produced by
+   * {@link formatMessage}. If Telegram rejects that HTML/parse payload, the
+   * connector retries the same chunk once as plain text so formatting quirks
+   * never drop the response. Attachments, groups/channels, proactive emits,
+   * and provider setup remain out of scope.
    */
   async sendMessage(req: {
     threadId: string;
@@ -522,21 +764,55 @@ export class TelegramConnector implements GatewayConnector {
     }
 
     const chatId = parseTelegramPrivateThreadId(req.threadId);
-    try {
-      return await this.client.sendMessage({
-        botToken: this.config.bot_token,
-        chatId,
-        text: req.text,
-      });
-    } catch (error) {
-      throw new Error(
-        `Telegram sendMessage failed: ${sanitizeTelegramError(error, this.config.bot_token, req.text)}`
-      );
+    const richBlock = extractTelegramHtmlBlock(req.blocks);
+    const chunks = richBlock
+      ? splitTelegramText(richBlock.source, markdownToTelegramHtml)
+      : splitTelegramText(req.text);
+    let firstMessageId: string | undefined;
+
+    for (const chunk of chunks) {
+      const richText = richBlock ? markdownToTelegramHtml(chunk) : undefined;
+      const sensitiveTexts = [req.text, chunk, richText, richBlock?.text];
+
+      try {
+        const messageId = await this.client.sendMessage({
+          botToken: this.config.bot_token,
+          chatId,
+          text: richText ?? chunk,
+          ...(richText ? { parseMode: TELEGRAM_HTML_PARSE_MODE } : {}),
+        });
+        firstMessageId ??= messageId;
+      } catch (error) {
+        if (richText && isTelegramRichFormatError(error)) {
+          try {
+            const fallbackMessageId = await this.client.sendMessage({
+              botToken: this.config.bot_token,
+              chatId,
+              text: chunk,
+            });
+            firstMessageId ??= fallbackMessageId;
+            continue;
+          } catch (fallbackError) {
+            throw new Error(
+              `Telegram sendMessage failed: ${sanitizeTelegramError(fallbackError, this.config.bot_token, sensitiveTexts)}`
+            );
+          }
+        }
+
+        throw new Error(
+          `Telegram sendMessage failed: ${sanitizeTelegramError(error, this.config.bot_token, sensitiveTexts)}`
+        );
+      }
     }
+
+    return firstMessageId ?? '';
   }
 
-  formatMessage(markdown: string): string {
-    return markdown;
+  formatMessage(markdown: string): OutboundPayload {
+    return {
+      text: markdown,
+      blocks: [telegramHtmlBlockFromMarkdown(markdown)],
+    };
   }
 
   async startListening(callback: (msg: InboundMessage) => void): Promise<void> {
