@@ -1,4 +1,10 @@
-import { ROLES, type User } from '@agor/core/types';
+import { UsersRepository } from '@agor/core/db';
+import {
+  TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
+  TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
+  telegramExternalIdentityRef,
+} from '@agor/core/gateway';
+import { hasMinimumRole, ROLES, type User, type UserExternalIdentity } from '@agor/core/types';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { mcpOptionalString, mcpRequiredId, mcpRequiredString } from '../schema.js';
@@ -21,6 +27,64 @@ const USER_QUERY_LIMIT_MAX = 10000;
 type UserListField = (typeof USER_LIST_FIELDS)[number];
 type UserListRow = Pick<User, UserListField>;
 type UserFindField = 'email' | 'name' | 'unix_username';
+type ExternalIdentityArgs = {
+  provider?: string;
+  issuer?: string;
+  subject: string;
+};
+
+function requireAdmin(ctx: McpContext): void {
+  if (!hasMinimumRole(ctx.authenticatedUser?.role, ROLES.ADMIN)) {
+    throw new Error('Admin role required to manage external identity links.');
+  }
+}
+
+function normalizeExternalIdentityRef(args: ExternalIdentityArgs): {
+  provider: string;
+  issuer: string;
+  subject: string;
+} {
+  const provider = (args.provider ?? TELEGRAM_EXTERNAL_IDENTITY_PROVIDER).trim().toLowerCase();
+  if (!provider) throw new Error('provider cannot be blank.');
+
+  const issuer = (args.issuer ?? provider).trim().toLowerCase();
+  if (!issuer) throw new Error('issuer cannot be blank.');
+
+  const subject = args.subject.trim();
+  if (!subject) throw new Error('subject cannot be blank.');
+
+  if (provider === TELEGRAM_EXTERNAL_IDENTITY_PROVIDER) {
+    if (issuer !== TELEGRAM_EXTERNAL_IDENTITY_ISSUER) {
+      throw new Error('Telegram external identity links must use issuer "telegram".');
+    }
+    const telegramIdentityRef = telegramExternalIdentityRef(subject);
+    if (!telegramIdentityRef) {
+      throw new Error(
+        'Telegram external identity subject must be the stable numeric Telegram user.id in canonical positive decimal form. Usernames are metadata only and are not accepted as subjects.'
+      );
+    }
+    return telegramIdentityRef;
+  }
+
+  return { provider, issuer, subject };
+}
+
+function safeMetadataValue(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function safeExternalIdentity(identity: UserExternalIdentity) {
+  return {
+    provider: identity.provider,
+    issuer: identity.issuer,
+    subject: identity.subject,
+    ...(identity.email ? { email: identity.email } : {}),
+    ...(identity.name ? { name: identity.name } : {}),
+    last_login_at: identity.last_login_at,
+    key_prefix: `${identity.key.slice(0, 12)}…`,
+  };
+}
 
 function compactUser(user: User, fields?: UserListField[]): Partial<UserListRow> {
   const selectedFields = fields && fields.length > 0 ? fields : USER_LIST_FIELDS;
@@ -346,6 +410,142 @@ export function registerUserTools(server: McpServer, ctx: McpContext): void {
 
       const newUser = await ctx.app.service('users').create(createData, ctx.baseServiceParams);
       return textResult(newUser);
+    }
+  );
+
+  // Tool 8: agor_users_external_identities_list
+  server.registerTool(
+    'agor_users_external_identities_list',
+    {
+      description:
+        'Admin/test setup path: list explicit external identity links stored on one Agor user. Returns safe metadata with identity keys truncated. No provider calls happen, this is not a self-service /link flow, and Telegram usernames are metadata only.',
+      annotations: { readOnlyHint: true },
+      inputSchema: z.strictObject({
+        userId: mcpRequiredId('userId', 'User', 'User ID (UUIDv7 or short ID)'),
+        provider: mcpOptionalString(
+          'provider',
+          'Optional provider filter. Defaults to all providers. Telegram links use provider "telegram".'
+        ),
+        issuer: mcpOptionalString(
+          'issuer',
+          'Optional issuer filter. Telegram links use issuer "telegram".'
+        ),
+      }),
+    },
+    async (args) => {
+      requireAdmin(ctx);
+      const usersRepo = new UsersRepository(ctx.db);
+      const provider = safeMetadataValue(args.provider)?.toLowerCase();
+      const issuer = safeMetadataValue(args.issuer)?.toLowerCase();
+      const identities = (await usersRepo.listExternalIdentities(args.userId))
+        .filter((identity) => !provider || identity.provider === provider)
+        .filter((identity) => !issuer || identity.issuer === issuer)
+        .map(safeExternalIdentity);
+
+      return textResult({ user_id: args.userId, external_identities: identities });
+    }
+  );
+
+  // Tool 9: agor_users_external_identity_link
+  server.registerTool(
+    'agor_users_external_identity_link',
+    {
+      description:
+        'Admin/test setup path: link one stable external identity to an Agor user using local users.data.external_identities only. Defaults to Telegram and requires Telegram subject to be the numeric user.id; usernames are optional metadata only. No provider calls happen and this is not a self-service /link token flow.',
+      annotations: { idempotentHint: true },
+      inputSchema: z.strictObject({
+        userId: mcpRequiredId('userId', 'User', 'User ID (UUIDv7 or short ID)'),
+        provider: mcpOptionalString(
+          'provider',
+          'External identity provider. Defaults to "telegram" for Telegram gateway testing.'
+        ),
+        issuer: mcpOptionalString(
+          'issuer',
+          'Trusted issuer. Defaults to provider; Telegram links must use "telegram".'
+        ),
+        subject: mcpRequiredString(
+          'subject',
+          'Stable subject from the trusted issuer. For Telegram, this must be the canonical positive numeric Telegram user.id, not a username.'
+        ),
+        email: mcpOptionalString(
+          'email',
+          'Optional metadata only; not used for Telegram identity.'
+        ),
+        name: mcpOptionalString(
+          'name',
+          'Optional display metadata such as Telegram username; never used as the subject.'
+        ),
+        lastLoginAt: mcpOptionalString(
+          'lastLoginAt',
+          'Optional ISO timestamp metadata. Defaults to now when omitted.'
+        ),
+      }),
+    },
+    async (args) => {
+      requireAdmin(ctx);
+      const identityRef = normalizeExternalIdentityRef(args);
+      const usersRepo = new UsersRepository(ctx.db);
+      const updatedUser = await usersRepo.linkExternalIdentity(args.userId, {
+        ...identityRef,
+        ...(safeMetadataValue(args.email) ? { email: safeMetadataValue(args.email) } : {}),
+        ...(safeMetadataValue(args.name) ? { name: safeMetadataValue(args.name) } : {}),
+        ...(safeMetadataValue(args.lastLoginAt)
+          ? { last_login_at: safeMetadataValue(args.lastLoginAt) }
+          : {}),
+      });
+      const identity = (await usersRepo.listExternalIdentities(updatedUser.user_id)).find(
+        (candidate) =>
+          candidate.provider === identityRef.provider &&
+          candidate.issuer === identityRef.issuer &&
+          candidate.subject === identityRef.subject
+      );
+
+      return textResult({
+        status: 'linked',
+        user_id: updatedUser.user_id,
+        external_identity: identity ? safeExternalIdentity(identity) : identityRef,
+      });
+    }
+  );
+
+  // Tool 10: agor_users_external_identity_revoke
+  server.registerTool(
+    'agor_users_external_identity_revoke',
+    {
+      description:
+        'Admin/test setup path: revoke one local external identity link from an Agor user. This only removes users.data.external_identities; it does not call Telegram or any provider, revoke provider credentials, or implement self-service /link.',
+      annotations: { destructiveHint: true, idempotentHint: true },
+      inputSchema: z.strictObject({
+        userId: mcpRequiredId('userId', 'User', 'User ID (UUIDv7 or short ID)'),
+        provider: mcpOptionalString(
+          'provider',
+          'External identity provider. Defaults to "telegram" for Telegram gateway testing.'
+        ),
+        issuer: mcpOptionalString(
+          'issuer',
+          'Trusted issuer. Defaults to provider; Telegram links must use "telegram".'
+        ),
+        subject: mcpRequiredString(
+          'subject',
+          'Stable subject from the trusted issuer. For Telegram, this must be the canonical positive numeric Telegram user.id, not a username.'
+        ),
+      }),
+    },
+    async (args) => {
+      requireAdmin(ctx);
+      const identityRef = normalizeExternalIdentityRef(args);
+      const usersRepo = new UsersRepository(ctx.db);
+      const updatedUser = await usersRepo.unlinkExternalIdentity(args.userId, identityRef);
+      const remaining = (await usersRepo.listExternalIdentities(updatedUser.user_id)).map(
+        safeExternalIdentity
+      );
+
+      return textResult({
+        status: 'revoked',
+        user_id: updatedUser.user_id,
+        revoked_external_identity: identityRef,
+        remaining_external_identities: remaining,
+      });
     }
   );
 }

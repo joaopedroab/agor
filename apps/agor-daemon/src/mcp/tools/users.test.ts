@@ -1,11 +1,16 @@
+import { UsersRepository } from '@agor/core/db';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { registerUserTools } from './users.js';
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
   content: Array<{ type: string; text: string }>;
   isError?: boolean;
 }>;
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('user MCP tools in sessionless context', () => {
   it('agor_users_get_current works without current session context', async () => {
@@ -264,6 +269,234 @@ describe('user MCP tools in sessionless context', () => {
     expect(parsed.total).toBe(1);
     expect(parsed.limit).toBe(5);
     expect(parsed.data.map((user: { user_id: string }) => user.user_id)).toEqual(['user-2']);
+  });
+});
+
+describe('user external identity MCP tools', () => {
+  function registerExternalIdentityHandlers(role: 'admin' | 'member' = 'admin') {
+    const handlers = new Map<string, ToolHandler>();
+    const configs = new Map<
+      string,
+      { description?: string; inputSchema: { safeParse: (args: unknown) => unknown } }
+    >();
+    const fakeServer = {
+      registerTool: (
+        name: string,
+        cfg: { description?: string; inputSchema: { safeParse: (args: unknown) => unknown } },
+        cb: ToolHandler
+      ) => {
+        handlers.set(name, cb);
+        configs.set(name, cfg);
+      },
+    } as unknown as McpServer;
+
+    registerUserTools(fakeServer, {
+      app: { service: () => ({}) } as any,
+      db: {} as any,
+      userId: 'caller-1' as any,
+      sessionId: undefined,
+      authenticatedUser: { user_id: 'caller-1', email: 'caller@example.com', role } as any,
+      baseServiceParams: {},
+    });
+
+    return { handlers, configs };
+  }
+
+  it('lists external identity metadata without exposing the full lookup key', async () => {
+    const listSpy = vi
+      .spyOn(UsersRepository.prototype, 'listExternalIdentities')
+      .mockResolvedValue([
+        {
+          key: 'abcdefghijklmnopqrstuvwxyz1234567890',
+          provider: 'telegram',
+          issuer: 'telegram',
+          subject: '123456789',
+          name: 'telegram_username',
+          last_login_at: '2026-07-09T12:00:00.000Z',
+        },
+      ]);
+    const { handlers } = registerExternalIdentityHandlers('admin');
+    const handler = handlers.get('agor_users_external_identities_list');
+    if (!handler) throw new Error('agor_users_external_identities_list was not registered');
+
+    const parsed = JSON.parse((await handler({ userId: 'user-1' })).content[0].text);
+
+    expect(listSpy).toHaveBeenCalledWith('user-1');
+    expect(parsed.external_identities).toEqual([
+      {
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+        name: 'telegram_username',
+        last_login_at: '2026-07-09T12:00:00.000Z',
+        key_prefix: 'abcdefghijkl…',
+      },
+    ]);
+    expect(JSON.stringify(parsed)).not.toContain('abcdefghijklmnopqrstuvwxyz1234567890');
+  });
+
+  it('links Telegram numeric user.id through repository helpers with username as metadata only', async () => {
+    const linkSpy = vi.spyOn(UsersRepository.prototype, 'linkExternalIdentity').mockResolvedValue({
+      user_id: 'user-1',
+      email: 'target@example.com',
+      role: 'member',
+    } as any);
+    vi.spyOn(UsersRepository.prototype, 'listExternalIdentities').mockResolvedValue([
+      {
+        key: 'hashed-key-for-telegram-subject',
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+        name: '@telegram_username',
+        last_login_at: '2026-07-09T12:00:00.000Z',
+      },
+    ]);
+    const { handlers } = registerExternalIdentityHandlers('admin');
+    const handler = handlers.get('agor_users_external_identity_link');
+    if (!handler) throw new Error('agor_users_external_identity_link was not registered');
+
+    const parsed = JSON.parse(
+      (
+        await handler({
+          userId: 'user-1',
+          subject: ' 123456789 ',
+          name: ' @telegram_username ',
+          lastLoginAt: '2026-07-09T12:00:00.000Z',
+        })
+      ).content[0].text
+    );
+
+    expect(linkSpy).toHaveBeenCalledWith('user-1', {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+      name: '@telegram_username',
+      last_login_at: '2026-07-09T12:00:00.000Z',
+    });
+    expect(parsed).toMatchObject({
+      status: 'linked',
+      user_id: 'user-1',
+      external_identity: {
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+        name: '@telegram_username',
+      },
+    });
+  });
+
+  it('rejects non-canonical Telegram numeric subjects before repository writes', async () => {
+    const linkSpy = vi
+      .spyOn(UsersRepository.prototype, 'linkExternalIdentity')
+      .mockResolvedValue({} as any);
+    const { handlers } = registerExternalIdentityHandlers('admin');
+    const handler = handlers.get('agor_users_external_identity_link');
+    if (!handler) throw new Error('agor_users_external_identity_link was not registered');
+
+    await expect(handler({ userId: 'user-1', subject: '0' })).rejects.toThrow(
+      'Telegram external identity subject must be the stable numeric Telegram user.id'
+    );
+    await expect(handler({ userId: 'user-1', subject: '00123' })).rejects.toThrow(
+      'Telegram external identity subject must be the stable numeric Telegram user.id'
+    );
+    expect(linkSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects Telegram usernames or non-telegram issuers as subjects before repository writes', async () => {
+    const linkSpy = vi
+      .spyOn(UsersRepository.prototype, 'linkExternalIdentity')
+      .mockResolvedValue({} as any);
+    const { handlers } = registerExternalIdentityHandlers('admin');
+    const handler = handlers.get('agor_users_external_identity_link');
+    if (!handler) throw new Error('agor_users_external_identity_link was not registered');
+
+    await expect(handler({ userId: 'user-1', subject: '@telegram_username' })).rejects.toThrow(
+      'Telegram external identity subject must be the stable numeric Telegram user.id'
+    );
+    await expect(
+      handler({ userId: 'user-1', provider: 'telegram', issuer: 'botfather', subject: '123456789' })
+    ).rejects.toThrow('Telegram external identity links must use issuer "telegram".');
+    expect(linkSpy).not.toHaveBeenCalled();
+  });
+
+  it('requires admin role for list, link, and revoke operations', async () => {
+    const listSpy = vi
+      .spyOn(UsersRepository.prototype, 'listExternalIdentities')
+      .mockResolvedValue([]);
+    const linkSpy = vi
+      .spyOn(UsersRepository.prototype, 'linkExternalIdentity')
+      .mockResolvedValue({} as any);
+    const unlinkSpy = vi
+      .spyOn(UsersRepository.prototype, 'unlinkExternalIdentity')
+      .mockResolvedValue({} as any);
+    const { handlers } = registerExternalIdentityHandlers('member');
+
+    await expect(
+      handlers.get('agor_users_external_identities_list')?.({ userId: 'user-1' })
+    ).rejects.toThrow('Admin role required to manage external identity links.');
+    await expect(
+      handlers.get('agor_users_external_identity_link')?.({
+        userId: 'user-1',
+        subject: '123456789',
+      })
+    ).rejects.toThrow('Admin role required to manage external identity links.');
+    await expect(
+      handlers.get('agor_users_external_identity_revoke')?.({
+        userId: 'user-1',
+        subject: '123456789',
+      })
+    ).rejects.toThrow('Admin role required to manage external identity links.');
+    expect(listSpy).not.toHaveBeenCalled();
+    expect(linkSpy).not.toHaveBeenCalled();
+    expect(unlinkSpy).not.toHaveBeenCalled();
+  });
+
+  it('revokes Telegram links locally without provider calls', async () => {
+    const unlinkSpy = vi
+      .spyOn(UsersRepository.prototype, 'unlinkExternalIdentity')
+      .mockResolvedValue({
+        user_id: 'user-1',
+        email: 'target@example.com',
+        role: 'member',
+      } as any);
+    vi.spyOn(UsersRepository.prototype, 'listExternalIdentities').mockResolvedValue([]);
+    const { handlers } = registerExternalIdentityHandlers('admin');
+    const handler = handlers.get('agor_users_external_identity_revoke');
+    if (!handler) throw new Error('agor_users_external_identity_revoke was not registered');
+
+    const parsed = JSON.parse(
+      (await handler({ userId: 'user-1', subject: '123456789' })).content[0].text
+    );
+
+    expect(unlinkSpy).toHaveBeenCalledWith('user-1', {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    expect(parsed).toEqual({
+      status: 'revoked',
+      user_id: 'user-1',
+      revoked_external_identity: {
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+      },
+      remaining_external_identities: [],
+    });
+  });
+
+  it('describes external identity tools as admin/test setup without provider calls or self-service link flow', () => {
+    const { configs } = registerExternalIdentityHandlers('admin');
+
+    expect(configs.get('agor_users_external_identity_link')?.description).toContain(
+      'Admin/test setup path'
+    );
+    expect(configs.get('agor_users_external_identity_link')?.description).toContain(
+      'No provider calls happen'
+    );
+    expect(configs.get('agor_users_external_identity_link')?.description).toContain(
+      'not a self-service /link token flow'
+    );
   });
 });
 
