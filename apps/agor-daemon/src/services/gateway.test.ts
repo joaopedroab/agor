@@ -765,9 +765,9 @@ describe('GatewayService Telegram alignment', () => {
     expect(sessionsCreate).not.toHaveBeenCalled();
   });
 
-  it('does not perform Telegram outbound sends through routeMessage', async () => {
-    const sendMessage = vi.fn(async () => 'should-not-send');
-    const { service } = makeGatewayHarness({
+  it('routes mapped Telegram sessions through connector sendMessage', async () => {
+    const sendMessage = vi.fn(async () => 'telegram-message-42');
+    const { service, channelRepo, threadMapRepo } = makeGatewayHarness({
       channel: telegramChannel,
       existingMapping: makeMapping({
         channel_id: telegramChannel.id,
@@ -784,8 +784,117 @@ describe('GatewayService Telegram alignment', () => {
       message: 'assistant response',
     });
 
-    expect(result).toEqual({ routed: false, channelType: 'telegram' });
+    expect(result).toEqual({ routed: true, channelType: 'telegram' });
+    expect(sendMessage).toHaveBeenCalledWith({
+      threadId: 'telegram:private:123456789',
+      text: 'assistant response',
+      blocks: undefined,
+      metadata: undefined,
+    });
+    expect(threadMapRepo.updateLastMessage).toHaveBeenCalledWith('map-1');
+    expect(channelRepo.updateLastMessage).toHaveBeenCalledWith('chan-telegram');
+  });
+
+  it('does not route Telegram outbound for unmapped sessions', async () => {
+    const sendMessage = vi.fn(async () => 'should-not-send');
+    const { service, channelRepo, threadMapRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      existingMapping: null,
+      connector: { sendMessage },
+    });
+
+    const result = await service.routeMessage({
+      session_id: 'unmapped-session',
+      message: 'assistant response',
+    });
+
+    expect(result).toEqual({ routed: false });
     expect(sendMessage).not.toHaveBeenCalled();
+    expect(threadMapRepo.updateLastMessage).not.toHaveBeenCalled();
+    expect(channelRepo.updateLastMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not route Telegram outbound when the channel is disabled or transport-disabled', async () => {
+    const disabledSendMessage = vi.fn(async () => 'should-not-send');
+    const disabledChannel = {
+      ...telegramChannel,
+      enabled: false,
+    } as unknown as GatewayChannel;
+    const disabledHarness = makeGatewayHarness({
+      channel: disabledChannel,
+      existingMapping: makeMapping({
+        channel_id: disabledChannel.id,
+        thread_id: 'telegram:private:123456789',
+      }),
+      connector: { sendMessage: disabledSendMessage },
+    });
+
+    await expect(
+      disabledHarness.service.routeMessage({
+        session_id: 'sess-1',
+        message: 'assistant response',
+      })
+    ).resolves.toEqual({ routed: false });
+    expect(disabledSendMessage).not.toHaveBeenCalled();
+    expect(disabledHarness.threadMapRepo.updateLastMessage).not.toHaveBeenCalled();
+    expect(disabledHarness.channelRepo.updateLastMessage).not.toHaveBeenCalled();
+
+    const killSwitchSendMessage = vi.fn(async () => 'should-not-send');
+    const killSwitchChannel = {
+      ...telegramChannel,
+      config: { bot_token: 'telegram-token', transport_disabled: true },
+    } as unknown as GatewayChannel;
+    const killSwitchHarness = makeGatewayHarness({
+      channel: killSwitchChannel,
+      existingMapping: makeMapping({
+        channel_id: killSwitchChannel.id,
+        thread_id: 'telegram:private:123456789',
+      }),
+      connector: { sendMessage: killSwitchSendMessage },
+    });
+
+    await expect(
+      killSwitchHarness.service.routeMessage({
+        session_id: 'sess-1',
+        message: 'assistant response',
+      })
+    ).resolves.toEqual({ routed: false, channelType: 'telegram' });
+    expect(killSwitchSendMessage).not.toHaveBeenCalled();
+    expect(killSwitchHarness.threadMapRepo.updateLastMessage).not.toHaveBeenCalled();
+    expect(killSwitchHarness.channelRepo.updateLastMessage).not.toHaveBeenCalled();
+  });
+
+  it('fails closed and redacts Telegram tokens/message text when outbound routing fails', async () => {
+    const sendMessage = vi.fn(async () => {
+      throw new Error(
+        'Telegram API failed at https://api.telegram.org/bot123456:SECRET_TOKEN/sendMessage for assistant secret response'
+      );
+    });
+    const { service } = makeGatewayHarness({
+      channel: telegramChannel,
+      existingMapping: makeMapping({
+        channel_id: telegramChannel.id,
+        thread_id: 'telegram:private:123456789',
+      }),
+      connector: { sendMessage },
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      const result = await service.routeMessage({
+        session_id: 'sess-1',
+        message: 'assistant secret response',
+      });
+
+      expect(result).toEqual({ routed: false, channelType: 'telegram' });
+      const logged = consoleError.mock.calls.map((call) => call.join(' ')).join('\n');
+      expect(logged).toContain('[redacted-telegram-token]');
+      expect(logged).toContain('[redacted-message]');
+      expect(logged).not.toContain('123456:SECRET_TOKEN');
+      expect(logged).not.toContain('assistant secret response');
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('starts Telegram polling only for enabled channels with explicit polling and bot_token', async () => {
@@ -865,6 +974,87 @@ describe('GatewayService Slack system message routing', () => {
         blocks: expect.any(Array),
       })
     );
+  });
+});
+
+describe('GatewayService existing outbound connector behavior', () => {
+  it('keeps Slack immediate replies on the active thread path', async () => {
+    const sendMessage = vi.fn(async () => '104.000000');
+    const mapping = makeMapping();
+    const { service } = makeGatewayHarness({
+      existingMapping: mapping,
+      connector: { sendMessage },
+    });
+
+    const result = await service.routeMessage({
+      session_id: 'sess-1',
+      message: 'hello from agent',
+    });
+
+    expect(result).toEqual({ routed: true, channelType: 'slack' });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: 'C123-100.000000',
+        text: 'hello from agent',
+      })
+    );
+  });
+
+  it('keeps GitHub routeMessage buffered until the idle flush path', async () => {
+    const githubChannel = {
+      ...slackChannel,
+      id: 'chan-github',
+      channel_type: 'github',
+      config: {},
+    } as unknown as GatewayChannel;
+    const sendMessage = vi.fn(async () => 'should-not-send-yet');
+    const { service } = makeGatewayHarness({
+      channel: githubChannel,
+      existingMapping: makeMapping({
+        channel_id: githubChannel.id,
+        thread_id: 'owner/repo#123',
+      }),
+      connector: { sendMessage },
+    });
+
+    const result = await service.routeMessage({
+      session_id: 'sess-1',
+      message: 'final github response',
+    });
+
+    expect(result).toEqual({ routed: true, channelType: 'github' });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps Teams immediate replies through the active connector instance', async () => {
+    const teamsChannel = {
+      ...slackChannel,
+      id: 'chan-teams',
+      channel_type: 'teams',
+      config: { app_id: 'app-id', app_password: 'app-password' },
+    } as unknown as GatewayChannel;
+    const sendMessage = vi.fn(async () => 'teams-message-1');
+    const { service } = makeGatewayHarness({
+      channel: teamsChannel,
+      existingMapping: makeMapping({
+        channel_id: teamsChannel.id,
+        thread_id: 'conversation-id|activity-id',
+      }),
+      connector: { sendMessage },
+    });
+
+    const result = await service.routeMessage({
+      session_id: 'sess-1',
+      message: 'hello teams',
+    });
+
+    expect(result).toEqual({ routed: true, channelType: 'teams' });
+    expect(sendMessage).toHaveBeenCalledWith({
+      threadId: 'conversation-id|activity-id',
+      text: 'hello teams',
+      blocks: undefined,
+      metadata: undefined,
+    });
   });
 });
 

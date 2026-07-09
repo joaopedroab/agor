@@ -241,11 +241,17 @@ function parseSlackOutboundTarget(target: string): SlackOutboundTarget {
   );
 }
 
-function redactProviderErrorMessage(error: unknown): string {
+function redactProviderErrorMessage(error: unknown, messageText?: string): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message
+  let redacted = message
     .replace(/xox[baprs]-[A-Za-z0-9-]+/g, '[redacted-slack-token]')
-    .replace(/xapp-[A-Za-z0-9-]+/g, '[redacted-slack-token]');
+    .replace(/xapp-[A-Za-z0-9-]+/g, '[redacted-slack-token]')
+    .replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[redacted-telegram-token]')
+    .replace(/\b\d{5,}:[A-Za-z0-9_-]{10,}\b/g, '[redacted-telegram-token]');
+  if (messageText) {
+    redacted = redacted.split(messageText).join('[redacted-message]');
+  }
+  return redacted;
 }
 
 function previewText(text: string, maxChars = 500): string {
@@ -2393,9 +2399,11 @@ export class GatewayService {
       return { routed: false };
     }
 
-    if (channel.channel_type === 'telegram') {
-      console.log('[gateway] Telegram outbound routing is not implemented; skipping send');
-      return { routed: false, channelType: 'telegram' };
+    if ((channel.config as Record<string, unknown>)?.transport_disabled === true) {
+      console.log(
+        `[gateway] Outbound routing skipped for ${channel.channel_type}: transport disabled`
+      );
+      return { routed: false, channelType: channel.channel_type };
     }
 
     // Check if we have a connector for this channel type
@@ -2419,7 +2427,7 @@ export class GatewayService {
       return { routed: true, channelType: 'github' };
     }
 
-    // Non-GitHub channels (e.g. Slack, Teams): send immediately
+    // Non-GitHub channels (e.g. Slack, Teams, Telegram): send immediately
     try {
       // Prefer the active listener instance — webhook-based connectors (e.g. Teams)
       // store ConversationReferences in memory on the listener instance.
@@ -2453,7 +2461,9 @@ export class GatewayService {
 
       console.log(`[gateway] Routed message to ${channel.channel_type} thread ${threadId}`);
     } catch (error) {
-      console.error(`[gateway] Failed to route message to ${channel.channel_type}:`, error);
+      console.error(
+        `[gateway] Failed to route message to ${channel.channel_type}: ${redactProviderErrorMessage(error, data.message)}`
+      );
       return { routed: false, channelType: channel.channel_type };
     }
 

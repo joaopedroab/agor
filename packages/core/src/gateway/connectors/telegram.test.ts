@@ -5,6 +5,7 @@ import {
   handleTelegramUpdate,
   normalizeTelegramInboundUpdate,
   parseTelegramCommandIntent,
+  parseTelegramPrivateThreadId,
   TelegramConnector,
   telegramExternalIdentityRef,
 } from './telegram';
@@ -341,17 +342,6 @@ describe('TelegramConnector polling lifecycle', () => {
     expect(deleteWebhook).not.toHaveBeenCalled();
   });
 
-  it('fails closed if outbound send is reached directly', async () => {
-    const connector = new TelegramConnector({
-      bot_token: 'telegram-token',
-      enable_polling: true,
-    });
-
-    await expect(connector.sendMessage()).rejects.toThrow(
-      'Telegram outbound sending is not implemented'
-    );
-  });
-
   it('does not poll disabled, kill-switched, or tokenless connector configs', async () => {
     const getUpdates = vi.fn(async () => []);
 
@@ -376,5 +366,123 @@ describe('TelegramConnector polling lifecycle', () => {
       'Telegram connector requires bot_token to start polling'
     );
     expect(getUpdates).not.toHaveBeenCalled();
+  });
+});
+
+describe('TelegramConnector outbound private DM replies', () => {
+  it('parses only private Telegram DM thread IDs', () => {
+    expect(parseTelegramPrivateThreadId('telegram:private:123456789')).toBe('123456789');
+    expect(() => parseTelegramPrivateThreadId('telegram:group:123456789')).toThrow(
+      'Invalid Telegram private DM thread ID'
+    );
+    expect(() => parseTelegramPrivateThreadId('telegram:private:0')).toThrow(
+      'Invalid Telegram private DM thread ID'
+    );
+    expect(() => parseTelegramPrivateThreadId('telegram:private:00123')).toThrow(
+      'Invalid Telegram private DM thread ID'
+    );
+    expect(() => parseTelegramPrivateThreadId('telegram:private:not-numeric')).toThrow(
+      'Invalid Telegram private DM thread ID'
+    );
+  });
+
+  it('sends text-only replies to the parsed Telegram chat id', async () => {
+    const sendMessage = vi.fn(async () => '42');
+    const connector = new TelegramConnector(
+      {
+        bot_token: '123456:SAFE_TOKEN',
+        enable_polling: true,
+      },
+      {
+        client: { getUpdates: vi.fn(async () => []), sendMessage },
+      }
+    );
+
+    const result = await connector.sendMessage({
+      threadId: 'telegram:private:123456789',
+      text: 'plain response',
+      blocks: [{ ignored: true }],
+    });
+
+    expect(result).toBe('42');
+    expect(sendMessage).toHaveBeenCalledWith({
+      botToken: '123456:SAFE_TOKEN',
+      chatId: '123456789',
+      text: 'plain response',
+    });
+  });
+
+  it('rejects invalid/non-private/non-numeric thread IDs before sending', async () => {
+    const sendMessage = vi.fn(async () => '42');
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN' },
+      { client: { getUpdates: vi.fn(async () => []), sendMessage } }
+    );
+
+    await expect(
+      connector.sendMessage({ threadId: 'telegram:group:123456789', text: 'hello' })
+    ).rejects.toThrow('Invalid Telegram private DM thread ID');
+    await expect(
+      connector.sendMessage({ threadId: 'telegram:private:abc', text: 'hello' })
+    ).rejects.toThrow('Invalid Telegram private DM thread ID');
+    await expect(
+      connector.sendMessage({ threadId: 'telegram:private:0', text: 'hello' })
+    ).rejects.toThrow('Invalid Telegram private DM thread ID');
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('fails closed without sending when bot_token is missing or transport is disabled', async () => {
+    const sendMessage = vi.fn(async () => '42');
+
+    const tokenless = new TelegramConnector(
+      {},
+      { client: { getUpdates: vi.fn(async () => []), sendMessage } }
+    );
+    await expect(
+      tokenless.sendMessage({ threadId: 'telegram:private:123456789', text: 'hello' })
+    ).rejects.toThrow('Telegram connector requires bot_token to send messages');
+
+    const killSwitched = new TelegramConnector(
+      { bot_token: '123456:SAFE_TOKEN', transport_disabled: true },
+      { client: { getUpdates: vi.fn(async () => []), sendMessage } }
+    );
+    await expect(
+      killSwitched.sendMessage({ threadId: 'telegram:private:123456789', text: 'hello' })
+    ).rejects.toThrow('Telegram transport is disabled');
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('redacts bot tokens and message text from outbound errors', async () => {
+    const sendMessage = vi.fn(async () => {
+      throw new Error(
+        'provider failed at https://api.telegram.org/bot123456:SECRET_TOKEN/sendMessage for message: hello secret'
+      );
+    });
+    const connector = new TelegramConnector(
+      { bot_token: '123456:SECRET_TOKEN' },
+      { client: { getUpdates: vi.fn(async () => []), sendMessage } }
+    );
+
+    await expect(
+      connector.sendMessage({
+        threadId: 'telegram:private:123456789',
+        text: 'hello secret',
+      })
+    ).rejects.toThrow(/Telegram sendMessage failed/);
+
+    try {
+      await connector.sendMessage({
+        threadId: 'telegram:private:123456789',
+        text: 'hello secret',
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      expect(message).not.toContain('123456:SECRET_TOKEN');
+      expect(message).not.toContain('hello secret');
+      expect(message).toContain('[redacted-telegram-token]');
+      expect(message).toContain('[redacted-message]');
+    }
   });
 });

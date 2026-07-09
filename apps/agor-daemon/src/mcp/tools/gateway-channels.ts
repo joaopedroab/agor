@@ -521,7 +521,7 @@ function gatewayChannelNextSteps(channel: GatewayChannel): string[] {
     ...base,
     'Telegram is explicit-link-only: inbound private DM text is accepted only when the stable numeric Telegram user.id is already linked to exactly one Agor user.',
     'Telegram listening is disabled/no-op unless the channel is enabled, config.bot_token is present, config.enable_polling is true, and config.transport_disabled is not true.',
-    'Telegram outbound/proactive replies, groups, attachments, Mini Apps, setup wizard, webhooks, and provider mutation are not implemented in the MVP.',
+    'Telegram supports text-only replies to existing mapped private DM sessions; proactive emits, groups, attachments, rich markdown, self-service /link, Mini Apps, setup wizard, webhooks, and provider mutation remain later work.',
   ];
 }
 
@@ -690,7 +690,7 @@ export function registerGatewayChannelTools(server: McpServer, ctx: McpContext):
     'agor_gateway_channels_create',
     {
       description:
-        'Create a gateway channel definition (admin-only) through the same gateway-channels service used by the UI. Current connectors: Slack, GitHub, Teams, and Telegram private-DM MVP. Slack example config: { bot_token, app_token, connection_mode:"socket", enable_channels:true, require_mention:true, allowed_channel_ids:["C123"] }. Telegram example config: { bot_token, enable_polling:true } and remains no-op unless enabled with explicit polling; it accepts private DM text only, requires an existing numeric user.id link, has no owner fallback, and has no outbound/proactive replies or provider mutation. Secrets are encrypted by the service and returned redacted; prefer environment/template references where possible because raw secrets in tool arguments may appear in the MCP transcript.',
+        'Create a gateway channel definition (admin-only) through the same gateway-channels service used by the UI. Current connectors: Slack, GitHub, Teams, and Telegram private-DM MVP. Slack example config: { bot_token, app_token, connection_mode:"socket", enable_channels:true, require_mention:true, allowed_channel_ids:["C123"] }. Telegram example config: { bot_token, enable_polling:true } and remains no-op unless enabled with explicit polling; it accepts private DM text only, requires an existing numeric user.id link, has no owner fallback, and supports text-only replies to existing mapped private DM sessions; proactive emits, groups, attachments, rich markdown, self-service /link token flow, and provider mutation remain unsupported/out of scope. Secrets are encrypted by the service and returned redacted; prefer environment/template references where possible because raw secrets in tool arguments may appear in the MCP transcript.',
       annotations: { destructiveHint: false, idempotentHint: false },
       inputSchema: gatewayChannelCreateSchema,
     },

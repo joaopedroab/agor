@@ -1,8 +1,8 @@
 /**
  * Telegram inbound normalization helpers.
  *
- * This file intentionally does not implement webhooks, outbound sends,
- * attachment downloads, groups, channels, Mini Apps, or provider mutation.
+ * This file intentionally does not implement webhooks, attachment downloads,
+ * groups, channels, Mini Apps, rich markdown, or provider mutation.
  * It is the adapter-edge boundary for converting one raw Telegram Bot API
  * update into Agor's provider-agnostic InboundMessage shape and, when explicitly
  * enabled, polling Telegram getUpdates without changing remote provider state.
@@ -147,8 +147,15 @@ export interface TelegramGetUpdatesRequest {
   timeoutSeconds?: number;
 }
 
+export interface TelegramSendMessageRequest {
+  botToken: string;
+  chatId: string;
+  text: string;
+}
+
 export interface TelegramUpdateClient {
   getUpdates(req: TelegramGetUpdatesRequest): Promise<unknown[]>;
+  sendMessage?(req: TelegramSendMessageRequest): Promise<string>;
 }
 
 export interface TelegramConnectorOptions {
@@ -293,6 +300,27 @@ function pollingTimeoutSeconds(value: unknown): number | undefined {
     : undefined;
 }
 
+export function parseTelegramPrivateThreadId(threadId: string): string {
+  const match = /^telegram:private:([1-9]\d*)$/.exec(threadId);
+  if (!match) {
+    throw new Error('Invalid Telegram private DM thread ID');
+  }
+  return match[1];
+}
+
+function sanitizeTelegramError(error: unknown, botToken?: string, messageText?: string): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  let sanitized = raw.replace(/bot\d+:[A-Za-z0-9_-]+/g, 'bot[redacted-telegram-token]');
+  sanitized = sanitized.replace(/\b\d{5,}:[A-Za-z0-9_-]{10,}\b/g, '[redacted-telegram-token]');
+  if (botToken) {
+    sanitized = sanitized.split(botToken).join('[redacted-telegram-token]');
+  }
+  if (messageText) {
+    sanitized = sanitized.split(messageText).join('[redacted-message]');
+  }
+  return sanitized;
+}
+
 /**
  * Normalize one Telegram Bot API update into the gateway inbound message shape.
  *
@@ -423,6 +451,29 @@ class FetchTelegramUpdateClient implements TelegramUpdateClient {
     }
     return body.result;
   }
+
+  async sendMessage(req: TelegramSendMessageRequest): Promise<string> {
+    const response = await fetch(`https://api.telegram.org/bot${req.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: req.chatId,
+        text: req.text,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`Telegram sendMessage failed with HTTP ${response.status}`);
+    }
+    const body = await response.json();
+    if (!isRecord(body) || body.ok !== true || !isRecord(body.result)) {
+      throw new Error('Telegram sendMessage returned an unexpected response shape');
+    }
+    const messageId = body.result.message_id;
+    if (typeof messageId !== 'number' && typeof messageId !== 'string') {
+      throw new Error('Telegram sendMessage response is missing message_id');
+    }
+    return String(messageId);
+  }
 }
 
 export class TelegramConnector implements GatewayConnector {
@@ -448,12 +499,40 @@ export class TelegramConnector implements GatewayConnector {
   }
 
   /**
-   * Outbound Telegram sends are intentionally out of Slice 4 scope.
-   * GatewayService skips Telegram outbound before reaching this method; this
-   * failure boundary exists only to satisfy the connector interface safely.
+   * Send a text-only reply to a private Telegram DM thread.
+   *
+   * Rich markdown, attachments, groups/channels, and proactive emits are
+   * intentionally out of this connector slice. Structured blocks are ignored
+   * and `text` is sent without parse_mode so Telegram receives plain text.
    */
-  async sendMessage(): Promise<string> {
-    throw new Error('Telegram outbound sending is not implemented');
+  async sendMessage(req: {
+    threadId: string;
+    text: string;
+    blocks?: unknown[];
+    metadata?: Record<string, unknown>;
+  }): Promise<string> {
+    if (this.config.transport_disabled === true) {
+      throw new Error('Telegram transport is disabled');
+    }
+    if (!isValidBotToken(this.config.bot_token)) {
+      throw new Error('Telegram connector requires bot_token to send messages');
+    }
+    if (!this.client.sendMessage) {
+      throw new Error('Telegram connector client does not support sendMessage');
+    }
+
+    const chatId = parseTelegramPrivateThreadId(req.threadId);
+    try {
+      return await this.client.sendMessage({
+        botToken: this.config.bot_token,
+        chatId,
+        text: req.text,
+      });
+    } catch (error) {
+      throw new Error(
+        `Telegram sendMessage failed: ${sanitizeTelegramError(error, this.config.bot_token, req.text)}`
+      );
+    }
   }
 
   formatMessage(markdown: string): string {
