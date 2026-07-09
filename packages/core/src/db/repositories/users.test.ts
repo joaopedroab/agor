@@ -12,9 +12,9 @@
  */
 
 import type { UserID } from '@agor/core/types';
-import { eq } from 'drizzle-orm';
-import { beforeAll, describe, expect } from 'vitest';
-import { select, update } from '../database-wrapper';
+import { and, eq } from 'drizzle-orm';
+import { beforeAll, describe, expect, vi } from 'vitest';
+import { jsonExtract, select, update } from '../database-wrapper';
 import { users } from '../schema';
 import { dbTest } from '../test-helpers';
 import { externalIdentityKey, UsersRepository } from './users';
@@ -296,6 +296,310 @@ describe('UsersRepository external identity links', () => {
     });
 
     expect(found).toBeNull();
+  });
+
+  dbTest('creates hashed Telegram link tokens and consumes them once', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const userId = await makeUser(repo);
+
+    const created = await repo.createExternalIdentityLinkToken({
+      provider: 'telegram',
+      issuer: 'telegram',
+      purpose: 'telegram_dm_link',
+      intended_user_id: userId,
+      created_by_user_id: userId,
+      expires_at: '2099-01-01T00:00:00.000Z',
+      token: 'raw-token-for-test',
+    });
+
+    expect(created.token).toBe('raw-token-for-test');
+    const row = await select(db).from(users).where(eq(users.user_id, userId)).one();
+    const storedToken = row?.data.external_identity_link_tokens?.[0];
+    expect(storedToken?.token_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(row?.data)).not.toContain('raw-token-for-test');
+
+    const consumed = await repo.consumeExternalIdentityLinkToken({
+      provider: 'telegram',
+      issuer: 'telegram',
+      purpose: 'telegram_dm_link',
+      token: 'raw-token-for-test',
+      subject: '123456789',
+      name: '@telegram_username',
+      now: new Date('2026-07-09T12:00:00.000Z'),
+    });
+    expect(consumed).toMatchObject({
+      ok: true,
+      user_id: userId,
+      external_identity: {
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+        name: '@telegram_username',
+      },
+    });
+
+    const after = await select(db).from(users).where(eq(users.user_id, userId)).one();
+    expect(after?.data.external_identity_link_tokens?.[0]?.consumed_at).toBe(
+      '2026-07-09T12:00:00.000Z'
+    );
+    expect(
+      await repo.findByExternalIdentity({
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+      })
+    ).toMatchObject({ user_id: userId });
+
+    await expect(
+      repo.consumeExternalIdentityLinkToken({
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        token: 'raw-token-for-test',
+        subject: '123456789',
+        now: new Date('2026-07-09T12:01:00.000Z'),
+      })
+    ).resolves.toEqual({ ok: false, reason: 'used_token' });
+  });
+
+  dbTest('allows only one concurrent link token consumption to succeed', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const userId = await makeUser(repo);
+
+    await repo.createExternalIdentityLinkToken({
+      provider: 'telegram',
+      issuer: 'telegram',
+      purpose: 'telegram_dm_link',
+      intended_user_id: userId,
+      created_by_user_id: userId,
+      expires_at: '2099-01-01T00:00:00.000Z',
+      token: 'concurrent-token-for-test',
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        repo.consumeExternalIdentityLinkToken({
+          provider: 'telegram',
+          issuer: 'telegram',
+          purpose: 'telegram_dm_link',
+          token: 'concurrent-token-for-test',
+          subject: `race-subject-${index}`,
+          name: `@race_${index}`,
+          now: new Date('2026-07-09T12:00:00.000Z'),
+        })
+      )
+    );
+
+    const successes = results.filter((result) => result.ok);
+    const failures = results.filter((result) => !result.ok);
+    expect(successes).toHaveLength(1);
+    expect(failures).toHaveLength(7);
+    expect(failures.map((result) => (!result.ok ? result.reason : 'ok'))).toEqual(
+      Array.from({ length: 7 }, () => 'used_token')
+    );
+    const success = successes[0];
+    expect(success?.ok).toBe(true);
+    if (!success?.ok) throw new Error('Expected one successful token consumption');
+
+    const after = await select(db).from(users).where(eq(users.user_id, userId)).one();
+    expect(after?.data.external_identities).toHaveLength(1);
+    expect(after?.data.external_identities?.[0]?.subject).toBe(success.external_identity.subject);
+    expect(after?.data.external_identity_link_tokens?.[0]?.consumed_at).toBe(
+      '2026-07-09T12:00:00.000Z'
+    );
+
+    await expect(
+      repo.consumeExternalIdentityLinkToken({
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        token: 'concurrent-token-for-test',
+        subject: 'late-race-subject',
+        now: new Date('2026-07-09T12:01:00.000Z'),
+      })
+    ).resolves.toEqual({ ok: false, reason: 'used_token' });
+  });
+
+  dbTest('stale same-millisecond token consume preimages fail the nonce CAS', async ({ db }) => {
+    const fixedNow = new Date('2026-07-09T12:00:00.000Z');
+    vi.useFakeTimers();
+    vi.setSystemTime(fixedNow);
+    try {
+      const repo = new UsersRepository(db);
+      const userId = await makeUser(repo);
+
+      await repo.createExternalIdentityLinkToken({
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        intended_user_id: userId,
+        created_by_user_id: userId,
+        expires_at: '2099-01-01T00:00:00.000Z',
+        token: 'same-millisecond-token-for-test',
+      });
+
+      const staleRow = await select(db).from(users).where(eq(users.user_id, userId)).one();
+      expect(staleRow?.updated_at?.getTime()).toBe(fixedNow.getTime());
+      const staleData = staleRow?.data;
+      const staleNonce = staleData?.external_identity_link_token_nonce;
+      expect(staleNonce).toMatch(/^[A-Za-z0-9_-]+$/);
+
+      const consumed = await repo.consumeExternalIdentityLinkToken({
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        token: 'same-millisecond-token-for-test',
+        subject: 'winner-subject',
+        now: fixedNow,
+      });
+      expect(consumed.ok).toBe(true);
+
+      const afterWinner = await select(db).from(users).where(eq(users.user_id, userId)).one();
+      expect(afterWinner?.updated_at?.getTime()).toBe(fixedNow.getTime());
+      expect(afterWinner?.data.external_identity_link_token_nonce).not.toBe(staleNonce);
+
+      const staleToken = staleData?.external_identity_link_tokens?.[0];
+      expect(staleToken).toBeTruthy();
+      const staleContenderData = {
+        ...staleData,
+        external_identities: [
+          ...(staleData?.external_identities ?? []),
+          {
+            key: externalIdentityKey('telegram', 'telegram', 'stale-subject'),
+            provider: 'telegram',
+            issuer: 'telegram',
+            subject: 'stale-subject',
+            last_login_at: fixedNow.toISOString(),
+          },
+        ],
+        external_identity_link_tokens: (staleData?.external_identity_link_tokens ?? []).map(
+          (candidate) =>
+            candidate.token_id === staleToken?.token_id
+              ? {
+                  ...candidate,
+                  consumed_at: fixedNow.toISOString(),
+                  consumed_by_subject: 'stale-subject',
+                }
+              : candidate
+        ),
+        external_identity_link_token_nonce: 'stale-contender-next-nonce',
+      };
+      const staleUpdate = await update(db, users)
+        .set({
+          data: staleContenderData,
+          updated_at: new Date(),
+        })
+        .where(
+          and(
+            eq(users.user_id, userId),
+            eq(jsonExtract(db, users.data, 'external_identity_link_token_nonce'), staleNonce ?? '')
+          )
+        )
+        .run();
+
+      expect(staleUpdate.rowsAffected).toBe(0);
+      await expect(
+        repo.consumeExternalIdentityLinkToken({
+          provider: 'telegram',
+          issuer: 'telegram',
+          purpose: 'telegram_dm_link',
+          token: 'same-millisecond-token-for-test',
+          subject: 'late-subject',
+          now: fixedNow,
+        })
+      ).resolves.toEqual({ ok: false, reason: 'used_token' });
+
+      const finalRow = await select(db).from(users).where(eq(users.user_id, userId)).one();
+      expect(finalRow?.data.external_identities).toHaveLength(1);
+      expect(finalRow?.data.external_identities?.[0]?.subject).toBe('winner-subject');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  dbTest('rejects expired link tokens without creating external links', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const userId = await makeUser(repo);
+
+    await repo.createExternalIdentityLinkToken({
+      provider: 'telegram',
+      issuer: 'telegram',
+      purpose: 'telegram_dm_link',
+      intended_user_id: userId,
+      created_by_user_id: userId,
+      expires_at: '2026-07-09T12:00:00.000Z',
+      token: 'expired-token-for-test',
+    });
+
+    await expect(
+      repo.consumeExternalIdentityLinkToken({
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        token: 'expired-token-for-test',
+        subject: '123456789',
+        now: new Date('2026-07-09T12:00:01.000Z'),
+      })
+    ).resolves.toEqual({ ok: false, reason: 'expired_token' });
+    expect(
+      await repo.findByExternalIdentity({
+        provider: 'telegram',
+        issuer: 'telegram',
+        subject: '123456789',
+      })
+    ).toBeNull();
+  });
+
+  dbTest('fails closed when token consumption would duplicate an existing link', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const tokenUserId = await makeUser(repo);
+    const linkedUserId = await makeUser(repo);
+
+    await repo.linkExternalIdentity(linkedUserId, {
+      provider: 'telegram',
+      issuer: 'telegram',
+      subject: '123456789',
+    });
+    await repo.createExternalIdentityLinkToken({
+      provider: 'telegram',
+      issuer: 'telegram',
+      purpose: 'telegram_dm_link',
+      intended_user_id: tokenUserId,
+      created_by_user_id: tokenUserId,
+      expires_at: '2099-01-01T00:00:00.000Z',
+      token: 'duplicate-link-token',
+    });
+
+    await expect(
+      repo.consumeExternalIdentityLinkToken({
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        token: 'duplicate-link-token',
+        subject: '123456789',
+        now: new Date('2026-07-09T12:00:00.000Z'),
+      })
+    ).resolves.toEqual({ ok: false, reason: 'already_linked' });
+  });
+
+  dbTest('generic user updates preserve pending link tokens', async ({ db }) => {
+    const repo = new UsersRepository(db);
+    const userId = await makeUser(repo);
+
+    await repo.createExternalIdentityLinkToken({
+      provider: 'telegram',
+      issuer: 'telegram',
+      purpose: 'telegram_dm_link',
+      intended_user_id: userId,
+      created_by_user_id: userId,
+      expires_at: '2099-01-01T00:00:00.000Z',
+      token: 'pending-token-for-test',
+    });
+    await repo.update(userId, { name: 'Renamed User' });
+
+    const row = await select(db).from(users).where(eq(users.user_id, userId)).one();
+    expect(row?.data.external_identity_link_tokens).toHaveLength(1);
+    expect(JSON.stringify(row?.data)).not.toContain('pending-token-for-test');
   });
 });
 

@@ -127,10 +127,10 @@ describe('agor_gateway_channels MCP tools', () => {
     const tools = await captureTools();
     expect(tools.agor_gateway_channels_create.cfg.description).toContain('Telegram private-DM MVP');
     expect(tools.agor_gateway_channels_create.cfg.description).toContain(
-      'supports rich markdown replies with safe plain-text fallback for existing mapped private DM sessions'
+      'supports rich markdown replies with safe plain-text fallback for mapped private DM sessions'
     );
     expect(tools.agor_gateway_channels_create.cfg.description).toContain(
-      'proactive emits, groups, attachments, self-service /link token flow, and provider mutation remain unsupported/out of scope'
+      'self-service tokens come from agor_users_telegram_link_token_create plus /link <token>'
     );
 
     const enabledWithoutToken = tools.agor_gateway_channels_create.cfg.inputSchema.safeParse({
@@ -207,9 +207,10 @@ describe('agor_gateway_channels MCP tools', () => {
     expect(payload.next_steps).toEqual(
       expect.arrayContaining([
         expect.stringContaining('explicit-link-only'),
+        expect.stringContaining('agor_users_telegram_link_token_create'),
         expect.stringContaining('disabled/no-op unless'),
         expect.stringContaining(
-          'supports rich markdown replies with safe plain-text fallback for existing mapped private DM sessions'
+          'supports local /link token verification plus rich markdown replies with safe plain-text fallback for mapped private DM sessions'
         ),
         expect.stringContaining('proactive emits'),
       ])

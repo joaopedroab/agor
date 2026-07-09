@@ -404,6 +404,23 @@ export interface UserExternalIdentity {
   last_login_at: string;
 }
 
+/** Short-lived local token for self-service external identity linking. */
+export interface UserExternalIdentityLinkToken {
+  /** Random token identifier safe to expose in internal audit/tool responses. */
+  token_id: string;
+  /** SHA-256 of provider + issuer + raw token; raw token is returned once only. */
+  token_hash: string;
+  provider: string;
+  issuer: string;
+  purpose: 'telegram_dm_link' | string;
+  intended_user_id: UserID | string;
+  created_by_user_id: UserID | string;
+  created_at: string;
+  expires_at: string;
+  consumed_at?: string;
+  consumed_by_subject?: string;
+}
+
 /**
  * Base user fields shared across User, CreateUserInput, and UpdateUserInput
  */

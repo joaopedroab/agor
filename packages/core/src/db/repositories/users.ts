@@ -6,7 +6,7 @@
  * the public DTO (User.agentic_tools) exposes boolean presence flags only.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type {
   AgenticToolName,
   AgenticToolsConfig,
@@ -15,14 +15,15 @@ import type {
   StoredAgenticTools,
   User,
   UserExternalIdentity,
+  UserExternalIdentityLinkToken,
   UUID,
 } from '@agor/core/types';
 import { toAgenticToolsStatus } from '@agor/core/types';
-import { eq, like, sql } from 'drizzle-orm';
+import { and, eq, isNull, like, sql } from 'drizzle-orm';
 import { normalizeStoredEnvMap, type RawStoredEnvVar } from '../../config/env-vars';
 import { generateId, shortId } from '../../lib/ids';
 import type { Database } from '../client';
-import { deleteFrom, insert, select, update } from '../database-wrapper';
+import { deleteFrom, insert, jsonExtract, select, update } from '../database-wrapper';
 import { decryptApiKey, encryptApiKey } from '../encryption';
 import { type UserInsert as SchemaUserInsert, type UserRow, users } from '../schema';
 import {
@@ -45,8 +46,49 @@ export interface LinkExternalIdentityInput extends ExternalIdentityRef {
   last_login_at?: string;
 }
 
+export interface CreateExternalIdentityLinkTokenInput {
+  provider: string;
+  issuer: string;
+  purpose: 'telegram_dm_link' | string;
+  intended_user_id: string;
+  created_by_user_id: string;
+  expires_at: string;
+  token?: string;
+}
+
+export interface CreateExternalIdentityLinkTokenResult {
+  token: string;
+  token_id: string;
+  user_id: string;
+  provider: string;
+  issuer: string;
+  purpose: string;
+  expires_at: string;
+}
+
+export type ConsumeExternalIdentityLinkTokenResult =
+  | {
+      ok: true;
+      user_id: string;
+      token_id: string;
+      external_identity: UserExternalIdentity;
+    }
+  | {
+      ok: false;
+      reason:
+        | 'invalid_token'
+        | 'expired_token'
+        | 'used_token'
+        | 'ambiguous_token'
+        | 'already_linked'
+        | 'ambiguous_link'
+        | 'target_user_not_found';
+    };
+
 type StoredUserData = UserRow['data'] & {
   external_identities?: UserExternalIdentity[];
+  external_identity_link_tokens?: UserExternalIdentityLinkToken[];
+  external_identity_link_token_nonce?: string;
 };
 
 /**
@@ -62,6 +104,26 @@ export function externalIdentityKey(provider: string, issuer: string, subject: s
 
 function getExternalIdentities(data: StoredUserData | null | undefined): UserExternalIdentity[] {
   return Array.isArray(data?.external_identities) ? data.external_identities : [];
+}
+
+function getExternalIdentityLinkTokens(
+  data: StoredUserData | null | undefined
+): UserExternalIdentityLinkToken[] {
+  return Array.isArray(data?.external_identity_link_tokens)
+    ? data.external_identity_link_tokens
+    : [];
+}
+
+function externalIdentityLinkTokenHash(provider: string, issuer: string, token: string): string {
+  return createHash('sha256').update(`${provider}\0${issuer}\0${token}`).digest('hex');
+}
+
+function generateLinkToken(): string {
+  return randomBytes(24).toString('base64url');
+}
+
+function generateLinkTokenConsumeNonce(): string {
+  return randomBytes(16).toString('base64url');
 }
 
 /**
@@ -125,6 +187,8 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
       agentic_tools_raw?: StoredAgenticTools;
       env_vars_raw?: SchemaUserInsert['data']['env_vars'];
       external_identities_raw?: UserExternalIdentity[];
+      external_identity_link_tokens_raw?: UserExternalIdentityLinkToken[];
+      external_identity_link_token_nonce_raw?: string;
     }
   ): SchemaUserInsert {
     const now = new Date();
@@ -168,6 +232,8 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
         // Stable external account links are internal user data. Preserve them
         // across generic profile/preference updates just like credential blobs.
         external_identities: user.external_identities_raw,
+        external_identity_link_tokens: user.external_identity_link_tokens_raw,
+        external_identity_link_token_nonce: user.external_identity_link_token_nonce_raw,
         default_agentic_config: user.default_agentic_config,
       },
     };
@@ -469,6 +535,183 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
   }
 
   /**
+   * Create a short-lived, single-use local token for linking an external
+   * identity to an existing user. The raw token is returned once and only its
+   * hash is stored in users.data.
+   */
+  async createExternalIdentityLinkToken(
+    input: CreateExternalIdentityLinkTokenInput
+  ): Promise<CreateExternalIdentityLinkTokenResult> {
+    const intendedUserId = await this.resolveId(input.intended_user_id);
+    const row = await select(this.db).from(users).where(eq(users.user_id, intendedUserId)).one();
+    if (!row) {
+      throw new EntityNotFoundError('User', input.intended_user_id);
+    }
+
+    const data = ((row as UserRow).data ?? {}) as StoredUserData;
+    const now = new Date().toISOString();
+    const token = input.token ?? generateLinkToken();
+    const tokenRecord: UserExternalIdentityLinkToken = {
+      token_id: generateId(),
+      token_hash: externalIdentityLinkTokenHash(input.provider, input.issuer, token),
+      provider: input.provider,
+      issuer: input.issuer,
+      purpose: input.purpose,
+      intended_user_id: intendedUserId,
+      created_by_user_id: input.created_by_user_id,
+      created_at: now,
+      expires_at: input.expires_at,
+    };
+    const activeTokens = getExternalIdentityLinkTokens(data)
+      .filter((candidate) => candidate.consumed_at || Date.parse(candidate.expires_at) > Date.now())
+      .slice(-24);
+
+    await update(this.db, users)
+      .set({
+        data: {
+          ...data,
+          external_identity_link_tokens: [...activeTokens, tokenRecord],
+          external_identity_link_token_nonce: generateLinkTokenConsumeNonce(),
+        },
+        updated_at: new Date(),
+      })
+      .where(eq(users.user_id, intendedUserId))
+      .run();
+
+    return {
+      token,
+      token_id: tokenRecord.token_id,
+      user_id: intendedUserId,
+      provider: input.provider,
+      issuer: input.issuer,
+      purpose: input.purpose,
+      expires_at: input.expires_at,
+    };
+  }
+
+  /**
+   * Verify and consume a local external-identity link token, then attach the
+   * external identity to the token's intended user. Fails closed for missing,
+   * expired, reused, duplicate, or ambiguous state.
+   */
+  async consumeExternalIdentityLinkToken(input: {
+    provider: string;
+    issuer: string;
+    purpose: 'telegram_dm_link' | string;
+    token: string;
+    subject: string;
+    email?: string;
+    name?: string;
+    now?: Date;
+  }): Promise<ConsumeExternalIdentityLinkTokenResult> {
+    const tokenHash = externalIdentityLinkTokenHash(input.provider, input.issuer, input.token);
+    const now = input.now ?? new Date();
+    const nowIso = now.toISOString();
+
+    // Link tokens live inside the users JSON blob, so there is no token row
+    // to atomically UPDATE by primary key. Use an optimistic compare-and-set on
+    // a cryptographically random nonce in the same users.data blob instead of
+    // users.updated_at: SQLite timestamp precision can preserve the same
+    // updated_at value across a stale read/write race, while this nonce is
+    // always replaced during the token mutation. After a conflict, re-read so
+    // contenders observe consumed_at and fail closed as used_token.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const rows = (await select(this.db).from(users).all()) as UserRow[];
+      const tokenMatches: Array<{ row: UserRow; token: UserExternalIdentityLinkToken }> = [];
+
+      for (const row of rows) {
+        const data = (row.data ?? {}) as StoredUserData;
+        for (const candidate of getExternalIdentityLinkTokens(data)) {
+          if (
+            candidate.provider === input.provider &&
+            candidate.issuer === input.issuer &&
+            candidate.purpose === input.purpose &&
+            candidate.token_hash === tokenHash
+          ) {
+            tokenMatches.push({ row, token: candidate });
+          }
+        }
+      }
+
+      if (tokenMatches.length === 0) return { ok: false, reason: 'invalid_token' };
+      if (tokenMatches.length > 1) return { ok: false, reason: 'ambiguous_token' };
+
+      const [{ row: tokenRow, token: storedToken }] = tokenMatches;
+      if (storedToken.consumed_at) return { ok: false, reason: 'used_token' };
+      const expiresAtMs = Date.parse(storedToken.expires_at);
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now.getTime()) {
+        return { ok: false, reason: 'expired_token' };
+      }
+      if (storedToken.intended_user_id !== tokenRow.user_id) {
+        return { ok: false, reason: 'target_user_not_found' };
+      }
+
+      const key = externalIdentityKey(input.provider, input.issuer, input.subject);
+      const existingMatches = rows.filter((candidate) => {
+        const identities = getExternalIdentities(candidate.data as StoredUserData);
+        return identities.some((identity) => identity.key === key);
+      });
+      if (existingMatches.length > 1) return { ok: false, reason: 'ambiguous_link' };
+      if (existingMatches.length === 1) return { ok: false, reason: 'already_linked' };
+
+      const targetData = ((tokenRow.data ?? {}) as StoredUserData) ?? {};
+      const externalIdentity: UserExternalIdentity = {
+        key,
+        provider: input.provider,
+        issuer: input.issuer,
+        subject: input.subject,
+        ...(input.email ? { email: input.email } : {}),
+        ...(input.name ? { name: input.name } : {}),
+        last_login_at: nowIso,
+      };
+      const external_identity_link_tokens = getExternalIdentityLinkTokens(targetData).map(
+        (candidate) =>
+          candidate.token_id === storedToken.token_id
+            ? {
+                ...candidate,
+                consumed_at: nowIso,
+                consumed_by_subject: input.subject,
+              }
+            : candidate
+      );
+      const previousNonce = targetData.external_identity_link_token_nonce;
+      const nextNonce = generateLinkTokenConsumeNonce();
+
+      const nonceExpression = jsonExtract(
+        this.db,
+        users.data,
+        'external_identity_link_token_nonce'
+      );
+      const casWhere = previousNonce
+        ? and(eq(users.user_id, tokenRow.user_id), eq(nonceExpression, previousNonce))
+        : and(eq(users.user_id, tokenRow.user_id), isNull(nonceExpression));
+      const result = await update(this.db, users)
+        .set({
+          data: {
+            ...targetData,
+            external_identities: [...getExternalIdentities(targetData), externalIdentity],
+            external_identity_link_tokens,
+            external_identity_link_token_nonce: nextNonce,
+          },
+          updated_at: new Date(),
+        })
+        .where(casWhere)
+        .run();
+
+      if (result.rowsAffected === 1) {
+        return {
+          ok: true,
+          user_id: tokenRow.user_id,
+          token_id: storedToken.token_id,
+          external_identity: externalIdentity,
+        };
+      }
+    }
+
+    return { ok: false, reason: 'used_token' };
+  }
+
+  /**
    * Find all users
    */
   async findAll(): Promise<InternalUser[]> {
@@ -508,6 +751,8 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
       agentic_tools_raw?: StoredAgenticTools;
       env_vars_raw?: SchemaUserInsert['data']['env_vars'];
       external_identities_raw?: UserExternalIdentity[];
+      external_identity_link_tokens_raw?: UserExternalIdentityLinkToken[];
+      external_identity_link_token_nonce_raw?: string;
     };
     if (rawRow?.data.agentic_tools) {
       merged.agentic_tools_raw = rawRow.data.agentic_tools as StoredAgenticTools;
@@ -517,6 +762,13 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
     }
     if (rawRow?.data.external_identities) {
       merged.external_identities_raw = rawRow.data.external_identities;
+    }
+    if (rawRow?.data.external_identity_link_tokens) {
+      merged.external_identity_link_tokens_raw = rawRow.data.external_identity_link_tokens;
+    }
+    if (rawRow?.data.external_identity_link_token_nonce) {
+      merged.external_identity_link_token_nonce_raw =
+        rawRow.data.external_identity_link_token_nonce;
     }
     const insertData = this.userToInsert(merged);
 

@@ -23,6 +23,8 @@ const USER_LIST_FIELDS = [
 ] as const;
 
 const USER_QUERY_LIMIT_MAX = 10000;
+const TELEGRAM_LINK_TOKEN_DEFAULT_TTL_MINUTES = 15;
+const TELEGRAM_LINK_TOKEN_MAX_TTL_MINUTES = 60;
 
 type UserListField = (typeof USER_LIST_FIELDS)[number];
 type UserListRow = Pick<User, UserListField>;
@@ -36,6 +38,13 @@ type ExternalIdentityArgs = {
 function requireAdmin(ctx: McpContext): void {
   if (!hasMinimumRole(ctx.authenticatedUser?.role, ROLES.ADMIN)) {
     throw new Error('Admin role required to manage external identity links.');
+  }
+}
+
+function requireSelfOrAdmin(ctx: McpContext, userId: string): void {
+  if (userId === ctx.userId) return;
+  if (!hasMinimumRole(ctx.authenticatedUser?.role, ROLES.ADMIN)) {
+    throw new Error('Admin role required to create link tokens for another user.');
   }
 }
 
@@ -415,6 +424,65 @@ export function registerUserTools(server: McpServer, ctx: McpContext): void {
 
   // Tool 8: agor_users_external_identities_list
   server.registerTool(
+    'agor_users_telegram_link_token_create',
+    {
+      description:
+        'Create a short-lived single-use Telegram /link token for the current Agor user, or for a specified user when called by an admin. The raw token is returned once; only a hash is stored in local users.data. No Telegram provider calls or username trust happen.',
+      inputSchema: z.strictObject({
+        userId: mcpOptionalString(
+          'userId',
+          'Optional target Agor user ID (UUIDv7 or short ID). Defaults to the authenticated caller. Admin role is required to create a token for another user.'
+        ),
+        ttlMinutes: z
+          .number({ error: 'ttlMinutes must be a positive integer when provided.' })
+          .int('ttlMinutes must be an integer.')
+          .positive('ttlMinutes must be greater than 0.')
+          .max(
+            TELEGRAM_LINK_TOKEN_MAX_TTL_MINUTES,
+            `ttlMinutes must be less than or equal to ${TELEGRAM_LINK_TOKEN_MAX_TTL_MINUTES}.`
+          )
+          .optional()
+          .describe(
+            `Token lifetime in minutes (default: ${TELEGRAM_LINK_TOKEN_DEFAULT_TTL_MINUTES}, max: ${TELEGRAM_LINK_TOKEN_MAX_TTL_MINUTES}).`
+          ),
+      }),
+    },
+    async (args) => {
+      const targetUserId = safeMetadataValue(args.userId) ?? ctx.userId;
+      requireSelfOrAdmin(ctx, targetUserId);
+
+      const ttlMinutes = args.ttlMinutes ?? TELEGRAM_LINK_TOKEN_DEFAULT_TTL_MINUTES;
+      const expiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
+      const usersRepo = new UsersRepository(ctx.db);
+      const token = await usersRepo.createExternalIdentityLinkToken({
+        provider: TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
+        issuer: TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
+        purpose: 'telegram_dm_link',
+        intended_user_id: targetUserId,
+        created_by_user_id: ctx.userId,
+        expires_at: expiresAt,
+      });
+
+      return textResult({
+        status: 'created',
+        user_id: token.user_id,
+        provider: token.provider,
+        issuer: token.issuer,
+        token: token.token,
+        token_id: token.token_id,
+        expires_at: token.expires_at,
+        usage: `/link ${token.token}`,
+        notes: [
+          'The token is returned once; only a hash is stored locally.',
+          'Send this token to the Telegram bot in a private DM with /link <token> before it expires.',
+          'Telegram usernames are metadata only; the link is made to Telegram numeric user.id during verification.',
+        ],
+      });
+    }
+  );
+
+  // Tool 9: agor_users_external_identities_list
+  server.registerTool(
     'agor_users_external_identities_list',
     {
       description:
@@ -446,12 +514,12 @@ export function registerUserTools(server: McpServer, ctx: McpContext): void {
     }
   );
 
-  // Tool 9: agor_users_external_identity_link
+  // Tool 10: agor_users_external_identity_link
   server.registerTool(
     'agor_users_external_identity_link',
     {
       description:
-        'Admin/test setup path: link one stable external identity to an Agor user using local users.data.external_identities only. Defaults to Telegram and requires Telegram subject to be the numeric user.id; usernames are optional metadata only. No provider calls happen and this is not a self-service /link token flow.',
+        'Admin/test setup path: link one stable external identity to an Agor user using local users.data.external_identities only. Defaults to Telegram and requires Telegram subject to be the numeric user.id; usernames are optional metadata only. No provider calls happen. For self-service Telegram setup, prefer agor_users_telegram_link_token_create plus /link in a Telegram DM.',
       annotations: { idempotentHint: true },
       inputSchema: z.strictObject({
         userId: mcpRequiredId('userId', 'User', 'User ID (UUIDv7 or short ID)'),
@@ -508,7 +576,7 @@ export function registerUserTools(server: McpServer, ctx: McpContext): void {
     }
   );
 
-  // Tool 10: agor_users_external_identity_revoke
+  // Tool 11: agor_users_external_identity_revoke
   server.registerTool(
     'agor_users_external_identity_revoke',
     {

@@ -61,6 +61,7 @@ function makeGatewayHarness(args: {
   externalIdentityUser?: User | null;
   externalIdentityUsers?: User[];
   alignmentUser?: User | null;
+  consumeLinkTokenResult?: unknown;
 }) {
   const channel = args.channel ?? slackChannel;
   let mapping = args.existingMapping ?? null;
@@ -131,6 +132,7 @@ function makeGatewayHarness(args: {
           subject: string;
         }) => Promise<User[]>;
         findByEmailForAlignment: (email: string) => Promise<User | null>;
+        consumeExternalIdentityLinkToken: (input: Record<string, unknown>) => Promise<unknown>;
       };
     }
   ).usersRepo = {
@@ -141,6 +143,9 @@ function makeGatewayHarness(args: {
     ),
     findByEmailForAlignment: vi.fn(async () =>
       args.alignmentUser === undefined ? user : args.alignmentUser
+    ),
+    consumeExternalIdentityLinkToken: vi.fn(
+      async () => args.consumeLinkTokenResult ?? { ok: false, reason: 'invalid_token' }
     ),
   };
   (
@@ -724,10 +729,117 @@ describe('GatewayService Telegram alignment', () => {
     expect(promptCreate).not.toHaveBeenCalled();
   });
 
-  it('handles Telegram link commands without creating sessions', async () => {
+  it('/link without token sends help and does not create a session', async () => {
+    const sendMessage = vi.fn(async () => 'help-message-1');
     const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
       channel: telegramChannel,
       externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/link',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        telegram_username: 'not-an-identity',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: 'telegram:private:123456789',
+        text: expect.stringContaining('/link <token>'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('/link valid token links the numeric Telegram sender and then regular messages route', async () => {
+    const sendMessage = vi.fn(async () => 'link-message-1');
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+      consumeLinkTokenResult: {
+        ok: true,
+        user_id: 'telegram-user-1',
+        token_id: 'token-1',
+        external_identity: {
+          provider: 'telegram',
+          issuer: 'telegram',
+          subject: '123456789',
+        },
+      },
+    });
+    const usersRepo = (
+      service as unknown as {
+        usersRepo: {
+          consumeExternalIdentityLinkToken: ReturnType<typeof vi.fn>;
+        };
+      }
+    ).usersRepo;
+
+    const linkResult = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/link abc_DEF-1234',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+        telegram_username: 'not-an-identity',
+        telegram_first_name: 'Tele',
+        telegram_last_name: 'Gram',
+      },
+    });
+
+    expect(linkResult).toEqual({ success: false, sessionId: '', created: false });
+    expect(usersRepo.consumeExternalIdentityLinkToken).toHaveBeenCalledWith({
+      provider: 'telegram',
+      issuer: 'telegram',
+      purpose: 'telegram_dm_link',
+      token: 'abc_DEF-1234',
+      subject: '123456789',
+      name: 'Tele Gram',
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: 'telegram:private:123456789',
+        text: expect.stringContaining('Telegram account linked to Agor'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+
+    const messageResult = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'hello after linking',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(messageResult).toMatchObject({ success: true, sessionId: 'sess-new', created: true });
+    expect(sessionsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        created_by: 'telegram-user-1',
+      })
+    );
+  });
+
+  it('/link invalid or reused token rejects and does not create a session', async () => {
+    const sendMessage = vi.fn(async () => 'failure-message-1');
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+      consumeLinkTokenResult: { ok: false, reason: 'used_token' },
     });
 
     const result = await service.create({
@@ -737,7 +849,35 @@ describe('GatewayService Telegram alignment', () => {
       metadata: {
         telegram_user_id: '123456789',
         telegram_external_subject: '123456789',
-        telegram_username: 'not-an-identity',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('Link failed'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('/link ambiguous duplicate link fails closed and does not create a session', async () => {
+    const sendMessage = vi.fn(async () => 'ambiguous-message-1');
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+      consumeLinkTokenResult: { ok: false, reason: 'ambiguous_link' },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/link abc_DEF-1234',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
       },
     });
 

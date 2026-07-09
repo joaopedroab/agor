@@ -17,6 +17,7 @@ import type {
   Session,
   Task,
   UserExternalIdentity,
+  UserExternalIdentityLinkToken,
 } from '@agor/core/types';
 import { BRANCH_PERMISSION_LEVELS } from '@agor/core/types';
 import { relations, sql } from 'drizzle-orm';
@@ -937,6 +938,10 @@ export const users = sqliteTable(
         preferences?: Record<string, unknown>;
         // Stable external-auth identity mappings used by generic launch-code auth.
         external_identities?: UserExternalIdentity[];
+        // Short-lived hashed local tokens for self-service external identity linking.
+        external_identity_link_tokens?: UserExternalIdentityLinkToken[];
+        // Random compare-and-set token changed with every link-token mutation.
+        external_identity_link_token_nonce?: string;
         // Per-tool credentials and auth-adjacent config.
         //
         // Each entry is keyed by AgenticToolName and holds env-var-named fields

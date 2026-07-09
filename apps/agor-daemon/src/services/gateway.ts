@@ -1572,6 +1572,56 @@ export class GatewayService {
         data.metadata?.telegram_external_subject ?? data.metadata?.telegram_user_id
       );
       if (telegramCommand.kind !== 'regular_message') {
+        if (telegramCommand.kind === 'link_help') {
+          this.sendSystemMessage(
+            channel,
+            data.thread_id,
+            'To link this Telegram DM to Agor, create a Telegram link token in Agor, then send `/link <token>` here. Tokens expire quickly and can only be used once.'
+          );
+        } else if (telegramCommand.kind === 'link_token') {
+          const username =
+            typeof data.metadata?.telegram_username === 'string'
+              ? data.metadata.telegram_username
+              : undefined;
+          const firstName =
+            typeof data.metadata?.telegram_first_name === 'string'
+              ? data.metadata.telegram_first_name
+              : undefined;
+          const lastName =
+            typeof data.metadata?.telegram_last_name === 'string'
+              ? data.metadata.telegram_last_name
+              : undefined;
+          const displayName =
+            [firstName, lastName].filter(Boolean).join(' ') ||
+            (username ? `@${username}` : undefined);
+          const linkResult = await this.usersRepo.consumeExternalIdentityLinkToken({
+            provider: TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
+            issuer: TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
+            purpose: 'telegram_dm_link',
+            token: telegramCommand.token,
+            subject: telegramCommand.telegramUserId,
+            ...(displayName ? { name: displayName } : {}),
+          });
+          if (linkResult.ok) {
+            this.sendSystemMessage(
+              channel,
+              data.thread_id,
+              'Telegram account linked to Agor. You can now send messages in this DM to start or continue Agor sessions.'
+            );
+          } else {
+            this.sendSystemMessage(
+              channel,
+              data.thread_id,
+              'Link failed. The token may be invalid, expired, already used, or blocked by an existing Telegram link. Create a new token in Agor and try again.'
+            );
+          }
+        } else if (telegramCommand.kind === 'invalid_link_token') {
+          this.sendSystemMessage(
+            channel,
+            data.thread_id,
+            'Link failed. Use `/link <token>` with the token created in Agor. Tokens expire quickly and can only be used once.'
+          );
+        }
         console.log(
           `[gateway] Telegram command boundary handled ${telegramCommand.kind} without creating a session (thread=${data.thread_id})`
         );

@@ -251,8 +251,8 @@ export function decideTelegramInboundAuth(input: {
 /**
  * Parse Telegram text commands without performing any live provider action.
  *
- * `/link <token>` only describes a future safe link-token verification intent.
- * It does not trust usernames, create users, create sessions, or mutate links.
+ * `/link <token>` describes a safe Agor-side link-token verification intent.
+ * It does not trust usernames, create users, or create sessions.
  */
 export function parseTelegramCommandIntent(
   text: string,

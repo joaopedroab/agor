@@ -273,7 +273,10 @@ describe('user MCP tools in sessionless context', () => {
 });
 
 describe('user external identity MCP tools', () => {
-  function registerExternalIdentityHandlers(role: 'admin' | 'member' = 'admin') {
+  function registerExternalIdentityHandlers(
+    role: 'admin' | 'member' = 'admin',
+    overrides: { userId?: string } = {}
+  ) {
     const handlers = new Map<string, ToolHandler>();
     const configs = new Map<
       string,
@@ -293,14 +296,86 @@ describe('user external identity MCP tools', () => {
     registerUserTools(fakeServer, {
       app: { service: () => ({}) } as any,
       db: {} as any,
-      userId: 'caller-1' as any,
+      userId: (overrides.userId ?? 'caller-1') as any,
       sessionId: undefined,
-      authenticatedUser: { user_id: 'caller-1', email: 'caller@example.com', role } as any,
+      authenticatedUser: {
+        user_id: overrides.userId ?? 'caller-1',
+        email: 'caller@example.com',
+        role,
+      } as any,
       baseServiceParams: {},
     });
 
     return { handlers, configs };
   }
+
+  it('creates a self-service Telegram link token for the current user', async () => {
+    const createTokenSpy = vi
+      .spyOn(UsersRepository.prototype, 'createExternalIdentityLinkToken')
+      .mockResolvedValue({
+        token: 'raw-token-created-once',
+        token_id: 'token-1',
+        user_id: 'caller-1',
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        expires_at: '2026-07-09T12:15:00.000Z',
+      });
+    const { handlers } = registerExternalIdentityHandlers('member');
+    const handler = handlers.get('agor_users_telegram_link_token_create');
+    if (!handler) throw new Error('agor_users_telegram_link_token_create was not registered');
+
+    const parsed = JSON.parse((await handler({ ttlMinutes: 10 })).content[0].text);
+
+    expect(createTokenSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        intended_user_id: 'caller-1',
+        created_by_user_id: 'caller-1',
+      })
+    );
+    expect(parsed).toMatchObject({
+      status: 'created',
+      user_id: 'caller-1',
+      token: 'raw-token-created-once',
+      usage: '/link raw-token-created-once',
+    });
+    expect(JSON.stringify(parsed)).not.toContain('token_hash');
+  });
+
+  it('allows admins, but not members, to create Telegram link tokens for another user', async () => {
+    const createTokenSpy = vi
+      .spyOn(UsersRepository.prototype, 'createExternalIdentityLinkToken')
+      .mockResolvedValue({
+        token: 'target-token',
+        token_id: 'token-2',
+        user_id: 'target-user',
+        provider: 'telegram',
+        issuer: 'telegram',
+        purpose: 'telegram_dm_link',
+        expires_at: '2026-07-09T12:15:00.000Z',
+      });
+
+    const adminHandlers = registerExternalIdentityHandlers('admin').handlers;
+    await adminHandlers.get('agor_users_telegram_link_token_create')?.({
+      userId: 'target-user',
+    });
+    expect(createTokenSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        intended_user_id: 'target-user',
+        created_by_user_id: 'caller-1',
+      })
+    );
+
+    const memberHandlers = registerExternalIdentityHandlers('member').handlers;
+    await expect(
+      memberHandlers.get('agor_users_telegram_link_token_create')?.({
+        userId: 'target-user',
+      })
+    ).rejects.toThrow('Admin role required to create link tokens for another user.');
+  });
 
   it('lists external identity metadata without exposing the full lookup key', async () => {
     const listSpy = vi
@@ -494,8 +569,8 @@ describe('user external identity MCP tools', () => {
     expect(configs.get('agor_users_external_identity_link')?.description).toContain(
       'No provider calls happen'
     );
-    expect(configs.get('agor_users_external_identity_link')?.description).toContain(
-      'not a self-service /link token flow'
+    expect(configs.get('agor_users_telegram_link_token_create')?.description).toContain(
+      'short-lived single-use Telegram /link token'
     );
   });
 });
