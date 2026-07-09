@@ -76,6 +76,26 @@ function makeSlackChannel(): GatewayChannel {
   } as unknown as GatewayChannel;
 }
 
+function makeTelegramChannel(): GatewayChannel {
+  return {
+    id: 'telegram-channel-1',
+    name: 'Telegram DMs',
+    channel_type: 'telegram',
+    channel_key: 'telegram:dm',
+    target_branch_id: 'branch-1',
+    agor_user_id: 'user-1',
+    enabled: true,
+    config: {
+      bot_token: '••••••••',
+      enable_polling: true,
+      transport_disabled: false,
+      poll_interval_ms: 10_000,
+    },
+    agentic_config: { agent: 'claude-code' },
+    last_message_at: null,
+  } as unknown as GatewayChannel;
+}
+
 /**
  * Minimal AgorClient stub exposing only the services the table calls. Records
  * the `gateway-channels` create payload and the `gateway-channels/test` probe.
@@ -313,7 +333,11 @@ describe('GatewayChannelsTable Slack create wizard', () => {
  * edit Collapse keeps inactive panels mounted (`destroyOnHidden={false}`), but
  * children render lazily — call {@link expandPanel} to reveal a section's body.
  */
-function renderEditTable(client: AgorClient | null, channel: GatewayChannel) {
+function renderEditTable(
+  client: AgorClient | null,
+  channel: GatewayChannel,
+  onUpdate?: (channelId: string, updates: Partial<GatewayChannel>) => void
+) {
   const branch = makeBranch();
   const user = makeUser();
   renderWithProviders(
@@ -323,6 +347,7 @@ function renderEditTable(client: AgorClient | null, channel: GatewayChannel) {
       branchById={new Map([[branch.branch_id, branch]])}
       userById={new Map([[user.user_id, user]])}
       mcpServerById={new Map<string, MCPServer>()}
+      onUpdate={onUpdate}
     />
   );
   fireEvent.click(screen.getByTitle('Edit'));
@@ -521,5 +546,103 @@ describe('GatewayChannelsTable Teams create wizard', () => {
       agor_user_id: 'user-1',
       config: { app_id: 'app-123', tenant_id: 'tenant-123' },
     });
+  });
+});
+describe('GatewayChannelsTable Telegram configuration', () => {
+  function clickSwitchById(id: string) {
+    const element = document.querySelector(`#${id}`) as HTMLElement | null;
+    if (!element) throw new Error(`No switch with id ${id}`);
+    fireEvent.click(element);
+  }
+
+  async function advanceToTelegramSetup() {
+    clickButton(/Add Channel/);
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    fireEvent.click(screen.getByText('Telegram'));
+    fireEvent.change(screen.getByPlaceholderText('e.g., Team Slack, Personal Discord'), {
+      target: { value: 'My Telegram' },
+    });
+    fireEvent.change(screen.getByLabelText('branch-select'), { target: { value: 'branch-1' } });
+    fireEvent.change(screen.getByLabelText('user-select'), { target: { value: 'user-1' } });
+    clickButton(/^Continue$/);
+    await flush();
+  }
+
+  it('renders Telegram setup fields and creates the mapped config payload', async () => {
+    const { client, channelCreate } = makeClient();
+    renderTable(client);
+
+    await advanceToTelegramSetup();
+
+    expect(screen.getByText('Telegram private-DM MVP')).toBeInTheDocument();
+    expect(screen.getByText('Enable polling')).toBeInTheDocument();
+    expect(screen.getByText('Transport disabled')).toBeInTheDocument();
+    expect(screen.getByText('Poll interval (seconds)')).toBeInTheDocument();
+    expect(screen.getByText('No setup wizard or outbound replies')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText('123456:ABC-DEF...'), {
+      target: { value: 'telegram-token-placeholder' },
+    });
+    clickSwitchById('telegram_enable_polling');
+    clickSwitchById('telegram_transport_disabled');
+    fireEvent.change(document.querySelector('#telegram_poll_interval_s') as HTMLInputElement, {
+      target: { value: '20' },
+    });
+
+    clickButton(/Create channel/);
+    await flush();
+
+    await waitFor(() => expect(channelCreate).toHaveBeenCalledTimes(1));
+    expect(channelCreate.mock.calls[0][0]).toMatchObject({
+      channel_type: 'telegram',
+      name: 'My Telegram',
+      target_branch_id: 'branch-1',
+      agor_user_id: 'user-1',
+      config: {
+        bot_token: 'telegram-token-placeholder',
+        enable_polling: true,
+        transport_disabled: true,
+        poll_interval_ms: 20_000,
+      },
+    });
+  });
+
+  it('requires a bot token when creating an enabled Telegram channel', async () => {
+    const { client, channelCreate } = makeClient();
+    renderTable(client);
+
+    await advanceToTelegramSetup();
+    clickButton(/Create channel/);
+
+    await waitFor(() =>
+      expect(
+        screen.getAllByText('Bot token is required to create or enable a Telegram channel').length
+      ).toBeGreaterThan(0)
+    );
+    expect(channelCreate).not.toHaveBeenCalled();
+  });
+
+  it('keeps the stored Telegram bot token when the edit field is blank or redacted', async () => {
+    const onUpdate = vi.fn();
+    renderEditTable(null, makeTelegramChannel(), onUpdate);
+    expandPanel('Telegram Credentials');
+
+    expect(screen.getByText('Stored')).toBeInTheDocument();
+    const tokenInput = screen.getByPlaceholderText('••••••••') as HTMLInputElement;
+    fireEvent.change(tokenInput, { target: { value: '••••••••' } });
+
+    clickButton(/^Save$/);
+    await waitFor(() => expect(onUpdate).toHaveBeenCalledTimes(1));
+
+    expect(onUpdate.mock.calls[0][0]).toBe('telegram-channel-1');
+    expect(onUpdate.mock.calls[0][1]).toMatchObject({
+      channel_type: 'telegram',
+      config: {
+        enable_polling: true,
+        transport_disabled: false,
+        poll_interval_ms: 10_000,
+      },
+    });
+    expect(onUpdate.mock.calls[0][1].config).not.toHaveProperty('bot_token');
   });
 });

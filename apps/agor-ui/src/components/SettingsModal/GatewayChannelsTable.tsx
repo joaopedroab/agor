@@ -347,6 +347,7 @@ function createStepsForType(type: ChannelType): { title: string }[] {
         { title: 'Configure' },
       ];
     case 'teams':
+    case 'telegram':
       return [{ title: 'Channel' }, { title: 'Setup' }];
     default:
       return [{ title: 'Channel' }];
@@ -590,6 +591,12 @@ const SlackManifestPanel: React.FC<{ options: SlackWizardOptions }> = ({ options
 function isSecretStored(config: Record<string, unknown> | undefined, field: string): boolean {
   const value = config?.[field];
   return value === GATEWAY_REDACTED_SENTINEL || (typeof value === 'string' && value.length > 0);
+}
+
+function isNewSecretValue(value: unknown): value is string {
+  return (
+    typeof value === 'string' && value.trim().length > 0 && value !== GATEWAY_REDACTED_SENTINEL
+  );
 }
 
 /** Inline "Stored" / "Not set" badge for an edit-form secret field. */
@@ -1034,6 +1041,171 @@ const SlackSetupWizard: React.FC<{
   );
 };
 
+const TelegramSetupPanel: React.FC<{
+  mode: 'create' | 'edit';
+  botTokenStored: boolean;
+  selectedAgent: string;
+  onAgentChange: (agent: string) => void;
+  mcpServerById: Map<string, MCPServer>;
+}> = ({ mode, botTokenStored, selectedAgent, onAgentChange, mcpServerById }) => (
+  <Collapse
+    ghost
+    destroyOnHidden={false}
+    defaultActiveKey={mode === 'create' ? ['telegram-credentials', 'telegram-transport'] : []}
+    style={{ marginLeft: -16, marginRight: -16 }}
+    items={[
+      {
+        key: 'telegram-credentials',
+        label: (
+          <SectionLabel
+            icon={<KeyOutlined />}
+            title="Telegram Credentials"
+            subtitle={
+              mode === 'edit' ? 'blank keeps stored values' : 'bot token required when enabled'
+            }
+          />
+        ),
+        children: (
+          <>
+            <Alert
+              type="info"
+              showIcon
+              title="Telegram private-DM MVP"
+              description="Telegram supports private text DMs only. Users must be explicitly linked by numeric Telegram user ID. Polling is opt-in, Agor does not configure BotFather or webhooks, and outbound Telegram replies are disabled."
+              style={{ fontSize: 12, marginBottom: 16 }}
+            />
+            <Form.Item
+              label={
+                <span>
+                  Bot Token {mode === 'edit' && <SecretStatusTag stored={botTokenStored} />}
+                </span>
+              }
+              name="telegram_bot_token"
+              dependencies={['enabled']}
+              rules={[
+                ({ getFieldValue }) => ({
+                  validator: (_rule, value) => {
+                    const enabled = getFieldValue('enabled') !== false;
+                    if (enabled && !botTokenStored && !isNewSecretValue(value)) {
+                      return Promise.reject(
+                        new Error('Bot token is required to create or enable a Telegram channel')
+                      );
+                    }
+                    return Promise.resolve();
+                  },
+                }),
+              ]}
+              tooltip="Telegram Bot API token created outside Agor"
+              extra={
+                mode === 'edit' && botTokenStored
+                  ? 'A token is stored. Leave blank to keep it; enter a new value to overwrite it.'
+                  : 'Enabled Telegram channels require a bot token. Agor stores it as channel config.bot_token.'
+              }
+            >
+              <Input.Password placeholder={botTokenStored ? '••••••••' : '123456:ABC-DEF...'} />
+            </Form.Item>
+          </>
+        ),
+      },
+      {
+        key: 'telegram-transport',
+        label: <SectionLabel icon={<ToolOutlined />} title="Transport" subtitle="polling opt-in" />,
+        children: (
+          <>
+            <Form.Item
+              label="Enable polling"
+              name="telegram_enable_polling"
+              valuePropName="checked"
+              initialValue={false}
+              tooltip="When enabled, Agor polls Telegram Bot API getUpdates for private DMs."
+            >
+              <Switch />
+            </Form.Item>
+            <Form.Item
+              label="Transport disabled"
+              name="telegram_transport_disabled"
+              valuePropName="checked"
+              initialValue={false}
+              tooltip="Emergency kill switch. When on, Telegram polling is disabled even if Enable polling is on."
+            >
+              <Switch />
+            </Form.Item>
+            <Form.Item
+              label="Poll interval (seconds)"
+              name="telegram_poll_interval_s"
+              initialValue={10}
+              tooltip="How frequently to poll Telegram when polling is enabled."
+            >
+              <InputNumber min={1} max={300} style={{ width: '100%' }} />
+            </Form.Item>
+            <Alert
+              type="warning"
+              showIcon
+              title="No setup wizard or outbound replies"
+              description="This only saves local channel configuration. It does not create a Telegram bot, set webhooks, create link tokens, or enable outbound Telegram replies."
+              style={{ fontSize: 12 }}
+            />
+          </>
+        ),
+      },
+      {
+        key: 'agentic-tool-config',
+        label: (
+          <SectionLabel
+            icon={<ThunderboltOutlined />}
+            title="Agent Configuration"
+            subtitle={selectedAgent}
+          />
+        ),
+        children: (
+          <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              Configure which agent and settings to use for sessions created from this channel.
+            </Typography.Text>
+            <AgentSelectionGrid
+              agents={AVAILABLE_AGENTS}
+              selectedAgentId={selectedAgent}
+              onSelect={onAgentChange}
+              columns={2}
+              showHelperText={false}
+              showComparisonLink={false}
+            />
+            <AgenticToolConfigForm
+              agenticTool={selectedAgent as AgenticToolName}
+              mcpServerById={mcpServerById}
+              showHelpText={false}
+            />
+          </Space>
+        ),
+      },
+      {
+        key: 'env-vars',
+        label: (
+          <SectionLabel
+            icon={<LockOutlined />}
+            title="Environment Variables"
+            subtitle="channel-level secrets"
+          />
+        ),
+        children: (
+          <>
+            <Typography.Text
+              type="secondary"
+              style={{ fontSize: 12, display: 'block', marginBottom: 12 }}
+            >
+              Define environment variables for sessions created from this channel. Useful for
+              service account tokens or API keys for MCP servers.
+            </Typography.Text>
+            <Form.Item name="envVars" noStyle>
+              <GatewayEnvVarsEditor />
+            </Form.Item>
+          </>
+        ),
+      },
+    ]}
+  />
+);
+
 /** Shared form fields for create and edit modals */
 const ChannelFormFields: React.FC<{
   form: FormInstance;
@@ -1212,15 +1384,18 @@ const ChannelFormFields: React.FC<{
             <Switch />
           </Form.Item>
 
-          {channelType !== 'slack' && channelType !== 'github' && channelType !== 'teams' && (
-            <Alert
-              title={`${channelType.charAt(0).toUpperCase() + channelType.slice(1)} support coming soon`}
-              description="This platform integration is not yet available. Slack, GitHub, and Microsoft Teams are currently supported."
-              type="info"
-              showIcon
-              style={{ marginBottom: 16 }}
-            />
-          )}
+          {channelType !== 'slack' &&
+            channelType !== 'github' &&
+            channelType !== 'teams' &&
+            channelType !== 'telegram' && (
+              <Alert
+                title={`${channelType.charAt(0).toUpperCase() + channelType.slice(1)} support coming soon`}
+                description="This platform integration is not yet available. Slack, GitHub, Microsoft Teams, and Telegram private DMs are currently supported."
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+              />
+            )}
         </div>
 
         {/* ── GitHub App Setup (create steps + shared config collapse) ── */}
@@ -1823,6 +1998,17 @@ const ChannelFormFields: React.FC<{
                 ),
               },
             ]}
+          />
+        )}
+
+        {/* ── Telegram private-DM setup (create step 1, or the whole edit body) ── */}
+        {channelType === 'telegram' && (mode === 'edit' || createStep === 1) && (
+          <TelegramSetupPanel
+            mode={mode}
+            botTokenStored={botTokenStored}
+            selectedAgent={selectedAgent}
+            onAgentChange={onAgentChange}
+            mcpServerById={mcpServerById}
           />
         )}
 
@@ -2525,8 +2711,8 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       config.webhook_path = (values.teams_webhook_path as string) || '/api/messages';
       config.require_mention = values.teams_require_mention ?? true;
     } else if (values.channel_type === 'slack') {
-      if (values.bot_token) config.bot_token = values.bot_token;
-      if (values.app_token) config.app_token = values.app_token;
+      if (isNewSecretValue(values.bot_token)) config.bot_token = values.bot_token;
+      if (isNewSecretValue(values.app_token)) config.app_token = values.app_token;
       if (values.connection_mode) config.connection_mode = values.connection_mode;
 
       // Form has preserve={true}, so all values are available even from collapsed panels.
@@ -2538,6 +2724,11 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       config.allowed_channel_ids = values.allowed_channel_ids ?? [];
       config.outbound_enabled = values.outbound_enabled ?? false;
       config.default_outbound_target = values.default_outbound_target || null;
+    } else if (values.channel_type === 'telegram') {
+      if (isNewSecretValue(values.telegram_bot_token)) config.bot_token = values.telegram_bot_token;
+      config.enable_polling = values.telegram_enable_polling ?? false;
+      config.transport_disabled = values.telegram_transport_disabled ?? false;
+      config.poll_interval_ms = ((values.telegram_poll_interval_s as number) ?? 10) * 1000;
     }
 
     // Build agentic config from form values
@@ -2713,6 +2904,10 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       formValues.teams_webhook_port = (config?.webhook_port as number) ?? 3978;
       formValues.teams_webhook_path = (config?.webhook_path as string) || '/api/messages';
       formValues.teams_require_mention = config?.require_mention ?? true;
+    } else if (channel.channel_type === 'telegram') {
+      formValues.telegram_enable_polling = config?.enable_polling ?? false;
+      formValues.telegram_transport_disabled = config?.transport_disabled ?? false;
+      formValues.telegram_poll_interval_s = ((config?.poll_interval_ms as number) ?? 10000) / 1000;
     }
 
     editForm.setFieldsValue(formValues);

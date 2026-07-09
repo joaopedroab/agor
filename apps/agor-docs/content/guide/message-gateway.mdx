@@ -313,7 +313,7 @@ Follow-up messages in the same conversation continue the same session — the ag
 
 ## Telegram Private-DM MVP
 
-Telegram is available as a native Message Gateway channel for a narrow, safe MVP. It is disabled/no-op unless an admin creates an enabled `telegram` channel with a `bot_token` and explicitly sets `config.enable_polling: true`. The connector uses Telegram Bot API `getUpdates` polling only; it does not configure webhooks, call BotFather, or mutate Telegram provider settings.
+Telegram is available as a native Message Gateway channel for a narrow, safe MVP. It is disabled/no-op unless an admin creates an enabled `telegram` channel with a `bot_token` and explicitly sets `config.enable_polling: true`. The Settings UI exposes minimal local fields for the bot token, polling opt-in, transport kill switch, and poll interval; these fields do not configure webhooks, call BotFather, create link tokens, or mutate Telegram provider settings. The connector uses Telegram Bot API `getUpdates` polling only.
 
 Current capabilities and limits:
 
