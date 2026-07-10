@@ -11,7 +11,7 @@
  * generic field updates nuking the encrypted credential blob — stays fixed.
  */
 
-import type { UserID } from '@agor/core/types';
+import type { UserExternalIdentityLinkToken, UserID } from '@agor/core/types';
 import { and, eq } from 'drizzle-orm';
 import { beforeAll, describe, expect, vi } from 'vitest';
 import { jsonExtract, select, update } from '../database-wrapper';
@@ -473,7 +473,7 @@ describe('UsersRepository external identity links', () => {
           },
         ],
         external_identity_link_tokens: (staleData?.external_identity_link_tokens ?? []).map(
-          (candidate) =>
+          (candidate: UserExternalIdentityLinkToken) =>
             candidate.token_id === staleToken?.token_id
               ? {
                   ...candidate,

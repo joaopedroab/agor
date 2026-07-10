@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { getConnector, hasConnector } from '../connector-registry';
+import type { TelegramGetUpdatesRequest } from './telegram';
 import {
   decideTelegramInboundAuth,
   handleTelegramUpdate,
@@ -474,7 +475,7 @@ describe('TelegramConnector polling lifecycle', () => {
   });
 
   it('does not advance polling offset until the gateway callback resolves', async () => {
-    const getUpdates = vi.fn(async () => [
+    const getUpdates = vi.fn(async (_req: TelegramGetUpdatesRequest) => [
       {
         update_id: 1000,
         message: {

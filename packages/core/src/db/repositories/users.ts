@@ -654,7 +654,7 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
       if (existingMatches.length > 1) return { ok: false, reason: 'ambiguous_link' };
       if (existingMatches.length === 1) return { ok: false, reason: 'already_linked' };
 
-      const targetData = ((tokenRow.data ?? {}) as StoredUserData) ?? {};
+      const targetData = (tokenRow.data ?? {}) as StoredUserData;
       const externalIdentity: UserExternalIdentity = {
         key,
         provider: input.provider,
