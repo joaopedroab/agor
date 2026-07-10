@@ -6,7 +6,8 @@
  */
 
 import type { BranchID, UUID } from '@agor/core/types';
-import { describe, expect } from 'vitest';
+import { GATEWAY_REDACTED_SENTINEL } from '@agor/core/types';
+import { describe, expect, vi } from 'vitest';
 import { generateId } from '../../lib/ids';
 import type { Database } from '../client';
 import { dbTest } from '../test-helpers';
@@ -130,4 +131,147 @@ describe('GatewayChannelRepository', () => {
     expect(enabled.enabled).toBe(true);
     expect(enabled.config.bot_token).toBe('telegram-token-placeholder');
   });
+
+  dbTest(
+    'updateConfig sends only the config patch so concurrent config changes are not clobbered',
+    async ({ db }) => {
+      const branch = await seedBranch(db);
+      const repo = new GatewayChannelRepository(db);
+      const userId = generateId() as UUID;
+
+      const channel = await repo.create({
+        name: 'Telegram Enabled',
+        created_by: userId,
+        channel_type: 'telegram',
+        target_branch_id: branch.branch_id as UUID,
+        enabled: true,
+        config: {
+          bot_token: 'telegram-token-original',
+          enable_polling: true,
+        },
+      });
+
+      const realUpdate = repo.update.bind(repo);
+      let injectedConcurrentChange = false;
+      const updateSpy = vi.spyOn(repo, 'update').mockImplementation(async (id, updates) => {
+        if (!injectedConcurrentChange) {
+          injectedConcurrentChange = true;
+          await realUpdate(id, {
+            config: {
+              bot_token: 'telegram-token-rotated',
+              enable_polling: false,
+            },
+          });
+        }
+        return await realUpdate(id, updates);
+      });
+
+      const updated = await repo.updateConfig(channel.id, {
+        telegram_polling_state: {
+          last_processed_update_id: 456,
+          acknowledged_at: '2026-07-10T12:05:00.000Z',
+        },
+      });
+
+      expect(updateSpy).toHaveBeenLastCalledWith(channel.id, {
+        config: {
+          telegram_polling_state: {
+            last_processed_update_id: 456,
+            acknowledged_at: '2026-07-10T12:05:00.000Z',
+          },
+        },
+      });
+      expect(updated.config).toMatchObject({
+        bot_token: 'telegram-token-rotated',
+        enable_polling: false,
+        telegram_polling_state: {
+          last_processed_update_id: 456,
+          acknowledged_at: '2026-07-10T12:05:00.000Z',
+        },
+      });
+
+      updateSpy.mockRestore();
+    }
+  );
+
+  dbTest(
+    'updateConfig preserves existing secrets when concurrent clients hold redacted config values',
+    async ({ db }) => {
+      const branch = await seedBranch(db);
+      const repo = new GatewayChannelRepository(db);
+      const userId = generateId() as UUID;
+
+      const channel = await repo.create({
+        name: 'Telegram Enabled',
+        created_by: userId,
+        channel_type: 'telegram',
+        target_branch_id: branch.branch_id as UUID,
+        enabled: true,
+        config: {
+          bot_token: 'telegram-token-secret',
+          enable_polling: true,
+        },
+      });
+
+      await repo.update(channel.id, {
+        config: {
+          bot_token: GATEWAY_REDACTED_SENTINEL,
+          enable_polling: false,
+        },
+      });
+
+      const updated = await repo.updateConfig(channel.id, {
+        telegram_polling_state: {
+          last_processed_update_id: 789,
+          acknowledged_at: '2026-07-10T12:10:00.000Z',
+        },
+      });
+
+      expect(updated.config).toMatchObject({
+        bot_token: 'telegram-token-secret',
+        enable_polling: false,
+        telegram_polling_state: {
+          last_processed_update_id: 789,
+          acknowledged_at: '2026-07-10T12:10:00.000Z',
+        },
+      });
+    }
+  );
+
+  dbTest(
+    'updateConfig merges durable channel state without replacing Telegram credentials',
+    async ({ db }) => {
+      const branch = await seedBranch(db);
+      const repo = new GatewayChannelRepository(db);
+      const userId = generateId() as UUID;
+
+      const channel = await repo.create({
+        name: 'Telegram Enabled',
+        created_by: userId,
+        channel_type: 'telegram',
+        target_branch_id: branch.branch_id as UUID,
+        enabled: true,
+        config: {
+          bot_token: 'telegram-token-placeholder',
+          enable_polling: true,
+        },
+      });
+
+      const updated = await repo.updateConfig(channel.id, {
+        telegram_polling_state: {
+          last_processed_update_id: 123,
+          acknowledged_at: '2026-07-10T12:00:00.000Z',
+        },
+      });
+
+      expect(updated.config).toMatchObject({
+        bot_token: 'telegram-token-placeholder',
+        enable_polling: true,
+        telegram_polling_state: {
+          last_processed_update_id: 123,
+          acknowledged_at: '2026-07-10T12:00:00.000Z',
+        },
+      });
+    }
+  );
 });

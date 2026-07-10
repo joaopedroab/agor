@@ -150,6 +150,9 @@ export interface TelegramConfig {
   transport_disabled?: boolean;
   poll_interval_ms?: number;
   poll_timeout_seconds?: number;
+  telegram_polling_state?: {
+    last_processed_update_id?: unknown;
+  };
 }
 
 export interface TelegramGetUpdatesRequest {
@@ -490,6 +493,14 @@ function pollingTimeoutSeconds(value: unknown): number | undefined {
     : undefined;
 }
 
+function nonNegativeSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function lastProcessedTelegramUpdateId(config: TelegramConfig): number | undefined {
+  return nonNegativeSafeInteger(config.telegram_polling_state?.last_processed_update_id);
+}
+
 export function parseTelegramPrivateThreadId(threadId: string): string {
   const match = /^telegram:private:([1-9]\d*)$/.exec(threadId);
   if (!match) {
@@ -810,14 +821,8 @@ export function normalizeTelegramInboundUpdate(
   };
 }
 
-/**
- * Testable transport bridge from a raw Telegram update into the gateway inbound
- * callback. This owns only Telegram edge-shape normalization, non-secret audit
- * metadata, and an optional rate-limit seam; user auth remains in GatewayService.
- */
-export function handleTelegramUpdate(
+function buildTelegramTransportResult(
   update: unknown,
-  callback: (msg: InboundMessage) => void,
   opts: {
     transport?: 'polling' | 'webhook' | 'test';
     rateLimit?: (message: InboundMessage) => boolean;
@@ -843,6 +848,26 @@ export function handleTelegramUpdate(
     return { ok: false, reason: 'rate_limited' };
   }
 
+  return { ok: true, message };
+}
+
+/**
+ * Testable transport bridge from a raw Telegram update into the gateway inbound
+ * callback. This owns only Telegram edge-shape normalization, non-secret audit
+ * metadata, and an optional rate-limit seam; user auth remains in GatewayService.
+ */
+export function handleTelegramUpdate(
+  update: unknown,
+  callback: (msg: InboundMessage) => void | Promise<void>,
+  opts: {
+    transport?: 'polling' | 'webhook' | 'test';
+    rateLimit?: (message: InboundMessage) => boolean;
+    now?: () => Date;
+  } = {}
+): TelegramTransportResult {
+  const result = buildTelegramTransportResult(update, opts);
+  if (!result.ok) return result;
+  const { message } = result;
   callback(message);
   return { ok: true, message };
 }
@@ -995,6 +1020,9 @@ export class TelegramConnector implements GatewayConnector {
     this.clearIntervalFn = options.clearInterval ?? clearInterval;
     this.rateLimit = options.rateLimit;
     this.now = options.now;
+    const lastProcessedUpdateId = lastProcessedTelegramUpdateId(this.config);
+    this.nextOffset =
+      typeof lastProcessedUpdateId === 'number' ? lastProcessedUpdateId + 1 : undefined;
   }
 
   /**
@@ -1138,7 +1166,7 @@ export class TelegramConnector implements GatewayConnector {
     };
   }
 
-  async startListening(callback: (msg: InboundMessage) => void): Promise<void> {
+  async startListening(callback: (msg: InboundMessage) => void | Promise<void>): Promise<void> {
     if (this.config.transport_disabled === true) {
       console.log('[telegram] Polling disabled by transport kill switch');
       return;
@@ -1161,7 +1189,7 @@ export class TelegramConnector implements GatewayConnector {
     console.log(`[telegram] Polling listener started (interval: ${intervalMs}ms)`);
   }
 
-  async pollOnce(callback: (msg: InboundMessage) => void): Promise<void> {
+  async pollOnce(callback: (msg: InboundMessage) => void | Promise<void>): Promise<void> {
     if (this.polling) {
       console.warn('[telegram] Poll tick skipped (previous tick still running)');
       return;
@@ -1183,12 +1211,23 @@ export class TelegramConnector implements GatewayConnector {
       });
 
       for (const update of updates) {
-        handleTelegramUpdate(update, callback, {
+        const result = buildTelegramTransportResult(update, {
           transport: 'polling',
           rateLimit: this.rateLimit,
           now: this.now,
         });
         const updateId = getUpdateId(update);
+        if (result.ok) {
+          try {
+            await callback(result.message);
+          } catch (error) {
+            console.warn(
+              '[telegram] Poll update processing failed; update will be retried:',
+              sanitizeTelegramError(error, this.config.bot_token, [result.message.text])
+            );
+            break;
+          }
+        }
         if (typeof updateId === 'number') {
           this.nextOffset = updateId + 1;
         }
@@ -1196,7 +1235,7 @@ export class TelegramConnector implements GatewayConnector {
     } catch (error) {
       console.warn(
         '[telegram] Poll tick failed:',
-        error instanceof Error ? error.message : String(error)
+        sanitizeTelegramError(error, this.config.bot_token)
       );
     } finally {
       this.polling = false;

@@ -372,6 +372,23 @@ export class GatewayChannelRepository
   }
 
   /**
+   * Merge non-secret channel runtime/config metadata into the platform config blob.
+   *
+   * This is intentionally a shallow config patch: callers that maintain nested
+   * runtime state (for example a polling cursor) should pass the full nested
+   * value they own. Existing credentials are preserved by the normal update()
+   * credential-merge path.
+   */
+  async updateConfig(
+    id: GatewayChannelID | string,
+    configPatch: Record<string, unknown>
+  ): Promise<GatewayChannel> {
+    return this.update(id, {
+      config: configPatch,
+    });
+  }
+
+  /**
    * Delete gateway channel by ID
    */
   async delete(id: string): Promise<void> {

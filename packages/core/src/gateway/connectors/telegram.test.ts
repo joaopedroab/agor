@@ -452,6 +452,154 @@ describe('TelegramConnector polling lifecycle', () => {
     expect(deleteWebhook).not.toHaveBeenCalled();
   });
 
+  it('seeds polling offset from persisted channel state', async () => {
+    const getUpdates = vi.fn(async () => []);
+    const connector = new TelegramConnector(
+      {
+        bot_token: 'telegram-token',
+        enable_polling: true,
+        telegram_polling_state: {
+          last_processed_update_id: 1000,
+        },
+      },
+      { client: { getUpdates } }
+    );
+
+    await connector.pollOnce(vi.fn());
+
+    expect(getUpdates).toHaveBeenCalledWith({
+      botToken: 'telegram-token',
+      offset: 1001,
+    });
+  });
+
+  it('does not advance polling offset until the gateway callback resolves', async () => {
+    const getUpdates = vi.fn(async () => [
+      {
+        update_id: 1000,
+        message: {
+          message_id: 42,
+          date: 1_788_888_888,
+          chat: { id: 123456789, type: 'private' },
+          from: { id: 123456789, is_bot: false },
+          text: 'retry me',
+        },
+      },
+    ]);
+    const callback = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('temporary gateway failure'))
+      .mockResolvedValueOnce(undefined);
+    const connector = new TelegramConnector(
+      {
+        bot_token: 'telegram-token',
+        enable_polling: true,
+      },
+      { client: { getUpdates } }
+    );
+
+    await connector.pollOnce(callback);
+    await connector.pollOnce(callback);
+    await connector.pollOnce(callback);
+
+    expect(getUpdates.mock.calls[0][0]).toEqual({ botToken: 'telegram-token' });
+    expect(getUpdates.mock.calls[1][0]).toEqual({ botToken: 'telegram-token' });
+    expect(getUpdates.mock.calls[2][0]).toEqual({ botToken: 'telegram-token', offset: 1001 });
+    expect(callback).toHaveBeenCalledTimes(3);
+  });
+
+  it('redacts inbound polling text from callback failure logs', async () => {
+    const secretText = 'private payroll question from telegram';
+    const getUpdates = vi.fn(async () => [
+      {
+        update_id: 1000,
+        message: {
+          message_id: 42,
+          date: 1_788_888_888,
+          chat: { id: 123456789, type: 'private' },
+          from: { id: 123456789, is_bot: false },
+          text: secretText,
+        },
+      },
+    ]);
+    const callback = vi.fn(async () => {
+      throw new Error(`callback failed while handling ${secretText} telegram-token`);
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const connector = new TelegramConnector(
+      {
+        bot_token: 'telegram-token',
+        enable_polling: true,
+      },
+      { client: { getUpdates } }
+    );
+
+    let logged = '';
+    try {
+      await connector.pollOnce(callback);
+      logged = warnSpy.mock.calls.flat().join(' ');
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    expect(logged).toContain('[redacted-message]');
+    expect(logged).not.toContain(secretText);
+  });
+
+  it('redacts bot tokens from polling fetch failure logs without advancing the retry offset', async () => {
+    const botToken = '123456:SECRET_TOKEN';
+    const tokenBearingUrl = `https://api.telegram.org/bot${botToken}/getUpdates`;
+    const getUpdates = vi
+      .fn()
+      .mockRejectedValueOnce(new Error(`fetch failed for ${tokenBearingUrl}`))
+      .mockResolvedValueOnce([]);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const connector = new TelegramConnector(
+      {
+        bot_token: botToken,
+        enable_polling: true,
+      },
+      { client: { getUpdates } }
+    );
+
+    let logged = '';
+    try {
+      await connector.pollOnce(vi.fn());
+      logged = warnSpy.mock.calls.flat().join(' ');
+      await connector.pollOnce(vi.fn());
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    expect(logged).toContain('[telegram] Poll tick failed:');
+    expect(logged).toContain('[redacted-telegram-token]');
+    expect(logged).not.toContain(botToken);
+    expect(logged).not.toContain(tokenBearingUrl);
+    expect(getUpdates.mock.calls[0][0]).toEqual({ botToken });
+    expect(getUpdates.mock.calls[1][0]).toEqual({ botToken });
+  });
+
+  it('advances polling offset for terminal adapter-level ignored updates', async () => {
+    const getUpdates = vi
+      .fn()
+      .mockResolvedValueOnce([{ update_id: 1000, channel_post: { text: 'unsupported' } }])
+      .mockResolvedValueOnce([]);
+    const callback = vi.fn();
+    const connector = new TelegramConnector(
+      {
+        bot_token: 'telegram-token',
+        enable_polling: true,
+      },
+      { client: { getUpdates } }
+    );
+
+    await connector.pollOnce(callback);
+    await connector.pollOnce(callback);
+
+    expect(callback).not.toHaveBeenCalled();
+    expect(getUpdates.mock.calls[1][0]).toEqual({ botToken: 'telegram-token', offset: 1001 });
+  });
+
   it('does not poll disabled, kill-switched, or tokenless connector configs', async () => {
     const getUpdates = vi.fn(async () => []);
 

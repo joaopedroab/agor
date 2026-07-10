@@ -106,6 +106,89 @@ interface RouteMessageData {
   metadata?: Record<string, unknown>;
 }
 
+const TELEGRAM_POLLING_STATE_CONFIG_KEY = 'telegram_polling_state';
+const TELEGRAM_RECENT_PROCESSED_UPDATE_LIMIT = 20;
+
+type TelegramPollingInflightStatus = 'reserved' | 'side_effects_started' | 'side_effects_completed';
+
+interface TelegramPollingInflightUpdate {
+  update_id: number;
+  status: TelegramPollingInflightStatus;
+  updated_at: string;
+}
+
+interface TelegramPollingState {
+  last_processed_update_id?: unknown;
+  acknowledged_at?: unknown;
+  recent_processed_update_ids?: unknown;
+  inflight_update?: unknown;
+}
+
+function getTelegramUpdateIdFromMetadata(metadata?: Record<string, unknown>): number | undefined {
+  const updateId = metadata?.telegram_update_id;
+  return typeof updateId === 'number' && Number.isSafeInteger(updateId) && updateId >= 0
+    ? updateId
+    : undefined;
+}
+
+function telegramSafeUpdateId(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function asTelegramPollingState(channel: GatewayChannel): TelegramPollingState {
+  const state = (channel.config as Record<string, unknown>)[TELEGRAM_POLLING_STATE_CONFIG_KEY];
+  return state && typeof state === 'object' && !Array.isArray(state)
+    ? (state as TelegramPollingState)
+    : {};
+}
+
+function getTelegramLastProcessedUpdateId(channel: GatewayChannel): number | undefined {
+  return telegramSafeUpdateId(asTelegramPollingState(channel).last_processed_update_id);
+}
+
+function getTelegramRecentProcessedUpdateIds(channel: GatewayChannel): number[] {
+  const recent = asTelegramPollingState(channel).recent_processed_update_ids;
+  if (!Array.isArray(recent)) return [];
+  return recent.filter((value): value is number => telegramSafeUpdateId(value) === value);
+}
+
+function getTelegramInflightUpdate(
+  channel: GatewayChannel
+): TelegramPollingInflightUpdate | undefined {
+  const inflight = asTelegramPollingState(channel).inflight_update;
+  if (!inflight || typeof inflight !== 'object' || Array.isArray(inflight)) return undefined;
+  const updateId = telegramSafeUpdateId((inflight as Record<string, unknown>).update_id);
+  const status = (inflight as Record<string, unknown>).status;
+  const updatedAt = (inflight as Record<string, unknown>).updated_at;
+  if (
+    typeof updateId !== 'number' ||
+    (status !== 'reserved' &&
+      status !== 'side_effects_started' &&
+      status !== 'side_effects_completed') ||
+    typeof updatedAt !== 'string'
+  ) {
+    return undefined;
+  }
+  return { update_id: updateId, status, updated_at: updatedAt };
+}
+
+function hasTelegramProcessedUpdate(channel: GatewayChannel, updateId: number): boolean {
+  const lastProcessedUpdateId = getTelegramLastProcessedUpdateId(channel);
+  return (
+    (typeof lastProcessedUpdateId === 'number' && updateId <= lastProcessedUpdateId) ||
+    getTelegramRecentProcessedUpdateIds(channel).includes(updateId)
+  );
+}
+
+function appendTelegramRecentProcessedUpdateId(
+  channel: GatewayChannel,
+  updateId: number
+): number[] {
+  return [...new Set([...getTelegramRecentProcessedUpdateIds(channel), updateId])].slice(
+    -TELEGRAM_RECENT_PROCESSED_UPDATE_LIMIT
+  );
+}
+
 /**
  * Outbound routing response
  */
@@ -777,6 +860,122 @@ export class GatewayService {
       this.activeListeners.get(channel.id) ??
       getConnector(channel.channel_type as ChannelType, channel.config)
     );
+  }
+
+  private async getFreshChannelForDeliveryState(channel: GatewayChannel): Promise<GatewayChannel> {
+    return (await this.channelRepo.findById(channel.id)) ?? channel;
+  }
+
+  private async isTelegramUpdateAlreadyProcessed(
+    channel: GatewayChannel,
+    updateId: number
+  ): Promise<boolean> {
+    const freshChannel = await this.getFreshChannelForDeliveryState(channel);
+    return hasTelegramProcessedUpdate(freshChannel, updateId);
+  }
+
+  private async writeTelegramPollingState(
+    channel: GatewayChannel,
+    buildState: (freshChannel: GatewayChannel) => TelegramPollingState
+  ): Promise<GatewayChannel> {
+    const freshChannel = await this.getFreshChannelForDeliveryState(channel);
+    return await this.channelRepo.updateConfig(channel.id, {
+      [TELEGRAM_POLLING_STATE_CONFIG_KEY]: buildState(freshChannel),
+    });
+  }
+
+  private async reserveTelegramUpdate(
+    channel: GatewayChannel,
+    updateId: number
+  ): Promise<'reserved' | 'processed' | TelegramPollingInflightStatus> {
+    const freshChannel = await this.getFreshChannelForDeliveryState(channel);
+    if (hasTelegramProcessedUpdate(freshChannel, updateId)) {
+      return 'processed';
+    }
+
+    const inflight = getTelegramInflightUpdate(freshChannel);
+    if (inflight?.update_id === updateId) {
+      return inflight.status;
+    }
+
+    await this.channelRepo.updateConfig(channel.id, {
+      [TELEGRAM_POLLING_STATE_CONFIG_KEY]: {
+        ...asTelegramPollingState(freshChannel),
+        inflight_update: {
+          update_id: updateId,
+          status: 'reserved',
+          updated_at: new Date().toISOString(),
+        },
+      },
+    });
+    return 'reserved';
+  }
+
+  private async markTelegramUpdateSideEffectsStarted(
+    channel: GatewayChannel,
+    updateId: number
+  ): Promise<void> {
+    await this.writeTelegramPollingState(channel, (freshChannel) => ({
+      ...asTelegramPollingState(freshChannel),
+      inflight_update: {
+        update_id: updateId,
+        status: 'side_effects_started',
+        updated_at: new Date().toISOString(),
+      },
+    }));
+  }
+
+  private async markTelegramUpdateSideEffectsCompleted(
+    channel: GatewayChannel,
+    updateId: number
+  ): Promise<void> {
+    await this.writeTelegramPollingState(channel, (freshChannel) => ({
+      ...asTelegramPollingState(freshChannel),
+      inflight_update: {
+        update_id: updateId,
+        status: 'side_effects_completed',
+        updated_at: new Date().toISOString(),
+      },
+    }));
+  }
+
+  private async clearTelegramUpdateReservation(
+    channel: GatewayChannel,
+    updateId: number
+  ): Promise<void> {
+    await this.writeTelegramPollingState(channel, (freshChannel) => {
+      const state = { ...asTelegramPollingState(freshChannel) };
+      const inflight = getTelegramInflightUpdate(freshChannel);
+      if (inflight?.update_id === updateId) {
+        delete state.inflight_update;
+      }
+      return state;
+    });
+  }
+
+  private async acknowledgeTelegramUpdate(
+    channel: GatewayChannel,
+    updateId: number
+  ): Promise<void> {
+    await this.writeTelegramPollingState(channel, (freshChannel) => {
+      const state = { ...asTelegramPollingState(freshChannel) };
+      const lastProcessedUpdateId = getTelegramLastProcessedUpdateId(freshChannel);
+      state.last_processed_update_id =
+        typeof lastProcessedUpdateId === 'number'
+          ? Math.max(lastProcessedUpdateId, updateId)
+          : updateId;
+      state.acknowledged_at = new Date().toISOString();
+      state.recent_processed_update_ids = appendTelegramRecentProcessedUpdateId(
+        freshChannel,
+        updateId
+      );
+
+      const inflight = getTelegramInflightUpdate(freshChannel);
+      if (inflight?.update_id === updateId) {
+        delete state.inflight_update;
+      }
+      return state;
+    });
   }
 
   private async storeInboundAttachments(
@@ -2694,13 +2893,23 @@ export class GatewayService {
         });
       }
     } catch (error) {
-      console.error('[gateway] Failed to send prompt to session:', error);
-      this.sendSystemMessage(channel, data.thread_id, `Error sending prompt: ${error}`);
+      const redactedError = redactProviderErrorMessage(error, inboundText);
+      console.error(`[gateway] Failed to send prompt to session: ${redactedError}`);
+      this.sendSystemMessage(
+        channel,
+        data.thread_id,
+        channel.channel_type === 'telegram'
+          ? 'Agor could not process that message yet. It will be retried.'
+          : `Error sending prompt: ${redactedError}`
+      );
       this.updateProgressAfterCommit({
         session_id: sessionId,
         state: 'failed',
-        error_message: error instanceof Error ? error.message : String(error),
+        error_message: redactedError,
       });
+      if (channel.channel_type === 'telegram') {
+        throw new Error(redactedError);
+      }
     }
 
     return {
@@ -3018,13 +3227,18 @@ export class GatewayService {
           return; // Connector doesn't support listening
         }
 
-        const callback = (msg: InboundMessage) => {
-          this.handleListenerInboundMessage(channel, listenerTenantId, msg).catch((error) => {
+        const callback = async (msg: InboundMessage) => {
+          try {
+            await this.handleListenerInboundMessage(channel, listenerTenantId, msg);
+          } catch (error) {
+            const redactedError = redactProviderErrorMessage(error, msg.text);
             console.error(
-              `[gateway] Failed to process inbound message for channel ${channel.name}:`,
-              error
+              `[gateway] Failed to process inbound message for channel ${shortId(
+                channel.id
+              )}: ${redactedError}`
             );
-          });
+            throw new Error(redactedError);
+          }
         };
 
         await connector.startListening(callback);
@@ -3046,15 +3260,73 @@ export class GatewayService {
     }
 
     await runWithTenantDatabaseScope(this.db, tenantId, async () => {
-      await this.create({
-        channel_key: channel.channel_key,
-        thread_id: msg.threadId,
-        text: msg.text,
-        user_name: msg.userId,
-        attachments: msg.attachments,
-        attachmentRejection: msg.attachmentRejection,
-        metadata: msg.metadata,
-      });
+      const telegramUpdateId =
+        channel.channel_type === 'telegram'
+          ? getTelegramUpdateIdFromMetadata(msg.metadata)
+          : undefined;
+      if (typeof telegramUpdateId === 'number') {
+        if (await this.isTelegramUpdateAlreadyProcessed(channel, telegramUpdateId)) {
+          console.debug(
+            `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
+          );
+          return;
+        }
+
+        const reservationStatus = await this.reserveTelegramUpdate(channel, telegramUpdateId);
+        if (reservationStatus === 'processed') {
+          console.debug(
+            `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
+          );
+          return;
+        }
+        if (reservationStatus === 'side_effects_completed') {
+          console.warn(
+            `[gateway] Telegram update ${telegramUpdateId} replay reached channel ${shortId(
+              channel.id
+            )} after side effects completed; finalizing durable acknowledgement without repeating side effects`
+          );
+          await this.acknowledgeTelegramUpdate(channel, telegramUpdateId);
+          return;
+        }
+        if (reservationStatus === 'side_effects_started') {
+          throw new Error(
+            `Telegram update ${telegramUpdateId} for channel ${shortId(
+              channel.id
+            )} has ambiguous processing state; refusing to acknowledge without replay`
+          );
+        }
+
+        await this.markTelegramUpdateSideEffectsStarted(channel, telegramUpdateId);
+      }
+
+      try {
+        await this.create({
+          channel_key: channel.channel_key,
+          thread_id: msg.threadId,
+          text: msg.text,
+          user_name: msg.userId,
+          attachments: msg.attachments,
+          attachmentRejection: msg.attachmentRejection,
+          metadata: msg.metadata,
+        });
+      } catch (error) {
+        if (typeof telegramUpdateId === 'number') {
+          try {
+            await this.clearTelegramUpdateReservation(channel, telegramUpdateId);
+          } catch (clearError) {
+            console.warn(
+              `[gateway] Failed to clear Telegram update ${telegramUpdateId} reservation after processing error:`,
+              redactProviderErrorMessage(clearError)
+            );
+          }
+        }
+        throw error;
+      }
+
+      if (typeof telegramUpdateId === 'number') {
+        await this.markTelegramUpdateSideEffectsCompleted(channel, telegramUpdateId);
+        await this.acknowledgeTelegramUpdate(channel, telegramUpdateId);
+      }
     });
   }
 

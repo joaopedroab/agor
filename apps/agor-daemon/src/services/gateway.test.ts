@@ -66,8 +66,13 @@ function makeGatewayHarness(args: {
   alignmentUser?: User | null;
   consumeLinkTokenResult?: unknown;
   sessionUrl?: string | null;
+  updateConfig?: (
+    id: string,
+    configPatch: Record<string, unknown>,
+    currentChannel: GatewayChannel
+  ) => Promise<GatewayChannel>;
 }) {
-  const channel = args.channel ?? slackChannel;
+  let channel = args.channel ?? slackChannel;
   let mapping = args.existingMapping ?? null;
   const promptCreate = vi.fn(async () => ({
     task_id: 'task-1',
@@ -98,11 +103,26 @@ function makeGatewayHarness(args: {
       throw new Error(`Unexpected service: ${name}`);
     },
   };
-  const service = new GatewayService(args.db ?? ({} as TenantScopeAwareDatabase), app as never);
+  const service = new GatewayService(
+    args.db ?? ({ run: vi.fn() } as unknown as TenantScopeAwareDatabase),
+    app as never
+  );
   const channelRepo = {
     findByKey: vi.fn(async () => channel),
     findById: vi.fn(async () => channel),
     updateLastMessage: vi.fn(async () => undefined),
+    updateConfig: vi.fn(async (id: string, configPatch: Record<string, unknown>) => {
+      channel = args.updateConfig
+        ? await args.updateConfig(id, configPatch, channel)
+        : ({
+            ...channel,
+            config: {
+              ...channel.config,
+              ...configPatch,
+            },
+          } as GatewayChannel);
+      return channel;
+    }),
   };
   const threadMapRepo = {
     findByChannelAndThread: vi.fn(async () => mapping),
@@ -495,6 +515,39 @@ describe('GatewayService Telegram alignment', () => {
     email: 'telegram-user@example.com',
     name: 'Telegram User',
   } as unknown as User;
+
+  function handleTelegramListenerMessage(
+    service: GatewayService,
+    channel: GatewayChannel,
+    updateId: number,
+    text = 'hello from telegram'
+  ): Promise<void> {
+    return (
+      service as unknown as {
+        handleListenerInboundMessage: (
+          channel: GatewayChannel,
+          tenantId: string,
+          msg: {
+            threadId: string;
+            text: string;
+            userId: string;
+            timestamp: string;
+            metadata: Record<string, unknown>;
+          }
+        ) => Promise<void>;
+      }
+    ).handleListenerInboundMessage(channel, 'default', {
+      threadId: 'telegram:private:123456789',
+      text,
+      userId: '123456789',
+      timestamp: '2026-07-10T12:00:00.000Z',
+      metadata: {
+        telegram_update_id: updateId,
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+  }
 
   it('creates a session as the explicitly linked Telegram user', async () => {
     const { service, sessionsCreate, threadMapRepo } = makeGatewayHarness({
@@ -931,6 +984,270 @@ describe('GatewayService Telegram alignment', () => {
     expect(sendMessage.mock.calls.map((call) => call[0].text).join('\n')).not.toContain(
       'Mention received'
     );
+  });
+
+  it('acknowledges Telegram polling updates only after successful gateway processing', async () => {
+    const { service, promptCreate, channelRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+    });
+    let releasePrompt: (() => void) | undefined;
+    const promptStarted = new Promise<void>((resolve) => {
+      const promptCanFinish = new Promise<void>((finish) => {
+        releasePrompt = finish;
+      });
+      promptCreate.mockImplementationOnce(async () => {
+        expect(channelRepo.updateConfig).toHaveBeenCalledWith('chan-telegram', {
+          telegram_polling_state: expect.objectContaining({
+            inflight_update: expect.objectContaining({
+              update_id: 1000,
+              status: 'side_effects_started',
+            }),
+          }),
+        });
+        expect(channelRepo.updateConfig).not.toHaveBeenCalledWith('chan-telegram', {
+          telegram_polling_state: expect.objectContaining({
+            last_processed_update_id: 1000,
+          }),
+        });
+        resolve();
+        await promptCanFinish;
+        return {
+          task_id: 'task-1',
+          session_id: 'sess-new',
+          status: 'running',
+        };
+      });
+    });
+
+    const handlePromise = (
+      service as unknown as {
+        handleListenerInboundMessage: (
+          channel: GatewayChannel,
+          tenantId: string,
+          msg: {
+            threadId: string;
+            text: string;
+            userId: string;
+            timestamp: string;
+            metadata: Record<string, unknown>;
+          }
+        ) => Promise<void>;
+      }
+    ).handleListenerInboundMessage(telegramChannel, 'default', {
+      threadId: 'telegram:private:123456789',
+      text: 'hello from telegram',
+      userId: '123456789',
+      timestamp: '2026-07-10T12:00:00.000Z',
+      metadata: {
+        telegram_update_id: 1000,
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    await promptStarted;
+    expect(channelRepo.updateConfig).not.toHaveBeenCalledWith('chan-telegram', {
+      telegram_polling_state: expect.objectContaining({
+        last_processed_update_id: 1000,
+      }),
+    });
+    releasePrompt?.();
+    await handlePromise;
+    expect(channelRepo.updateConfig).toHaveBeenCalledWith('chan-telegram', {
+      telegram_polling_state: expect.objectContaining({
+        last_processed_update_id: 1000,
+      }),
+    });
+  });
+
+  it('does not process already acknowledged Telegram polling updates after service recreation', async () => {
+    const restartedTelegramChannel = {
+      ...telegramChannel,
+      config: {
+        ...telegramChannel.config,
+        telegram_polling_state: {
+          last_processed_update_id: 1000,
+          acknowledged_at: '2026-07-10T12:00:00.000Z',
+        },
+      },
+    } as GatewayChannel;
+    const { service, sessionsCreate, promptCreate, channelRepo } = makeGatewayHarness({
+      channel: restartedTelegramChannel,
+      externalIdentityUser: telegramUser,
+    });
+
+    await handleTelegramListenerMessage(service, restartedTelegramChannel, 1000);
+
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+    expect(channelRepo.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it('leaves failed Telegram polling processing unacknowledged so it can retry', async () => {
+    const { service, promptCreate, channelRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+    });
+    promptCreate
+      .mockRejectedValueOnce(new Error('temporary prompt failure with telegram-token'))
+      .mockResolvedValueOnce({
+        task_id: 'task-2',
+        session_id: 'sess-new',
+        status: 'running',
+      });
+
+    await expect(handleTelegramListenerMessage(service, telegramChannel, 1000)).rejects.toThrow(
+      'temporary prompt failure'
+    );
+    expect(channelRepo.updateConfig).not.toHaveBeenCalledWith('chan-telegram', {
+      telegram_polling_state: expect.objectContaining({
+        last_processed_update_id: 1000,
+      }),
+    });
+
+    await handleTelegramListenerMessage(service, telegramChannel, 1000);
+    expect(promptCreate).toHaveBeenCalledTimes(2);
+    expect(channelRepo.updateConfig).toHaveBeenCalledWith('chan-telegram', {
+      telegram_polling_state: expect.objectContaining({
+        last_processed_update_id: 1000,
+      }),
+    });
+  });
+
+  it('does not replay-acknowledge a failed Telegram update when reservation cleanup fails', async () => {
+    let failReservationCleanup = true;
+    const { service, sessionsCreate, promptCreate, channelRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      updateConfig: async (_id, configPatch, currentChannel) => {
+        const pollingState = configPatch.telegram_polling_state as
+          | Record<string, unknown>
+          | undefined;
+        if (
+          failReservationCleanup &&
+          pollingState &&
+          !('inflight_update' in pollingState) &&
+          !('last_processed_update_id' in pollingState)
+        ) {
+          failReservationCleanup = false;
+          throw new Error('cleanup config write failure');
+        }
+        return {
+          ...currentChannel,
+          config: {
+            ...currentChannel.config,
+            ...configPatch,
+          },
+        } as GatewayChannel;
+      },
+    });
+    promptCreate.mockRejectedValueOnce(new Error('temporary prompt failure'));
+
+    await expect(handleTelegramListenerMessage(service, telegramChannel, 1000)).rejects.toThrow(
+      'temporary prompt failure'
+    );
+    expect(promptCreate).toHaveBeenCalledTimes(1);
+
+    await expect(handleTelegramListenerMessage(service, telegramChannel, 1000)).rejects.toThrow(
+      'ambiguous processing state'
+    );
+
+    expect(promptCreate).toHaveBeenCalledTimes(1);
+    expect(sessionsCreate).toHaveBeenCalledTimes(1);
+    expect(
+      channelRepo.updateConfig.mock.calls.some(([, configPatch]) => {
+        const pollingState = configPatch.telegram_polling_state as
+          | Record<string, unknown>
+          | undefined;
+        return pollingState?.last_processed_update_id === 1000;
+      })
+    ).toBe(false);
+  });
+
+  it('does not duplicate Telegram side effects when final durable acknowledgement write fails and the update replays', async () => {
+    let failNextProcessedAck = true;
+    const { service, sessionsCreate, promptCreate, channelRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      updateConfig: async (_id, configPatch, currentChannel) => {
+        const pollingState = configPatch.telegram_polling_state as
+          | Record<string, unknown>
+          | undefined;
+        if (pollingState?.last_processed_update_id === 1000 && failNextProcessedAck) {
+          failNextProcessedAck = false;
+          throw new Error('temporary config write failure');
+        }
+        return {
+          ...currentChannel,
+          config: {
+            ...currentChannel.config,
+            ...configPatch,
+          },
+        } as GatewayChannel;
+      },
+    });
+
+    await expect(handleTelegramListenerMessage(service, telegramChannel, 1000)).rejects.toThrow(
+      'temporary config write failure'
+    );
+    expect(sessionsCreate).toHaveBeenCalledTimes(1);
+    expect(promptCreate).toHaveBeenCalledTimes(1);
+
+    await handleTelegramListenerMessage(service, telegramChannel, 1000);
+
+    expect(sessionsCreate).toHaveBeenCalledTimes(1);
+    expect(promptCreate).toHaveBeenCalledTimes(1);
+    expect(channelRepo.updateConfig).toHaveBeenLastCalledWith('chan-telegram', {
+      telegram_polling_state: expect.objectContaining({
+        last_processed_update_id: 1000,
+        recent_processed_update_ids: expect.arrayContaining([1000]),
+      }),
+    });
+  });
+
+  it('redacts Telegram inbound text from retryable listener processing errors', async () => {
+    const secretText = 'please summarize confidential payroll notes';
+    const { service, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+    });
+    promptCreate.mockRejectedValueOnce(new Error(`failed while handling: ${secretText}`));
+
+    let thrown: unknown;
+    try {
+      await handleTelegramListenerMessage(service, telegramChannel, 1000, secretText);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain('[redacted-message]');
+    expect((thrown as Error).message).not.toContain(secretText);
+  });
+
+  it('acknowledges terminal Telegram polling rejections so they do not loop forever', async () => {
+    const sendMessage = vi.fn(async () => 'new-rejected-message-1');
+    const { service, sessionsCreate, promptCreate, channelRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUsers: [],
+      connector: { sendMessage },
+    });
+
+    await handleTelegramListenerMessage(service, telegramChannel, 1000, '/new fresh prompt please');
+
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('/link <token>'),
+      })
+    );
+    expect(channelRepo.updateConfig).toHaveBeenCalledWith('chan-telegram', {
+      telegram_polling_state: expect.objectContaining({
+        last_processed_update_id: 1000,
+      }),
+    });
   });
 
   it('/new without a prompt clears the current Telegram mapping and waits for the next message', async () => {
