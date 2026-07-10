@@ -22,6 +22,8 @@ export const TELEGRAM_EXTERNAL_IDENTITY_PROVIDER = 'telegram';
 export const TELEGRAM_EXTERNAL_IDENTITY_ISSUER = 'telegram';
 
 const TELEGRAM_LINK_COMMAND = 'link';
+const TELEGRAM_NEW_COMMAND = 'new';
+const TELEGRAM_HELP_COMMAND = 'help';
 const TELEGRAM_LINK_TOKEN_PATTERN = /^[A-Za-z0-9_-]{8,256}$/;
 const TELEGRAM_HTML_PARSE_MODE = 'HTML';
 const TELEGRAM_MESSAGE_MAX_CHARS = 4096;
@@ -135,9 +137,11 @@ export type TelegramInboundAuthDecision = TelegramInboundAuthSuccess | TelegramI
 
 export type TelegramCommandIntent =
   | { kind: 'regular_message' }
+  | { kind: 'help' }
   | { kind: 'link_help' }
   | { kind: 'link_token'; token: string; telegramUserId: string }
   | { kind: 'invalid_link_token'; reason: 'missing_numeric_sender_id' | 'invalid_token' }
+  | { kind: 'new_session'; prompt?: string }
   | { kind: 'unsupported_command'; command: string };
 
 export interface TelegramConfig {
@@ -433,6 +437,13 @@ export function parseTelegramCommandIntent(
 
   const [rawCommand = '', ...rest] = trimmed.split(/\s+/);
   const command = rawCommand.slice(1).split('@')[0].toLowerCase();
+  if (command === TELEGRAM_HELP_COMMAND) {
+    return { kind: 'help' };
+  }
+  if (command === TELEGRAM_NEW_COMMAND) {
+    const prompt = rest.join(' ').trim();
+    return prompt ? { kind: 'new_session', prompt } : { kind: 'new_session' };
+  }
   if (command !== TELEGRAM_LINK_COMMAND) {
     return { kind: 'unsupported_command', command };
   }

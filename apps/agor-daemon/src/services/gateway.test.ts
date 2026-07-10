@@ -65,6 +65,7 @@ function makeGatewayHarness(args: {
   externalIdentityUsers?: User[];
   alignmentUser?: User | null;
   consumeLinkTokenResult?: unknown;
+  sessionUrl?: string | null;
 }) {
   const channel = args.channel ?? slackChannel;
   let mapping = args.existingMapping ?? null;
@@ -87,7 +88,11 @@ function makeGatewayHarness(args: {
           ),
         };
       if (name === 'sessions') {
-        return { create: sessionsCreate, setMCPServers: vi.fn(async () => undefined) };
+        return {
+          create: sessionsCreate,
+          get: vi.fn(async (id: string) => ({ session_id: id, url: args.sessionUrl ?? null })),
+          setMCPServers: vi.fn(async () => undefined),
+        };
       }
       if (name === '/sessions/:id/prompt') return { create: promptCreate };
       throw new Error(`Unexpected service: ${name}`);
@@ -109,6 +114,9 @@ function makeGatewayHarness(args: {
       if (mapping) mapping = { ...mapping, metadata } as ThreadSessionMap;
     }),
     findById: vi.fn(async () => mapping),
+    delete: vi.fn(async () => {
+      mapping = null;
+    }),
     create: vi.fn(async (data: Partial<ThreadSessionMap>) => {
       mapping = makeMapping({
         ...data,
@@ -845,6 +853,256 @@ describe('GatewayService Telegram alignment', () => {
         created_by: 'telegram-user-1',
       })
     );
+  });
+
+  it('/help sends concise Telegram command help and does not create or prompt a session', async () => {
+    const sendMessage = vi.fn(async () => 'help-message-1');
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/help',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('/link <token>'),
+      })
+    );
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('/new'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('routes regular Telegram follow-up messages to the current mapping without noisy routing text', async () => {
+    const sendMessage = vi.fn(async () => 'system-message-1');
+    const mapping = makeMapping({
+      id: 'map-telegram',
+      channel_id: 'chan-telegram',
+      thread_id: 'telegram:private:123456789',
+      session_id: 'sess-current',
+      branch_id: telegramChannel.target_branch_id,
+      metadata: {
+        telegram_user_id: '123456789',
+      },
+    });
+    const { service, sessionsCreate, promptCreate, threadMapRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      existingMapping: mapping,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+      sessionUrl: 'http://localhost:3030/ui/s/sess-current',
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: 'continue this session',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: true, sessionId: 'sess-current', created: false });
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: expect.stringContaining('continue this session'),
+        messageSource: 'gateway',
+      }),
+      expect.objectContaining({ route: { id: 'sess-current' } })
+    );
+    expect(threadMapRepo.updateLastMessage).toHaveBeenCalledWith('map-telegram');
+    expect(sendMessage.mock.calls.map((call) => call[0].text).join('\n')).not.toContain(
+      'Mention received'
+    );
+  });
+
+  it('/new without a prompt clears the current Telegram mapping and waits for the next message', async () => {
+    const sendMessage = vi.fn(async () => 'reset-message-1');
+    const mapping = makeMapping({
+      id: 'map-telegram',
+      channel_id: 'chan-telegram',
+      thread_id: 'telegram:private:123456789',
+      session_id: 'sess-current',
+      branch_id: telegramChannel.target_branch_id,
+    });
+    const { service, sessionsCreate, promptCreate, threadMapRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      existingMapping: mapping,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/new',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(threadMapRepo.delete).toHaveBeenCalledWith('map-telegram');
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('next message'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('/new with a prompt clears the old mapping, creates a fresh session, and routes that prompt', async () => {
+    const sendMessage = vi.fn(async () => 'new-message-1');
+    const mapping = makeMapping({
+      id: 'map-telegram',
+      channel_id: 'chan-telegram',
+      thread_id: 'telegram:private:123456789',
+      session_id: 'sess-current',
+      branch_id: telegramChannel.target_branch_id,
+    });
+    const { service, sessionsCreate, promptCreate, threadMapRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      existingMapping: mapping,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/new fresh prompt please',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: true, sessionId: 'sess-new', created: true });
+    expect(threadMapRepo.delete).toHaveBeenCalledWith('map-telegram');
+    expect(sessionsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'fresh prompt please',
+        description: 'fresh prompt please',
+        created_by: 'telegram-user-1',
+      })
+    );
+    expect(threadMapRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel_id: 'chan-telegram',
+        thread_id: 'telegram:private:123456789',
+        session_id: 'sess-new',
+      })
+    );
+    const prompt = promptCreate.mock.calls[0][0].prompt as string;
+    expect(prompt).toContain('fresh prompt please');
+    expect(prompt).not.toContain('/new fresh prompt please');
+    expect(promptCreate.mock.calls[0][1]).toMatchObject({ route: { id: 'sess-new' } });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('Starting a fresh Agor session'),
+      })
+    );
+  });
+
+  it('does not let unlinked Telegram users use /new to bypass explicit linking', async () => {
+    const sendMessage = vi.fn(async () => 'new-rejected-message-1');
+    const { service, sessionsCreate, promptCreate, threadMapRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUsers: [],
+      connector: { sendMessage },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/new fresh prompt please',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('/link <token>'),
+      })
+    );
+    expect(threadMapRepo.delete).not.toHaveBeenCalled();
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('rejects Telegram /new outside private DM thread ids before creating sessions', async () => {
+    const sendMessage = vi.fn(async () => 'should-not-send');
+    const { service, sessionsCreate, promptCreate, threadMapRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:group:123456789',
+      text: '/new fresh prompt please',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(threadMapRepo.delete).not.toHaveBeenCalled();
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
+  });
+
+  it('replies to unsupported Telegram slash commands without creating or prompting a session', async () => {
+    const sendMessage = vi.fn(async () => 'unsupported-message-1');
+    const { service, sessionsCreate, promptCreate } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
+      connector: { sendMessage },
+    });
+
+    const result = await service.create({
+      channel_key: 'telegram-key',
+      thread_id: 'telegram:private:123456789',
+      text: '/start',
+      metadata: {
+        telegram_user_id: '123456789',
+        telegram_external_subject: '123456789',
+      },
+    });
+
+    expect(result).toEqual({ success: false, sessionId: '', created: false });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('Unsupported Telegram command'),
+      })
+    );
+    expect(sessionsCreate).not.toHaveBeenCalled();
+    expect(promptCreate).not.toHaveBeenCalled();
   });
 
   it('/link invalid or reused token rejects and does not create a session', async () => {

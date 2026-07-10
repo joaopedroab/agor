@@ -283,6 +283,20 @@ describe('Telegram explicit link/auth helpers', () => {
 });
 
 describe('Telegram command/link boundary', () => {
+  it('parses /help without mutating or requiring identity', () => {
+    expect(parseTelegramCommandIntent('/help')).toEqual({ kind: 'help' });
+    expect(parseTelegramCommandIntent('/help@AgorBot anything else')).toEqual({ kind: 'help' });
+  });
+
+  it('parses /new reset and /new initial prompt intents', () => {
+    expect(parseTelegramCommandIntent('/new')).toEqual({ kind: 'new_session' });
+    expect(parseTelegramCommandIntent('/new@AgorBot')).toEqual({ kind: 'new_session' });
+    expect(parseTelegramCommandIntent('/new please start fresh')).toEqual({
+      kind: 'new_session',
+      prompt: 'please start fresh',
+    });
+  });
+
   it('parses /link help without mutating or requiring identity', () => {
     expect(parseTelegramCommandIntent('/link')).toEqual({ kind: 'link_help' });
     expect(parseTelegramCommandIntent('/link@AgorBot')).toEqual({ kind: 'link_help' });
@@ -305,9 +319,9 @@ describe('Telegram command/link boundary', () => {
       kind: 'invalid_link_token',
       reason: 'invalid_token',
     });
-    expect(parseTelegramCommandIntent('/new please')).toEqual({
+    expect(parseTelegramCommandIntent('/unknown please')).toEqual({
       kind: 'unsupported_command',
-      command: 'new',
+      command: 'unknown',
     });
     expect(parseTelegramCommandIntent('regular prompt')).toEqual({ kind: 'regular_message' });
   });

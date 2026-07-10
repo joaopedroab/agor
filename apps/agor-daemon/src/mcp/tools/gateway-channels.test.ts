@@ -206,6 +206,7 @@ describe('agor_gateway_channels MCP tools', () => {
     expect(serialized).not.toContain('raw-channel-key');
     expect(serialized).toContain('explicit-link-only');
     expect(serialized).toContain('agor_users_telegram_link_token_create');
+    expect(serialized).toContain('/new clears the current DM session mapping');
     expect(serialized).toContain('disabled/no-op unless');
     expect(serialized).toContain(
       'supports local /link token verification, rich markdown replies with safe plain-text fallback, and inbound document/photo attachments'

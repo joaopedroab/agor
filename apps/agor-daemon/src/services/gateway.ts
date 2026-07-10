@@ -42,6 +42,7 @@ import {
   normalizeOutbound,
   parseGitHubThreadId,
   parseTelegramCommandIntent,
+  parseTelegramPrivateThreadId,
   TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
   TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
   telegramExternalIdentityRef,
@@ -1721,20 +1722,47 @@ export class GatewayService {
       throw new Error('Channel is disabled');
     }
 
-    // Telegram command boundary for the explicit-link-only MVP. Commands such as
-    // `/link` are reserved for explicit account-link flows and must not create
-    // or prompt sessions merely because the sender is already linked.
+    let inboundText = data.text;
+    const telegramCommand =
+      channel.channel_type === 'telegram'
+        ? parseTelegramCommandIntent(
+            data.text,
+            data.metadata?.telegram_external_subject ?? data.metadata?.telegram_user_id
+          )
+        : null;
+
     if (channel.channel_type === 'telegram') {
-      const telegramCommand = parseTelegramCommandIntent(
-        data.text,
-        data.metadata?.telegram_external_subject ?? data.metadata?.telegram_user_id
-      );
-      if (telegramCommand.kind !== 'regular_message') {
+      try {
+        parseTelegramPrivateThreadId(data.thread_id);
+      } catch {
+        console.log(
+          `[gateway] Telegram message rejected before session routing: unsupported thread id ${data.thread_id}`
+        );
+        return {
+          success: false,
+          sessionId: '',
+          created: false,
+        };
+      }
+    }
+
+    // Telegram command boundary for the explicit-link-only MVP. Commands such as
+    // `/link` and `/help` are reserved for safe local help/link flows and must
+    // not create or prompt sessions merely because the sender is already linked.
+    // `/new` is handled later, after explicit numeric Telegram user auth.
+    if (telegramCommand && telegramCommand.kind !== 'regular_message') {
+      if (telegramCommand.kind !== 'new_session') {
         if (telegramCommand.kind === 'link_help') {
           this.sendSystemMessage(
             channel,
             data.thread_id,
-            'To link this Telegram DM to Agor, create a Telegram link token in Agor, then send `/link <token>` here. Tokens expire quickly and can only be used once.'
+            'To link this Telegram DM to Agor, create a Telegram link token in Agor, then send `/link <token>` here. Tokens expire quickly and can only be used once. After linking, use `/new` to reset this DM to a fresh session.'
+          );
+        } else if (telegramCommand.kind === 'help') {
+          this.sendSystemMessage(
+            channel,
+            data.thread_id,
+            'Telegram commands: `/link <token>` links this private DM to your Agor user. `/new` resets this DM so the next message starts a fresh session. `/new <prompt>` starts a fresh session with that prompt.'
           );
         } else if (telegramCommand.kind === 'link_token') {
           const username =
@@ -1778,6 +1806,12 @@ export class GatewayService {
             channel,
             data.thread_id,
             'Link failed. Use `/link <token>` with the token created in Agor. Tokens expire quickly and can only be used once.'
+          );
+        } else if (telegramCommand.kind === 'unsupported_command') {
+          this.sendSystemMessage(
+            channel,
+            data.thread_id,
+            'Unsupported Telegram command. Use `/help` for supported commands: `/link` and `/new`.'
           );
         }
         console.log(
@@ -1952,6 +1986,13 @@ export class GatewayService {
         console.log(
           `[gateway] Telegram user alignment failed: missing numeric Telegram sender id (thread=${data.thread_id})`
         );
+        if (telegramCommand?.kind === 'new_session') {
+          this.sendSystemMessage(
+            channel,
+            data.thread_id,
+            'Cannot start a new Agor session from this Telegram message. Link a private DM first with `/link <token>`.'
+          );
+        }
         return {
           success: false,
           sessionId: '',
@@ -1973,6 +2014,13 @@ export class GatewayService {
         console.log(
           `[gateway] Telegram user alignment failed: ${authDecision.reason} for Telegram user ${identityRef.subject} (thread=${data.thread_id})`
         );
+        if (telegramCommand?.kind === 'new_session') {
+          this.sendSystemMessage(
+            channel,
+            data.thread_id,
+            'This Telegram account is not linked to Agor yet. Use `/link <token>` first, then try `/new`.'
+          );
+        }
         return {
           success: false,
           sessionId: '',
@@ -2104,6 +2152,35 @@ export class GatewayService {
       }
     }
 
+    if (telegramCommand?.kind === 'new_session') {
+      if (existingMapping) {
+        await this.threadMapRepo.delete(existingMapping.id);
+        existingMapping = null;
+        console.log(`[gateway] Telegram /new cleared mapping for thread ${data.thread_id}`);
+      }
+
+      if (!telegramCommand.prompt) {
+        this.sendSystemMessage(
+          channel,
+          data.thread_id,
+          'This Telegram DM is reset. Send your next message to start a fresh Agor session.'
+        );
+        await this.channelRepo.updateLastMessage(channel.id);
+        return {
+          success: false,
+          sessionId: '',
+          created: false,
+        };
+      }
+
+      inboundText = telegramCommand.prompt;
+      this.sendSystemMessage(
+        channel,
+        data.thread_id,
+        'Starting a fresh Agor session for this Telegram DM.'
+      );
+    }
+
     let sessionId: SessionID;
     let created = false;
     let mcpAuthWarning: string | undefined;
@@ -2221,7 +2298,7 @@ export class GatewayService {
       }
 
       const sessionUrl = await this.fetchExistingSessionUrlForGatewayUser(sessionId, user);
-      if (sessionUrl && channel.channel_type !== 'slack') {
+      if (sessionUrl && channel.channel_type !== 'slack' && channel.channel_type !== 'telegram') {
         this.sendSystemMessage(
           channel,
           data.thread_id,
@@ -2235,12 +2312,14 @@ export class GatewayService {
         setMCPServers: (sessionId: SessionID, serverIds: string[], label: string) => Promise<void>;
       };
 
-      this.sendSystemMessage(
-        channel,
-        data.thread_id,
-        `Creating new ${agenticTool} session (${permissionMode} mode)...`,
-        { suppressSlack: true }
-      );
+      if (channel.channel_type !== 'telegram') {
+        this.sendSystemMessage(
+          channel,
+          data.thread_id,
+          `Creating new ${agenticTool} session (${permissionMode} mode)...`,
+          { suppressSlack: true }
+        );
+      }
 
       // Build custom_context with gateway metadata + platform-specific fields
       const gatewaySource: Record<string, unknown> = {
@@ -2311,8 +2390,8 @@ export class GatewayService {
       }
 
       const session = await sessionsService.create({
-        title: data.text.substring(0, 100),
-        description: data.text,
+        title: inboundText.substring(0, 100),
+        description: inboundText,
         branch_id: channel.target_branch_id,
         created_by: user.user_id,
         // Stamp session with creator's unix_username for executor impersonation.
@@ -2414,7 +2493,7 @@ export class GatewayService {
 
       const sessionUrl = await this.fetchExistingSessionUrlForGatewayUser(sessionId, user);
 
-      if (sessionUrl || channel.channel_type === 'slack') {
+      if ((sessionUrl || channel.channel_type === 'slack') && channel.channel_type !== 'telegram') {
         this.sendSystemMessage(
           channel,
           data.thread_id,
@@ -2458,7 +2537,7 @@ export class GatewayService {
       // requires explicit mentions for channel-like Slack conversations, so each
       // delivered prompt advances the last-delivered cursor. Non-mention replies
       // are picked up here the next time the bot is summoned.
-      let promptText = data.text;
+      let promptText = inboundText;
       let slackCursorTsToWrite: string | undefined;
       if (channel.channel_type === 'slack' && !outboundSeed) {
         const currentTs = getSlackMessageTs(data.metadata);
@@ -2493,7 +2572,7 @@ export class GatewayService {
             promptText = formatSlackCatchUpPrompt({
               channel,
               threadId: slackHistoryThreadId,
-              currentText: data.text,
+              currentText: inboundText,
               metadata: data.metadata,
               messages: filteredMessages.length > 0 ? filteredMessages : history.messages,
               hasMore: history.has_more,
@@ -2519,16 +2598,16 @@ export class GatewayService {
         promptText = buildSeededThreadInitialPrompt({
           seed: outboundSeed,
           channel,
-          replyText: data.text,
+          replyText: inboundText,
           metadata: data.metadata,
         });
       } else if (created && channel.channel_type === 'github') {
-        promptText = buildGitHubInitialPrompt(data.thread_id, data.text, data.metadata);
+        promptText = buildGitHubInitialPrompt(data.thread_id, inboundText, data.metadata);
       }
 
       if (storedInboundAttachments.length > 0) {
         promptText = buildAttachmentPrompt({
-          text: data.text,
+          text: inboundText,
           attachments: storedInboundAttachments,
           sourceLabel: channel.channel_type === 'telegram' ? 'Telegram' : 'Gateway',
         });

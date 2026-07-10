@@ -64,6 +64,7 @@ export {
   handleTelegramUpdate,
   normalizeTelegramInboundUpdate,
   parseTelegramCommandIntent,
+  parseTelegramPrivateThreadId,
   TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
   TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
   TelegramConnector,
