@@ -559,11 +559,11 @@ describe('GatewayChannelsTable Telegram configuration', () => {
     clickButton(/Add Channel/);
     fireEvent.mouseDown(screen.getByRole('combobox'));
     fireEvent.click(screen.getByText('Telegram'));
+    expect(screen.queryByText('Post messages as')).not.toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText('e.g., Team Slack, Personal Discord'), {
       target: { value: 'My Telegram' },
     });
     fireEvent.change(screen.getByLabelText('branch-select'), { target: { value: 'branch-1' } });
-    fireEvent.change(screen.getByLabelText('user-select'), { target: { value: 'user-1' } });
     clickButton(/^Continue$/);
     await flush();
   }
@@ -578,7 +578,10 @@ describe('GatewayChannelsTable Telegram configuration', () => {
     expect(screen.getByText('Enable polling')).toBeInTheDocument();
     expect(screen.getByText('Transport disabled')).toBeInTheDocument();
     expect(screen.getByText('Poll interval (seconds)')).toBeInTheDocument();
-    expect(screen.getByText('No setup wizard or outbound replies')).toBeInTheDocument();
+    expect(screen.getByText('No proactive emits, setup wizard, or webhooks')).toBeInTheDocument();
+    expect(
+      screen.getByText(/mapped private-DM replies use the normal gateway outbound path/)
+    ).toBeInTheDocument();
 
     fireEvent.change(screen.getByPlaceholderText('123456:ABC-DEF...'), {
       target: { value: 'telegram-token-placeholder' },
@@ -597,7 +600,6 @@ describe('GatewayChannelsTable Telegram configuration', () => {
       channel_type: 'telegram',
       name: 'My Telegram',
       target_branch_id: 'branch-1',
-      agor_user_id: 'user-1',
       config: {
         bot_token: 'telegram-token-placeholder',
         enable_polling: true,
@@ -605,6 +607,7 @@ describe('GatewayChannelsTable Telegram configuration', () => {
         poll_interval_ms: 20_000,
       },
     });
+    expect(channelCreate.mock.calls[0][0]).not.toHaveProperty('agor_user_id');
   });
 
   it('requires a bot token when creating an enabled Telegram channel', async () => {

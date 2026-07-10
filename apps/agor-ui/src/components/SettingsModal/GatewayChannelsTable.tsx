@@ -361,9 +361,9 @@ function createStepsForType(type: ChannelType): { title: string }[] {
 function createStepFields(type: ChannelType, step: number, alignSlackUsers: boolean): string[] {
   if (step === 0) {
     const fields = ['name', 'target_branch_id', 'channel_type'];
-    // Slack and GitHub pick identity inside their platform steps; everyone else
-    // chooses it on the universal Channel step.
-    if (type !== 'slack' && type !== 'github') fields.push('agor_user_id');
+    // Slack/GitHub pick identity inside their platform steps. Telegram never
+    // uses a channel-level run-as user; it resolves users via explicit /link.
+    if (type !== 'slack' && type !== 'github' && type !== 'telegram') fields.push('agor_user_id');
     return fields;
   }
   if (type === 'slack' && step === 1) {
@@ -1071,7 +1071,7 @@ const TelegramSetupPanel: React.FC<{
               type="info"
               showIcon
               title="Telegram private-DM MVP"
-              description="Telegram supports private text DMs only. Users must be explicitly linked by numeric Telegram user ID. Polling is opt-in, Agor does not configure BotFather or webhooks, and outbound Telegram replies are disabled."
+              description="Telegram supports private text DMs only. Users must explicitly link with /link using their numeric Telegram user ID. Polling is opt-in, Agor does not configure BotFather or webhooks, and mapped private-DM replies use the normal gateway outbound path."
               style={{ fontSize: 12, marginBottom: 16 }}
             />
             <Form.Item
@@ -1141,8 +1141,8 @@ const TelegramSetupPanel: React.FC<{
             <Alert
               type="warning"
               showIcon
-              title="No setup wizard or outbound replies"
-              description="This only saves local channel configuration. It does not create a Telegram bot, set webhooks, create link tokens, or enable outbound Telegram replies."
+              title="No proactive emits, setup wizard, or webhooks"
+              description="This only saves local channel configuration. It does not create a Telegram bot, set webhooks, create link tokens, or support proactive Telegram emits. Replies to mapped private DM sessions are supported."
               style={{ fontSize: 12 }}
             />
           </>
@@ -1363,8 +1363,8 @@ const ChannelFormFields: React.FC<{
             <BranchSelect branchById={branchById} />
           </Form.Item>
 
-          {/* Slack and GitHub choose identity in their platform-specific Identity sections. */}
-          {channelType !== 'slack' && channelType !== 'github' && (
+          {/* Slack/GitHub choose identity in platform-specific sections; Telegram uses /link. */}
+          {channelType !== 'slack' && channelType !== 'github' && channelType !== 'telegram' && (
             <Form.Item
               label="Post messages as"
               name="agor_user_id"
@@ -2768,7 +2768,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       name: values.name as string,
       channel_type: values.channel_type as ChannelType,
       target_branch_id: values.target_branch_id as UUID,
-      agor_user_id: values.agor_user_id as UUID,
+      ...(values.channel_type !== 'telegram' ? { agor_user_id: values.agor_user_id as UUID } : {}),
       config,
       agentic_config: agenticConfig,
       enabled: (values.enabled as boolean) ?? true,
