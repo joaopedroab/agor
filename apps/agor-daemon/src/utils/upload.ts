@@ -146,6 +146,25 @@ export function validateUploadDestinationQuery(destination: unknown): void {
 }
 
 /**
+ * Sanitize an original filename (path traversal, unsafe chars) and suffix it
+ * with a timestamp so concurrent uploads of the same name never overwrite.
+ */
+export function buildUploadFilename(originalname: string): string {
+  const basename = path.basename(originalname);
+
+  const sanitized = basename
+    .replace(/\.\./g, '_') // Remove path traversal attempts
+    .replace(/[/\\:*?"<>|]/g, '_') // Remove filesystem-unsafe chars (Windows + Unix)
+    .replace(/\.+$/g, '') // Remove trailing dots (Windows issue)
+    .substring(0, 200); // Limit length (leave room for timestamp)
+
+  const timestamp = Date.now();
+  const ext = path.extname(sanitized);
+  const nameWithoutExt = sanitized.slice(0, -ext.length || undefined);
+  return `${nameWithoutExt}_${timestamp}${ext}`;
+}
+
+/**
  * Create multer storage configuration
  */
 export function createUploadStorage() {
@@ -181,7 +200,7 @@ export function createUploadStorage() {
     },
 
     filename: (_req, file, cb) => {
-      const uniqueFilename = sanitizeUploadFilename(file.originalname);
+      const uniqueFilename = buildUploadFilename(file.originalname);
 
       if (DEBUG_UPLOAD) {
         console.log(

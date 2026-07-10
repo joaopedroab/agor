@@ -325,13 +325,13 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
           'toYaml',
           'fromYaml',
           'clone',
-          'setPrimaryAssistant',
-          'clearPrimaryAssistant',
-          'ensureAssistantWelcomeNote',
+          'setPrimaryTeammate',
+          'clearPrimaryTeammate',
+          'ensureTeammateWelcomeNote',
         ],
       }
     );
-    app.use('/board-objects', createBoardObjectsService(db));
+    app.use('/board-objects', createBoardObjectsService(db, app));
   }
 
   const boardsService = safeService('boards') as unknown as BoardsServiceImpl | undefined;
@@ -368,7 +368,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
       'remove',
       'updateEnvironment',
       'initializeUnixGroup',
-      'ensureAssistantKnowledgeNamespace',
+      'ensureTeammateKnowledgeNamespace',
     ],
   });
 
@@ -422,7 +422,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Knowledge (backend/data foundations)
   // ============================================================================
 
-  app.use('/kb/namespaces', createKnowledgeNamespacesService(db), {
+  app.use('/kb/namespaces', createKnowledgeNamespacesService(db, app), {
     methods: [
       'find',
       'get',

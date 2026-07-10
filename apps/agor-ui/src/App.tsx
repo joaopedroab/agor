@@ -435,7 +435,15 @@ function AppContent() {
     user ? (s.userById.get(user.user_id) ?? null) : null
   );
   const currentUser = user ? storedCurrentUser || user : null;
-  const mcpServerById = useAgorStore((s) => s.mcpServerById);
+  const mcpServerCount = useAgorStore((s) => s.mcpServerById.size);
+  // Slack/GitHub connections are gateway channels, a separate store map from MCP
+  // servers. Narrow size selector so unrelated channel writes don't re-render the shell.
+  const gatewayChannelCount = useAgorStore((s) => s.gatewayChannelById.size);
+  // Both integration collections are background-hydrated; gate the teal banner on
+  // their first apply so a zero count can't flash before the data is known.
+  const integrationsHydrated = useAgorStore(
+    (s) => s.mcpServersHydrated && s.gatewayChannelsHydrated
+  );
   // Whether this user can actually reach the MCP settings tab. Mirrors the tab's
   // own gate in SettingsModal (`mcpEnabled && isAdmin`), so the "Connect tools"
   // banner is never a dead-end for users who can't open it.
@@ -484,7 +492,7 @@ function AppContent() {
     branchId: string;
     sessionId: string;
     boardId: string;
-    path: 'assistant' | 'own-repo';
+    path: 'teammate' | 'own-repo';
   }) => {
     setOnboardingWizardOpen(false);
 
@@ -509,10 +517,10 @@ function AppContent() {
       { silent: true }
     ).catch(() => {});
 
-    // Clear the assistant pending flag if applicable
-    if (result.path === 'assistant' && client) {
+    // Clear the AI teammate pending flag if applicable
+    if (result.path === 'teammate' && client) {
       try {
-        await client.service('config').patch(null, { onboarding: { assistantPending: false } });
+        await client.service('config').patch(null, { onboarding: { teammatePending: false } });
       } catch {
         // Non-critical — ignore
       }
@@ -537,11 +545,18 @@ function AppContent() {
 
   const handleCheckAuth = useCallback(
     async (tool: AgenticToolName, apiKey?: string): Promise<AuthCheckResult> => {
-      if (!client) return { authenticated: false, method: 'none' as const };
+      // A transport failure is NOT proof of missing auth — surface `unknown` so
+      // callers fail safe rather than flashing a "not connected" state.
+      if (!client) return { status: 'unknown', authenticated: false, method: 'none' };
       try {
         return (await client.service('check-auth').create({ tool, apiKey })) as AuthCheckResult;
       } catch {
-        return { authenticated: false, method: 'none' as const, hint: 'Connection check failed.' };
+        return {
+          status: 'unknown',
+          authenticated: false,
+          method: 'none',
+          hint: 'Connection check failed.',
+        };
       }
     },
     [client]
@@ -1647,7 +1662,9 @@ function AppContent() {
       topBanner={
         <OnboardingBanners
           user={currentUser}
-          mcpServerCount={mcpServerById.size}
+          mcpServerCount={mcpServerCount}
+          gatewayChannelCount={gatewayChannelCount}
+          integrationsHydrated={integrationsHydrated}
           canManageMcp={canManageMcp}
           onOpenUserSettings={(tab) => {
             setUserSettingsInitialTab(tab);
@@ -1761,23 +1778,8 @@ function AppContent() {
           onUpdateBranch={(branchId, updates) =>
             handleUpdateBranch(branchId, updates, { silent: true })
           }
-          onCheckAuth={async (tool, apiKey) => {
-            if (!client) return { authenticated: false, method: 'none' as const };
-            try {
-              return (await client
-                .service('check-auth')
-                .create({ tool, apiKey })) as AuthCheckResult;
-            } catch {
-              return {
-                authenticated: false,
-                method: 'none' as const,
-                hint: 'Connection check failed.',
-              };
-            }
-          }}
-          assistantPending={
-            onboardingConfig?.assistantPending ?? onboardingConfig?.persistedAgentPending
-          }
+          onCheckAuth={handleCheckAuth}
+          teammatePending={onboardingConfig?.teammatePending}
           frameworkRepoUrl={onboardingConfig?.frameworkRepoUrl}
         />
 
