@@ -10,6 +10,7 @@ import {
   requiredBotEvents,
   requiredBotScopes,
 } from '@agor/core/gateway';
+import { getRequiredSecretFields } from '@agor/core/types';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -20,26 +21,6 @@ vi.mock('@agor/core/gateway', async (importOriginal) => {
     getConnector: vi.fn(),
   };
 });
-
-function getRequiredSecretFields(channelType: string, config: Record<string, unknown>): string[] {
-  switch (channelType) {
-    case 'slack': {
-      const wantsInbound =
-        config.connection_mode === 'socket' ||
-        config.enable_channels === true ||
-        config.enable_groups === true ||
-        config.enable_mpim === true;
-      const outboundOnly = config.outbound_enabled === true && !wantsInbound;
-      return outboundOnly ? ['bot_token'] : ['bot_token', 'app_token'];
-    }
-    case 'github':
-      return ['private_key'];
-    case 'teams':
-      return ['app_password'];
-    default:
-      return [];
-  }
-}
 
 type ServiceStub = Record<string, (...args: unknown[]) => unknown>;
 function makeFakeApp(services: Record<string, ServiceStub>) {

@@ -20,6 +20,7 @@ import {
   GATEWAY_REDACTED_SENTINEL,
   GATEWAY_SENSITIVE_CONFIG_FIELDS,
   type GatewayChannel,
+  getRequiredSecretFields,
   hasMinimumRole,
   ROLES,
   type ScheduleID,
@@ -104,31 +105,6 @@ function getOutboundConfig(channel: GatewayChannel): {
       ? { default_outbound_target: config.default_outbound_target }
       : {}),
   };
-}
-
-type GatewayChannelType = GatewayChannel['channel_type'];
-
-function getRequiredSecretFields(
-  channelType: GatewayChannelType,
-  config: Record<string, unknown>
-): string[] {
-  switch (channelType) {
-    case 'slack': {
-      const wantsInbound =
-        config.connection_mode === 'socket' ||
-        config.enable_channels === true ||
-        config.enable_groups === true ||
-        config.enable_mpim === true;
-      const outboundOnly = config.outbound_enabled === true && !wantsInbound;
-      return outboundOnly ? ['bot_token'] : ['bot_token', 'app_token'];
-    }
-    case 'github':
-      return ['private_key'];
-    case 'teams':
-      return ['app_password'];
-    default:
-      return [];
-  }
 }
 
 const configSchema = z
@@ -823,7 +799,7 @@ export function registerGatewayChannelTools(server: McpServer, ctx: McpContext):
     'agor_gateway_channels_create',
     {
       description:
-        'Create a gateway channel definition (admin-only) through the same gateway-channels service used by the UI. Current connectors: Slack, GitHub, Teams, and Telegram private-DM MVP. For interactive/agent-driven setup, create the channel disabled and without secrets (enabled:false, no tokens), then collect credentials with agor_widgets_request_gateway_token so the user enters them in a secure inline form — raw secrets passed in tool arguments leak into the MCP transcript. Passing secrets directly here is for programmatic/non-interactive use only. Non-interactive Slack example config: { bot_token, app_token, connection_mode:"socket", enable_channels:true, require_mention:true, allowed_channel_ids:["C123"] }. Secrets are encrypted by the service and returned redacted.',
+        'Create a gateway channel definition (admin-only) through the same gateway-channels service used by the UI. Current connectors: Slack, GitHub, Teams, and Telegram private-DM MVP. For interactive/agent-driven setup, create the channel disabled and without secrets (enabled:false, no tokens), then collect credentials with agor_widgets_request_gateway_token so the user enters them in a secure inline form — raw secrets passed in tool arguments leak into the MCP transcript. Passing secrets directly here is for programmatic/non-interactive use only. Non-interactive Slack example config: { bot_token, app_token, connection_mode:"socket", enable_channels:true, require_mention:true, allowed_channel_ids:["C123"] }. Secrets are encrypted by the service and returned redacted. Telegram private-DM MVP is explicit-link-only for private DMs.',
       annotations: { destructiveHint: false, idempotentHint: false },
       inputSchema: gatewayChannelCreateInputSchema,
     },
