@@ -6,7 +6,6 @@
  */
 
 import type { ManagedEnvExecutionMode } from '@agor/core/environment/webhook';
-import type { DaemonServicesConfig } from '@agor-live/client';
 import { useEffect, useState } from 'react';
 import { getDaemonUrl } from '../config/daemon';
 import type { BranchStorageConfig } from '../utils/branchStorage';
@@ -24,17 +23,9 @@ interface InstanceConfig {
   description?: string;
 }
 
-interface SystemCredentials {
-  ANTHROPIC_API_KEY?: boolean;
-  OPENAI_API_KEY?: boolean;
-  GEMINI_API_KEY?: boolean;
-  CURSOR_API_KEY?: boolean;
-}
-
 interface OnboardingConfig {
   teammatePending?: boolean;
   frameworkRepoUrl?: string;
-  systemCredentials?: SystemCredentials;
 }
 
 export interface FeaturesConfig {
@@ -81,7 +72,6 @@ interface HealthResponse {
   auth: AuthConfig;
   instance?: InstanceConfig;
   onboarding?: OnboardingConfig;
-  services?: DaemonServicesConfig;
   features?: FeaturesConfig;
 }
 
@@ -89,7 +79,6 @@ export function useAuthConfig() {
   const [config, setConfig] = useState<AuthConfig | null>(null);
   const [instanceConfig, setInstanceConfig] = useState<InstanceConfig | null>(null);
   const [onboardingConfig, setOnboardingConfig] = useState<OnboardingConfig | null>(null);
-  const [servicesConfig, setServicesConfig] = useState<DaemonServicesConfig | undefined>(undefined);
   const [featuresConfig, setFeaturesConfig] = useState<FeaturesConfig | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
@@ -106,7 +95,6 @@ export function useAuthConfig() {
         setConfig(health.auth);
         setInstanceConfig(health.instance ?? null);
         setOnboardingConfig(health.onboarding ?? null);
-        setServicesConfig(health.services);
         setFeaturesConfig(health.features);
         setError(null);
       } catch (err) {
@@ -115,7 +103,6 @@ export function useAuthConfig() {
         setConfig({ requireAuth: true });
         setInstanceConfig(null);
         setOnboardingConfig(null);
-        setServicesConfig(undefined);
         setFeaturesConfig(undefined);
       } finally {
         setLoading(false);
@@ -129,7 +116,6 @@ export function useAuthConfig() {
     config,
     instanceConfig,
     onboardingConfig,
-    servicesConfig,
     featuresConfig,
     loading,
     error,

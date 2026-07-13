@@ -21,6 +21,14 @@ vi.mock('@agor/core/gateway', async (importOriginal) => {
   };
 });
 
+vi.mock('@agor/core/config', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agor/core/config')>();
+  return {
+    ...actual,
+    assertInlineAgenticConfigurationAllowed: vi.fn(async () => undefined),
+  };
+});
+
 vi.mock('../utils/gateway-attachments.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/gateway-attachments.js')>();
   return {
@@ -105,7 +113,13 @@ function makeGatewayHarness(args: {
       throw new Error(`Unexpected service: ${name}`);
     },
   };
-  const service = new GatewayService(args.db ?? ({} as TenantScopeAwareDatabase), app as never);
+  const db = args.db ?? ({ run: vi.fn() } as unknown as TenantScopeAwareDatabase);
+  const service = new GatewayService(db, app as never);
+  const create = service.create.bind(service);
+  service.create = (data) => {
+    if (getCurrentTenantDatabaseScope()) return create(data);
+    return runWithTenantDatabaseScope(db, 'tenant-channel', () => create(data));
+  };
   const channelRepo = {
     findByKey: vi.fn(async () => channel),
     findById: vi.fn(async () => channel),

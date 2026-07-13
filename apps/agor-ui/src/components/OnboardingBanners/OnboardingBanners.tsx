@@ -13,12 +13,14 @@
 import type { AgenticToolName, AuthCheckResult, User } from '@agor-live/client';
 import { Alert, Button, Space } from 'antd';
 import { useEffect, useState } from 'react';
+import { useAgorStore } from '../../store/agorStore';
 import {
   BannerDecision,
   decideBanner,
-  hasAnyLlmKey,
+  hasConfiguredCredentialFor,
   ProbeState,
-  resolveProbeAgent,
+  preferredCredentialOwner,
+  resolveGovernedProbeAgent,
   resolveProbeState,
 } from './bannerLogic';
 
@@ -94,12 +96,17 @@ export function OnboardingBanners({
 }: OnboardingBannersProps) {
   const [probeState, setProbeState] = useState<ProbeState>(ProbeState.Unknown);
   const [integrationsBannerDismissed, setIntegrationsBannerDismissed] = useState(false);
+  const agenticToolSettings = useAgorStore((state) => state.agenticToolSettingsByName);
 
   // Pre-compute user-derived values so the effect captures primitives, not the full user object.
   const userId = user?.user_id;
   const onboardingCompleted = !!user?.onboarding_completed;
-  const hasLlm = hasAnyLlmKey(user);
-  const probeAgent = resolveProbeAgent(user);
+  const probeAgent = resolveGovernedProbeAgent(user, agenticToolSettings);
+  const canonicalProbeAgent = probeAgent === 'claude-code-cli' ? 'claude-code' : probeAgent;
+  const probeSettings = agenticToolSettings.get(canonicalProbeAgent as never);
+  const hasLlm = hasConfiguredCredentialFor(user, probeAgent, probeSettings);
+  const credentialOwner = preferredCredentialOwner(probeSettings);
+  const canManageWorkspaceCredentials = user?.role === 'admin' || user?.role === 'superadmin';
 
   // One probe (plus a bounded fallback) per identity/credential change. Deps are
   // primitives/stable so the effect never re-fires on board navigation or
@@ -149,7 +156,11 @@ export function OnboardingBanners({
         <AmberBanner
           message="⚡ No AI connected - sessions will open but nothing will run."
           buttonLabel="Connect AI"
-          onClick={() => onOpenUserSettings(probeAgent)}
+          onClick={() =>
+            credentialOwner === 'tenant' && canManageWorkspaceCredentials
+              ? onOpenWorkspaceSettings('agentic-tools')
+              : onOpenUserSettings(probeAgent)
+          }
           docsHref="https://agor.live/guide"
         />
       );
@@ -158,7 +169,11 @@ export function OnboardingBanners({
         <AmberBanner
           message="Your AI credentials aren't working. Sessions will fail until you reconnect."
           buttonLabel="Reconnect AI"
-          onClick={() => onOpenUserSettings(probeAgent)}
+          onClick={() =>
+            credentialOwner === 'tenant' && canManageWorkspaceCredentials
+              ? onOpenWorkspaceSettings('agentic-tools')
+              : onOpenUserSettings(probeAgent)
+          }
         />
       );
     case BannerDecision.Integrations:

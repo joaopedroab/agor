@@ -374,7 +374,6 @@ export interface RegisterHooksContext {
   db: TenantScopeAwareDatabase;
   app: Application & { io?: import('socket.io').Server };
   config: AgorConfig;
-  svcEnabled: (group: string) => boolean;
   jwtSecret: string;
   branchRbacEnabled: boolean;
   requireAuth: (context: HookContext) => Promise<HookContext>;
@@ -410,6 +409,8 @@ export const TENANT_OWNED_SERVICE_PATHS = [
   'branches/:id/group-grants',
   'boards/:id/group-grants',
   'app-variables',
+  'agentic-tool-settings',
+  'agentic-tool-presets',
   'mcp-servers',
   'mcp-servers/discover',
   'mcp-servers/oauth-auth-headers',
@@ -448,7 +449,6 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     db,
     app,
     config,
-    svcEnabled,
     jwtSecret,
     branchRbacEnabled,
     requireAuth,
@@ -584,6 +584,20 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     await invalidateRealtimeBranchAccess(branchId);
     return context;
   };
+
+  safeService('agentic-tool-settings')?.hooks({
+    before: {
+      patch: [requireMinimumRole(ROLES.ADMIN, 'manage workspace agentic tools')],
+    },
+  });
+
+  safeService('agentic-tool-presets')?.hooks({
+    before: {
+      create: [requireMinimumRole(ROLES.ADMIN, 'manage agentic tool presets')],
+      patch: [requireMinimumRole(ROLES.ADMIN, 'manage agentic tool presets')],
+      remove: [requireMinimumRole(ROLES.ADMIN, 'manage agentic tool presets')],
+    },
+  });
 
   const invalidateRealtimeBranchFromRoute = async (context: HookContext): Promise<HookContext> => {
     await invalidateRealtimeBranchAccess(context.params.route?.id);
@@ -904,7 +918,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   });
 
   // Custom REST routes for artifact payload and console
-  if (svcEnabled('artifacts')) {
+  {
     registerAuthenticatedRoute(
       app,
       '/artifacts/:id/payload',
@@ -2781,18 +2795,11 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
     },
   });
-
-  // ============================================================================
-  // Leaderboard hooks
-  // ============================================================================
-
-  if (svcEnabled('leaderboard')) {
-    app.service('leaderboard').hooks({
-      before: {
-        all: [requireAuth],
-      },
-    });
-  }
+  app.service('leaderboard').hooks({
+    before: {
+      all: [requireAuth],
+    },
+  });
 
   // ============================================================================
   // Schedules hooks

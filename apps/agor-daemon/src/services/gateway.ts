@@ -6,12 +6,18 @@
  * since it orchestrates across multiple repositories and services.
  */
 
-import { PublicBaseUrlNotConfiguredError, requirePublicBaseUrl } from '@agor/core/config';
+import {
+  assertInlineAgenticConfigurationAllowed,
+  PublicBaseUrlNotConfiguredError,
+  requirePublicBaseUrl,
+  resolveAgenticToolPreset,
+} from '@agor/core/config';
 import {
   BranchRepository,
   bindRepositoryToTenantUnitOfWork,
   GatewayChannelRepository,
   GatewayOutboundMessageRepository,
+  getCurrentTenantDatabase,
   getCurrentTenantId,
   getHiddenTenantId,
   MCPServerRepository,
@@ -1843,34 +1849,52 @@ export class GatewayService {
 
     // Resolve agentic config: channel config > user defaults > system defaults.
     // Channel-level agentic_config maps to the helper's `overrides` (it's the
-    // gateway's analogue of an MCP tool's explicit args). Codex sub-config and
-    // MCP server lists are first-class fields on `GatewayAgenticConfig`, so
-    // thread them all through the helper — otherwise the executor's per-tool
+    // gateway's analogue of an MCP tool's explicit args). Codex sub-config is
+    // first-class on `GatewayAgenticConfig`, so thread it through the helper —
+    // otherwise the executor's per-tool
     // settings (which Codex reads from `permission_config.codex`, not `mode`)
     // get silently dropped.
     const agenticConfig = channel.agentic_config;
     const agenticTool: AgenticToolName = (agenticConfig?.agent as AgenticToolName) ?? 'claude-code';
+    const tenantDb = getCurrentTenantDatabase();
+    if (!tenantDb) throw new Error('Missing tenant database scope for gateway agent resolution');
+    const preset = agenticConfig?.presetId
+      ? await resolveAgenticToolPreset(tenantDb, agenticTool, agenticConfig.presetId)
+      : null;
+    if (!preset) await assertInlineAgenticConfigurationAllowed(tenantDb, agenticTool);
+    const runtimeConfig = preset?.configuration ?? agenticConfig;
     const {
       permission_config: gatewayPermissionConfig,
       model_config: gatewayModelConfig,
-      mcp_server_ids: gatewayMcpServerIds,
+      mcp_server_ids: defaultMcpServerIds,
     } = resolveSessionDefaults({
       agenticTool,
       user,
       overrides: {
-        permissionMode: agenticConfig?.permissionMode,
-        modelConfig: agenticConfig?.modelConfig,
-        codexSandboxMode: agenticConfig?.codexSandboxMode,
-        codexApprovalPolicy: agenticConfig?.codexApprovalPolicy,
-        codexNetworkAccess: agenticConfig?.codexNetworkAccess,
-        mcpServerIds: agenticConfig?.mcpServerIds,
+        permissionMode: runtimeConfig?.permissionMode,
+        modelConfig: runtimeConfig?.modelConfig,
+        codexSandboxMode: runtimeConfig?.codexSandboxMode,
+        codexApprovalPolicy: runtimeConfig?.codexApprovalPolicy,
+        codexNetworkAccess: runtimeConfig?.codexNetworkAccess,
       },
     });
+    const gatewayMcpServerIds = channel.mcp_server_ids ?? defaultMcpServerIds;
     const permissionMode = gatewayPermissionConfig.mode;
 
     if (existingMapping) {
       // Existing thread → existing session
       sessionId = existingMapping.session_id;
+      if (agenticConfig?.presetId) {
+        await this.app.service('sessions').patch(sessionId, {
+          agentic_tool_preset_id: agenticConfig.presetId,
+        });
+      } else if (agenticConfig) {
+        await this.app.service('sessions').patch(sessionId, {
+          agentic_tool_preset_id: null,
+          model_config: gatewayModelConfig,
+          permission_config: gatewayPermissionConfig,
+        });
+      }
 
       // Touch timestamps
       await this.threadMapRepo.updateLastMessage(existingMapping.id);
@@ -1994,6 +2018,7 @@ export class GatewayService {
         unix_username: user.unix_username ?? null,
         status: SessionStatus.IDLE,
         agentic_tool: agenticTool,
+        agentic_tool_preset_id: agenticConfig?.presetId,
         permission_config: gatewayPermissionConfig,
         model_config: gatewayModelConfig,
         tasks: [],
