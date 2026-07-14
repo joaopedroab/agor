@@ -922,6 +922,7 @@ export const App: React.FC<AppProps> = ({
         description: result.description,
         userName: user?.name,
         userEmail: user?.email,
+        persona: user?.preferences?.onboarding?.persona,
       }),
       modelConfig: result.modelConfig,
       effort: result.effort,
@@ -1129,7 +1130,9 @@ export const App: React.FC<AppProps> = ({
   );
   // Comment-derived header scalars. Subscribing to the derived number/boolean
   // (instead of the comment map) keeps comment edits that don't change them —
-  // and all comments on other boards — from waking the shell.
+  // and all comments on other boards — from waking the shell. Shared between
+  // AppHeader's comments button and the collapsed rail's Comments item so
+  // both surfaces carry the same badge.
   const currentUserName = user?.name || user?.email?.split('@')[0] || '';
   const unreadCommentsCount = useAgorStore(
     useMemo(() => makeUnreadCommentCountSelector(currentBoardId), [currentBoardId])
@@ -1602,6 +1605,8 @@ export const App: React.FC<AppProps> = ({
           activeTab={effectiveSettingsTab}
           onTabChange={(newTab) => {
             if (!settingsRouteOpen && openSettingsTab) {
+              // Prop-controlled mode (e.g. opened from onboarding): navigate with the
+              // current board as background so closing the modal returns here, not '/'.
               openSettings(newTab as Parameters<typeof setSettingsSection>[0]);
               onSettingsClose?.();
             } else {
