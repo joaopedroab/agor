@@ -19,6 +19,8 @@ export { GitHubConnector, parseThreadId as parseGitHubThreadId } from './connect
 export type {
   SlackChannelHistoryRequest,
   SlackChannelHistoryResult,
+  SlackFileInfo,
+  SlackHistoryFile,
   SlackThreadHistoryMessage,
   SlackThreadHistoryRequest,
   SlackThreadHistoryResult,
@@ -27,6 +29,7 @@ export {
   extractSlackInboundFiles,
   isChannelAllowedByWhitelist,
   isSlackDirectMessageId,
+  isSlackFileSourceAllowed,
   isSlackWriteTargetAllowed,
   markdownToMrkdwn,
   SlackConnector,

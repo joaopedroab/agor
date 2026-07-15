@@ -159,7 +159,14 @@ export class GatewayChannelRepository
         agor_user_id: row.agor_user_id as UUID,
         channel_key: row.channel_key,
         config: decryptConfig(config),
-        agentic_config: (agenticConfig as unknown as GatewayAgenticConfig) ?? null,
+        agentic_config: agenticConfig
+          ? ({
+              ...(agenticConfig as unknown as GatewayAgenticConfig),
+              presetId:
+                (row.agentic_tool_preset_id as GatewayAgenticConfig['presetId']) ?? undefined,
+            } as GatewayAgenticConfig)
+          : null,
+        mcp_server_ids: row.mcp_server_ids ?? undefined,
         enabled: Boolean(row.enabled),
         created_at: new Date(row.created_at).toISOString(),
         updated_at: new Date(row.updated_at).toISOString(),
@@ -182,14 +189,11 @@ export class GatewayChannelRepository
     const channelType = data.channel_type ?? 'slack';
     const enabled = data.enabled ?? true;
     const config = data.config ?? {};
-    if (channelType === 'telegram' && enabled && !config.bot_token) {
-      throw new RepositoryError(
-        'config.bot_token is required to create or enable a Telegram gateway channel'
-      );
-    }
-
+    const { presetId: _presetId, ...storedAgenticConfig } = data.agentic_config ?? {};
     const encryptedAgenticConfig = encryptAgenticConfig(
-      (data.agentic_config as unknown as Record<string, unknown> | null) ?? null
+      Object.keys(storedAgenticConfig).length > 0
+        ? (storedAgenticConfig as unknown as Record<string, unknown>)
+        : null
     );
 
     return {
@@ -206,6 +210,8 @@ export class GatewayChannelRepository
       last_message_at: data.last_message_at ? new Date(data.last_message_at) : null,
       config: encryptConfig(config),
       agentic_config: encryptedAgenticConfig,
+      agentic_tool_preset_id: data.agentic_config?.presetId ?? null,
+      mcp_server_ids: data.mcp_server_ids ?? null,
     };
   }
 
@@ -223,7 +229,11 @@ export class GatewayChannelRepository
 
     const channelType = channel.channel_type ?? 'slack';
     const config = channel.config ?? {};
-    const missing = getRequiredSecretFields(channelType, config).filter((field) => {
+    const requiredFields = getRequiredSecretFields(channelType, config);
+    if (channelType === 'telegram' && !requiredFields.includes('bot_token')) {
+      requiredFields.push('bot_token');
+    }
+    const missing = requiredFields.filter((field) => {
       const value = config[field];
       return (
         typeof value !== 'string' || value.trim() === '' || value === GATEWAY_REDACTED_SENTINEL
@@ -383,6 +393,8 @@ export class GatewayChannelRepository
           enabled: insertData.enabled,
           config: insertData.config,
           agentic_config: insertData.agentic_config,
+          agentic_tool_preset_id: insertData.agentic_tool_preset_id,
+          mcp_server_ids: insertData.mcp_server_ids,
           updated_at: new Date(),
         })
         .where(eq(gatewayChannels.id, fullId))

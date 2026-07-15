@@ -5,7 +5,7 @@
  * sending messages to and receiving messages from messaging platforms.
  */
 
-import type { ChannelType, SlackTestResult } from '../types/gateway';
+import type { ChannelType, SlackAppInfo, SlackTestResult } from '../types/gateway';
 
 /**
  * Provider-normalized file/media metadata carried with an inbound gateway
@@ -165,4 +165,12 @@ export interface GatewayConnector {
    * prove, so a green result is never mistaken for full verification.
    */
   testConnection?(): Promise<SlackTestResult>;
+
+  /**
+   * Best-effort resolution of the platform app behind the channel's stored
+   * credentials (e.g. Slack app id via `auth.test` → `bots.info`), so the UI
+   * can deep-link to the app's settings. Returns nulls on failure rather than
+   * throwing, and never includes token material.
+   */
+  getAppInfo?(): Promise<SlackAppInfo>;
 }

@@ -260,6 +260,7 @@ describe('GatewayChannelRepository', () => {
       expect(
         getRequiredSecretFields('slack', { outbound_enabled: true, enable_channels: true })
       ).toEqual(['bot_token', 'app_token']);
+      expect(getRequiredSecretFields('telegram', {})).toEqual(['bot_token']);
     });
   });
 
@@ -277,9 +278,7 @@ describe('GatewayChannelRepository', () => {
         enabled: true,
         config: {},
       })
-    ).rejects.toThrow(
-      'config.bot_token is required to create or enable a Telegram gateway channel'
-    );
+    ).rejects.toThrow('missing required secret(s) bot_token');
 
     const disabled = await repo.create({
       name: 'Telegram Disabled',
@@ -318,7 +317,7 @@ describe('GatewayChannelRepository', () => {
     });
 
     await expect(repo.update(disabled.id, { enabled: true })).rejects.toThrow(
-      'config.bot_token is required to create or enable a Telegram gateway channel'
+      'missing required secret(s) bot_token'
     );
 
     const enabled = await repo.update(disabled.id, {

@@ -6,15 +6,22 @@
  * since it orchestrates across multiple repositories and services.
  */
 
-import { PublicBaseUrlNotConfiguredError, requirePublicBaseUrl } from '@agor/core/config';
+import {
+  assertInlineAgenticConfigurationAllowed,
+  PublicBaseUrlNotConfiguredError,
+  requirePublicBaseUrl,
+  resolveAgenticToolPreset,
+} from '@agor/core/config';
 import {
   BranchRepository,
+  bindRepositoryToTenantUnitOfWork,
   GatewayChannelRepository,
   GatewayOutboundMessageRepository,
   getCurrentTenantId,
   getHiddenTenantId,
   MCPServerRepository,
   runWithoutTenantDatabaseScope,
+  runWithTenantContext,
   runWithTenantDatabaseScope,
   SessionRepository,
   shortId,
@@ -41,6 +48,7 @@ import {
   formatGatewaySystemPayload,
   getConnector,
   hasConnector,
+  isSlackWriteTargetAllowed,
   normalizeOutbound,
   parseGitHubThreadId,
   parseTelegramCommandIntent,
@@ -72,9 +80,9 @@ import { getSessionUrl } from '@agor/core/utils/url';
 import { hasBranchPermission } from '../utils/branch-authorization.js';
 import {
   buildPromptWithAttachments,
-  ingestInboundImageAttachments,
+  ingestInboundAttachments,
 } from '../utils/gateway-attachments.js';
-import { deferWithTenantDatabaseScope } from '../utils/tenant-db-scope.js';
+import { deferWithTenantContext } from '../utils/tenant-db-scope.js';
 import {
   ALLOWED_UPLOAD_MIME_TYPES,
   MAX_UPLOAD_FILE_SIZE,
@@ -763,7 +771,6 @@ function attachmentFailureMessage(reason: string): string {
  * Gateway routing service
  */
 export class GatewayService {
-  private db: TenantScopeAwareDatabase;
   private channelRepo: GatewayChannelRepository;
   private threadMapRepo: ThreadSessionMapRepository;
   private outboundRepo: GatewayOutboundMessageRepository;
@@ -773,6 +780,7 @@ export class GatewayService {
 
   private mcpServerRepo: MCPServerRepository;
   private userTokenRepo: UserMCPOAuthTokenRepository;
+  private db: TenantScopeAwareDatabase;
   private app: Application;
 
   /** Active Socket Mode listeners keyed by channel ID */
@@ -812,16 +820,19 @@ export class GatewayService {
   private static SLACK_STREAMED_MESSAGE_CACHE_MAX = 500;
 
   constructor(db: TenantScopeAwareDatabase, app: Application) {
-    this.db = db;
-    this.channelRepo = new GatewayChannelRepository(db);
-    this.threadMapRepo = new ThreadSessionMapRepository(db);
-    this.outboundRepo = new GatewayOutboundMessageRepository(db);
-    this.branchRepo = new BranchRepository(db);
-    this.sessionRepo = new SessionRepository(db);
-    this.usersRepo = new UsersRepository(db);
+    this.channelRepo = bindRepositoryToTenantUnitOfWork(db, new GatewayChannelRepository(db));
+    this.threadMapRepo = bindRepositoryToTenantUnitOfWork(db, new ThreadSessionMapRepository(db));
+    this.outboundRepo = bindRepositoryToTenantUnitOfWork(
+      db,
+      new GatewayOutboundMessageRepository(db)
+    );
+    this.branchRepo = bindRepositoryToTenantUnitOfWork(db, new BranchRepository(db));
+    this.sessionRepo = bindRepositoryToTenantUnitOfWork(db, new SessionRepository(db));
+    this.usersRepo = bindRepositoryToTenantUnitOfWork(db, new UsersRepository(db));
 
-    this.mcpServerRepo = new MCPServerRepository(db);
-    this.userTokenRepo = new UserMCPOAuthTokenRepository(db);
+    this.mcpServerRepo = bindRepositoryToTenantUnitOfWork(db, new MCPServerRepository(db));
+    this.userTokenRepo = bindRepositoryToTenantUnitOfWork(db, new UserMCPOAuthTokenRepository(db));
+    this.db = db;
     this.app = app;
   }
 
@@ -1414,8 +1425,7 @@ export class GatewayService {
    * routes whose enclosing transaction is about to close.
    */
   updateProgressAfterCommit(data: GatewayProgressData, params?: unknown): void {
-    deferWithTenantDatabaseScope(
-      this.db,
+    deferWithTenantContext(
       params,
       async () => {
         await this.updateProgress(data);
@@ -1860,6 +1870,16 @@ export class GatewayService {
       resolvedChannel = resolved.channel;
       resolvedTargetMetadata.resolved_channel_id = resolved.channel;
       resolvedTargetMetadata.resolved_user_id = resolved.user_id;
+    }
+
+    // The allowed_channel_ids whitelist works on concrete conversation ids,
+    // while `target` may be a channel name or user email — so enforcement
+    // happens only after resolution. isSlackWriteTargetAllowed exempts DMs,
+    // so email→DM and D-prefixed targets always pass.
+    if (!isSlackWriteTargetAllowed(config, resolvedChannel)) {
+      throw new Error(
+        `Gateway outbound denied: target ${target} resolves to Slack conversation ${resolvedChannel}, which is not in this gateway channel's allowed_channel_ids whitelist.`
+      );
     }
 
     let sent: Awaited<ReturnType<SlackDirectConnector['sendSlackMessage']>>;
@@ -2470,34 +2490,62 @@ export class GatewayService {
 
     // Resolve agentic config: channel config > user defaults > system defaults.
     // Channel-level agentic_config maps to the helper's `overrides` (it's the
-    // gateway's analogue of an MCP tool's explicit args). Codex sub-config and
-    // MCP server lists are first-class fields on `GatewayAgenticConfig`, so
-    // thread them all through the helper — otherwise the executor's per-tool
+    // gateway's analogue of an MCP tool's explicit args). Codex sub-config is
+    // first-class on `GatewayAgenticConfig`, so thread it through the helper —
+    // otherwise the executor's per-tool
     // settings (which Codex reads from `permission_config.codex`, not `mode`)
     // get silently dropped.
     const agenticConfig = channel.agentic_config;
     const agenticTool: AgenticToolName = (agenticConfig?.agent as AgenticToolName) ?? 'claude-code';
+    // HTTP-originated requests carry an ambient tenant DB scope; socket-mode
+    // listener messages only carry tenant identity (runWithTenantContext).
+    // Open a short tenant unit of work from that identity — same pattern as
+    // bindRepositoryToTenantUnitOfWork — instead of assuming an ambient scope
+    // or falling back to the unscoped base connection.
+    const preset = await runWithTenantDatabaseScope(
+      this.db,
+      getCurrentTenantId(),
+      async (tenantDb) => {
+        const resolved = agenticConfig?.presetId
+          ? await resolveAgenticToolPreset(tenantDb, agenticTool, agenticConfig.presetId)
+          : null;
+        if (!resolved) await assertInlineAgenticConfigurationAllowed(tenantDb, agenticTool);
+        return resolved;
+      }
+    );
+    const runtimeConfig = preset?.configuration ?? agenticConfig;
     const {
       permission_config: gatewayPermissionConfig,
       model_config: gatewayModelConfig,
-      mcp_server_ids: gatewayMcpServerIds,
+      mcp_server_ids: defaultMcpServerIds,
     } = resolveSessionDefaults({
       agenticTool,
       user,
       overrides: {
-        permissionMode: agenticConfig?.permissionMode,
-        modelConfig: agenticConfig?.modelConfig,
-        codexSandboxMode: agenticConfig?.codexSandboxMode,
-        codexApprovalPolicy: agenticConfig?.codexApprovalPolicy,
-        codexNetworkAccess: agenticConfig?.codexNetworkAccess,
-        mcpServerIds: agenticConfig?.mcpServerIds,
+        permissionMode: runtimeConfig?.permissionMode,
+        modelConfig: runtimeConfig?.modelConfig,
+        codexSandboxMode: runtimeConfig?.codexSandboxMode,
+        codexApprovalPolicy: runtimeConfig?.codexApprovalPolicy,
+        codexNetworkAccess: runtimeConfig?.codexNetworkAccess,
       },
     });
+    const gatewayMcpServerIds = channel.mcp_server_ids ?? defaultMcpServerIds;
     const permissionMode = gatewayPermissionConfig.mode;
 
     if (existingMapping) {
       // Existing thread → existing session
       sessionId = existingMapping.session_id;
+      if (agenticConfig?.presetId) {
+        await this.app.service('sessions').patch(sessionId, {
+          agentic_tool_preset_id: agenticConfig.presetId,
+        });
+      } else if (agenticConfig) {
+        await this.app.service('sessions').patch(sessionId, {
+          agentic_tool_preset_id: null,
+          model_config: gatewayModelConfig,
+          permission_config: gatewayPermissionConfig,
+        });
+      }
 
       // Touch timestamps
       await this.threadMapRepo.updateLastMessage(existingMapping.id);
@@ -2644,6 +2692,7 @@ export class GatewayService {
         unix_username: user.unix_username ?? null,
         status: SessionStatus.IDLE,
         agentic_tool: agenticTool,
+        agentic_tool_preset_id: agenticConfig?.presetId,
         permission_config: gatewayPermissionConfig,
         model_config: gatewayModelConfig,
         tasks: [],
@@ -2855,8 +2904,8 @@ export class GatewayService {
         });
       }
 
-      // Download Slack image attachments server-side and fold their stored
-      // paths into the prompt so the agent can Read them. Gated on the
+      // Download Slack image and text attachments server-side and fold their
+      // stored paths into the prompt so the agent can Read them. Gated on the
       // channel's ingest_files flag — channels without the files:read scope
       // never attempt downloads. Any failure degrades to a short note; the
       // prompt is always delivered.
@@ -2870,7 +2919,7 @@ export class GatewayService {
           typeof channelConfig.bot_token === 'string' ? channelConfig.bot_token : undefined;
         let failedAttachments = 0;
         if (botToken) {
-          const { paths, failed } = await ingestInboundImageAttachments({
+          const { paths, failed } = await ingestInboundAttachments({
             files: data.files,
             botToken,
           });
@@ -3111,8 +3160,7 @@ export class GatewayService {
    * graph is visible on a new scoped connection.
    */
   routeMessageAfterCommit(data: RouteMessageData, params?: unknown): void {
-    deferWithTenantDatabaseScope(
-      this.db,
+    deferWithTenantContext(
       params,
       async () => {
         await this.routeMessage(data);
@@ -3339,75 +3387,77 @@ export class GatewayService {
       throw new Error(`Missing tenant context for gateway listener channel ${channel.id}`);
     }
 
-    await runWithTenantDatabaseScope(this.db, tenantId, async () => {
-      const telegramUpdateId =
-        channel.channel_type === 'telegram'
-          ? getTelegramUpdateIdFromMetadata(msg.metadata)
-          : undefined;
-      if (typeof telegramUpdateId === 'number') {
-        if (await this.isTelegramUpdateAlreadyProcessed(channel, telegramUpdateId)) {
-          console.debug(
-            `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
-          );
-          return;
-        }
-
-        const reservationStatus = await this.reserveTelegramUpdate(channel, telegramUpdateId);
-        if (reservationStatus === 'processed') {
-          console.debug(
-            `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
-          );
-          return;
-        }
-        if (reservationStatus === 'side_effects_completed') {
-          console.warn(
-            `[gateway] Telegram update ${telegramUpdateId} replay reached channel ${shortId(
-              channel.id
-            )} after side effects completed; finalizing durable acknowledgement without repeating side effects`
-          );
-          await this.acknowledgeTelegramUpdate(channel, telegramUpdateId);
-          return;
-        }
-        if (reservationStatus === 'side_effects_started') {
-          throw new Error(
-            `Telegram update ${telegramUpdateId} for channel ${shortId(
-              channel.id
-            )} has ambiguous processing state; refusing to acknowledge without replay`
-          );
-        }
-
-        await this.markTelegramUpdateSideEffectsStarted(channel, telegramUpdateId);
-      }
-
-      try {
-        await this.create({
-          channel_key: channel.channel_key,
-          thread_id: msg.threadId,
-          text: msg.text,
-          user_name: msg.userId,
-          ...(msg.attachments ? { attachments: msg.attachments } : {}),
-          ...(msg.attachmentRejection ? { attachmentRejection: msg.attachmentRejection } : {}),
-          ...(msg.files ? { files: msg.files } : {}),
-          metadata: msg.metadata,
-        });
-      } catch (error) {
+    await runWithTenantContext(tenantId, async () => {
+      await runWithTenantDatabaseScope(this.db, tenantId, async () => {
+        const telegramUpdateId =
+          channel.channel_type === 'telegram'
+            ? getTelegramUpdateIdFromMetadata(msg.metadata)
+            : undefined;
         if (typeof telegramUpdateId === 'number') {
-          try {
-            await this.clearTelegramUpdateReservation(channel, telegramUpdateId);
-          } catch (clearError) {
+          if (await this.isTelegramUpdateAlreadyProcessed(channel, telegramUpdateId)) {
+            console.debug(
+              `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
+            );
+            return;
+          }
+
+          const reservationStatus = await this.reserveTelegramUpdate(channel, telegramUpdateId);
+          if (reservationStatus === 'processed') {
+            console.debug(
+              `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
+            );
+            return;
+          }
+          if (reservationStatus === 'side_effects_completed') {
             console.warn(
-              `[gateway] Failed to clear Telegram update ${telegramUpdateId} reservation after processing error:`,
-              redactProviderErrorMessage(clearError)
+              `[gateway] Telegram update ${telegramUpdateId} replay reached channel ${shortId(
+                channel.id
+              )} after side effects completed; finalizing durable acknowledgement without repeating side effects`
+            );
+            await this.acknowledgeTelegramUpdate(channel, telegramUpdateId);
+            return;
+          }
+          if (reservationStatus === 'side_effects_started') {
+            throw new Error(
+              `Telegram update ${telegramUpdateId} for channel ${shortId(
+                channel.id
+              )} has ambiguous processing state; refusing to acknowledge without replay`
             );
           }
-        }
-        throw error;
-      }
 
-      if (typeof telegramUpdateId === 'number') {
-        await this.markTelegramUpdateSideEffectsCompleted(channel, telegramUpdateId);
-        await this.acknowledgeTelegramUpdate(channel, telegramUpdateId);
-      }
+          await this.markTelegramUpdateSideEffectsStarted(channel, telegramUpdateId);
+        }
+
+        try {
+          await this.create({
+            channel_key: channel.channel_key,
+            thread_id: msg.threadId,
+            text: msg.text,
+            user_name: msg.userId,
+            ...(msg.attachments ? { attachments: msg.attachments } : {}),
+            ...(msg.attachmentRejection ? { attachmentRejection: msg.attachmentRejection } : {}),
+            ...(msg.files ? { files: msg.files } : {}),
+            metadata: msg.metadata,
+          });
+        } catch (error) {
+          if (typeof telegramUpdateId === 'number') {
+            try {
+              await this.clearTelegramUpdateReservation(channel, telegramUpdateId);
+            } catch (clearError) {
+              console.warn(
+                `[gateway] Failed to clear Telegram update ${telegramUpdateId} reservation after processing error:`,
+                redactProviderErrorMessage(clearError)
+              );
+            }
+          }
+          throw error;
+        }
+
+        if (typeof telegramUpdateId === 'number') {
+          await this.markTelegramUpdateSideEffectsCompleted(channel, telegramUpdateId);
+          await this.acknowledgeTelegramUpdate(channel, telegramUpdateId);
+        }
+      });
     });
   }
 

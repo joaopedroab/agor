@@ -5,7 +5,9 @@ import {
   buildSlackManifest,
   requiredBotEvents,
   requiredBotScopes,
+  SLACK_APPS_URL,
   type SlackWizardOptions,
+  slackAppManifestUrl,
 } from '@agor/core/gateway/slack-manifest';
 import type {
   AgenticToolName,
@@ -17,6 +19,7 @@ import type {
   GatewayEnvVar,
   MCPServer,
   PermissionMode,
+  SlackAppInfo,
   SlackTestResult,
   User,
   UUID,
@@ -75,7 +78,10 @@ import { mapToSortedArray } from '@/utils/mapHelpers';
 import { useThemedMessage } from '@/utils/message';
 import { filterBySettingsSearch } from '@/utils/settingsSearch';
 import { ACCESS_TOKEN_KEY } from '@/utils/tokenRefresh';
-import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
+import {
+  AgenticToolConfigurationPicker,
+  INLINE_AGENTIC_CONFIGURATION,
+} from '../AgenticToolConfigurationPicker';
 import { AgentSelectionGrid } from '../AgentSelectionGrid';
 import { AVAILABLE_AGENTS } from '../AgentSelectionGrid/availableAgents';
 import { HighlightMatch } from '../HighlightMatch';
@@ -222,6 +228,7 @@ const GatewayEnvVarsEditor: React.FC<{
   value?: GatewayEnvVar[];
   onChange?: (vars: GatewayEnvVar[]) => void;
 }> = ({ value = [], onChange }) => {
+  const { token } = theme.useToken();
   // Stable row IDs so React doesn't remount inputs on every keystroke.
   // Each row gets a monotonically increasing ID that persists across re-renders.
   const nextId = useRef(0);
@@ -278,7 +285,7 @@ const GatewayEnvVarsEditor: React.FC<{
                 fontFamily: 'monospace',
                 fontSize: 12,
                 color: 'transparent',
-                textShadow: '0 0 6px rgba(255,255,255,0.5)',
+                textShadow: `0 0 6px ${token.colorTextDisabled}`,
               }}
             />
           ) : (
@@ -404,6 +411,7 @@ const SLACK_PROBE_FIELDS = new Set<string>([
   'agent_channel_history',
   'agent_reactions',
   'agent_file_upload',
+  'agent_file_download',
   'slack_public_scope',
   'allowed_channel_ids',
 ]);
@@ -592,12 +600,101 @@ const SlackTestResultView: React.FC<{ result: SlackTestResult }> = ({ result }) 
 };
 
 /**
+ * External link to the channel's Slack app manifest editor. The app + team ids
+ * are resolved server-side from the stored bot token
+ * (`gateway-channels/app-info`); when unresolved the link degrades to the
+ * generic Slack app list.
+ */
+const SlackAppManifestLink: React.FC<{ appInfo: SlackAppInfo | null }> = ({ appInfo }) => {
+  const href = slackAppManifestUrl(appInfo?.appId, appInfo?.teamId);
+  return (
+    <Typography.Link href={href} target="_blank" rel="noopener noreferrer">
+      {href === SLACK_APPS_URL ? 'Open Slack apps' : 'Open Slack app manifest'} ↗
+    </Typography.Link>
+  );
+};
+
+/**
+ * Inline warning shown while editing a channel whenever the pending capability
+ * toggles require OAuth scopes the SAVED config does not — i.e. the installed
+ * Slack app is now missing scopes and must be updated + reinstalled before the
+ * capability works. The delta comes from {@link requiredBotScopes} on both
+ * configs (single source of truth), so unrelated edits never trigger it and
+ * removing a capability never warns.
+ */
+const SlackScopeChangeWarning: React.FC<{
+  addedScopes: string[];
+  appInfo: SlackAppInfo | null;
+  options: SlackWizardOptions;
+}> = ({ addedScopes, appInfo, options }) => {
+  const { showError } = useThemedMessage();
+  const [copied, setCopied] = useState(false);
+  const scopeKey = addedScopes.join(',');
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the scope set is the change trigger, not a value read in the body.
+  useEffect(() => {
+    setCopied(false);
+  }, [scopeKey]);
+
+  if (addedScopes.length === 0) return null;
+
+  const handleCopy = async () => {
+    const ok = await copyTextToClipboard(JSON.stringify(buildSlackManifest(options), null, 2));
+    if (ok) {
+      setCopied(true);
+    } else {
+      showError('Copy failed — copy the manifest from the App Manifest section.');
+    }
+  };
+
+  return (
+    <CompactAlert
+      type="warning"
+      icon={<ExclamationCircleOutlined />}
+      heading={
+        <>
+          This change adds the{' '}
+          {addedScopes.map((scope, i) => (
+            <span key={scope}>
+              {i > 0 ? ', ' : ''}
+              <code>{scope}</code>
+            </span>
+          ))}{' '}
+          scope{addedScopes.length > 1 ? 's' : ''}
+        </>
+      }
+      description={
+        <>
+          <div style={{ marginBottom: 6 }}>
+            Saving here does not change the Slack app — update its manifest and reinstall the app
+            for the new scope{addedScopes.length > 1 ? 's' : ''} to take effect.
+          </div>
+          <Space size="small" wrap>
+            <SlackAppManifestLink appInfo={appInfo} />
+            <Button
+              size="small"
+              icon={copied ? <CheckCircleOutlined /> : <CopyOutlined />}
+              onClick={handleCopy}
+            >
+              {copied ? 'Copied' : 'Copy manifest'}
+            </Button>
+          </Space>
+        </>
+      }
+    />
+  );
+};
+
+/**
  * Recommended Slack app manifest for an existing channel. Derived from the
  * channel's current capability toggles via {@link buildSlackManifest}, so it
  * always shows the manifest the app *should* have — not a readout of the app's
  * live Slack configuration. Paste it back into Slack to align scopes/events.
  */
-const SlackManifestPanel: React.FC<{ options: SlackWizardOptions }> = ({ options }) => {
+const SlackManifestPanel: React.FC<{
+  options: SlackWizardOptions;
+  appInfo: SlackAppInfo | null;
+}> = ({ options, appInfo }) => {
   const { token } = theme.useToken();
   const { showError } = useThemedMessage();
   const [copied, setCopied] = useState(false);
@@ -631,7 +728,15 @@ const SlackManifestPanel: React.FC<{ options: SlackWizardOptions }> = ({ options
         configuration, not a readout of your app&apos;s live settings. Paste it into{' '}
         <strong>App Manifest</strong> in your Slack app to align its scopes and events.
       </Typography.Text>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 8,
+        }}
+      >
+        <SlackAppManifestLink appInfo={appInfo} />
         <Button
           size="small"
           icon={copied ? <CheckCircleOutlined /> : <CopyOutlined />}
@@ -689,6 +794,7 @@ const SecretStatusTag: React.FC<{ stored: boolean }> = ({ stored }) =>
  * {@link requiredBotScopes}, so the user never adds a scope by hand.
  */
 const SlackSetupWizard: React.FC<{
+  client: AgorClient | null;
   form: FormInstance;
   userById: Map<string, User>;
   mcpServerById: Map<string, MCPServer>;
@@ -700,6 +806,7 @@ const SlackSetupWizard: React.FC<{
   testLoading: boolean;
   onTest: () => void;
 }> = ({
+  client,
   form,
   userById,
   mcpServerById,
@@ -729,6 +836,8 @@ const SlackSetupWizard: React.FC<{
     Form.useWatch('agent_reactions', form) ?? SLACK_AGENT_TOOL_DEFAULTS.reactions;
   const agentFileUpload =
     Form.useWatch('agent_file_upload', form) ?? SLACK_AGENT_TOOL_DEFAULTS.file_upload;
+  const agentFileDownload =
+    Form.useWatch('agent_file_download', form) ?? SLACK_AGENT_TOOL_DEFAULTS.file_download;
   const publicScope = (Form.useWatch('slack_public_scope', form) as string) ?? 'all';
 
   const wizardOptions: SlackWizardOptions = useMemo(
@@ -745,6 +854,7 @@ const SlackSetupWizard: React.FC<{
         channel_history: agentChannelHistory,
         reactions: agentReactions,
         file_upload: agentFileUpload,
+        file_download: agentFileDownload,
       },
     }),
     [
@@ -759,6 +869,7 @@ const SlackSetupWizard: React.FC<{
       agentChannelHistory,
       agentReactions,
       agentFileUpload,
+      agentFileDownload,
     ]
   );
 
@@ -951,11 +1062,11 @@ const SlackSetupWizard: React.FC<{
         )}
 
         <Form.Item
-          label="Ingest attached images"
+          label="Ingest attached files"
           name="ingest_files"
           valuePropName="checked"
           initialValue={false}
-          tooltip="Download images attached to inbound messages (screenshots) so session agents can view them. Adds the files:read scope."
+          tooltip="Download images and text files (screenshots, logs, CSV, JSON) attached to inbound messages so session agents can read them. Adds the files:read scope."
         >
           <Switch />
         </Form.Item>
@@ -996,6 +1107,16 @@ const SlackSetupWizard: React.FC<{
           valuePropName="checked"
           initialValue={false}
           tooltip="Let session agents upload files/images to a channel or thread through the gateway MCP tool. Adds the files:write scope."
+        >
+          <Switch />
+        </Form.Item>
+
+        <Form.Item
+          label="Agents can download files"
+          name="agent_file_download"
+          valuePropName="checked"
+          initialValue={false}
+          tooltip="Let session agents download image/text files referenced in Slack history through the gateway MCP tool. Adds the files:read scope."
         >
           <Switch />
         </Form.Item>
@@ -1150,10 +1271,11 @@ const SlackSetupWizard: React.FC<{
                     showHelperText={false}
                     showComparisonLink={false}
                   />
-                  <AgenticToolConfigForm
-                    agenticTool={selectedAgent as AgenticToolName}
+                  <AgenticToolConfigurationPicker
+                    tool={selectedAgent as AgenticToolName}
                     mcpServerById={mcpServerById}
                     showHelpText={false}
+                    client={client}
                   />
                 </Space>
               ),
@@ -1356,6 +1478,7 @@ const TelegramSetupPanel: React.FC<{
 
 /** Shared form fields for create and edit modals */
 const ChannelFormFields: React.FC<{
+  client: AgorClient | null;
   form: FormInstance;
   mode: 'create' | 'edit';
   channelType: ChannelType;
@@ -1375,7 +1498,10 @@ const ChannelFormFields: React.FC<{
   slackTestResult: SlackTestResult | null;
   slackTestLoading: boolean;
   onSlackTest: () => void;
+  /** Slack app identity resolved server-side on edit open (edit mode only). */
+  slackAppInfo: SlackAppInfo | null;
 }> = ({
+  client,
   form,
   mode,
   channelType,
@@ -1392,8 +1518,10 @@ const ChannelFormFields: React.FC<{
   slackTestResult,
   slackTestLoading,
   onSlackTest,
+  slackAppInfo,
 }) => {
   const { showError } = useThemedMessage();
+  const { token } = theme.useToken();
 
   // Watch message source settings for showing warnings/scope requirements. A
   // watched value is `undefined` while its (lazily-rendered) Collapse panel is
@@ -1429,6 +1557,9 @@ const ChannelFormFields: React.FC<{
   const agentFileUpload = Boolean(
     Form.useWatch('agent_file_upload', form) ?? storedAgentTools.file_upload
   );
+  const agentFileDownload = Boolean(
+    Form.useWatch('agent_file_download', form) ?? storedAgentTools.file_download
+  );
   const alignGithubUsers = Form.useWatch('github_align_users', form) ?? false;
   // Track the live Name field so the manifest preview reflects in-progress edits,
   // falling back to the stored channel name.
@@ -1453,6 +1584,7 @@ const ChannelFormFields: React.FC<{
         channel_history: agentChannelHistory,
         reactions: agentReactions,
         file_upload: agentFileUpload,
+        file_download: agentFileDownload,
       },
     }),
     [
@@ -1467,10 +1599,41 @@ const ChannelFormFields: React.FC<{
       agentChannelHistory,
       agentReactions,
       agentFileUpload,
+      agentFileDownload,
     ]
   );
   const slackScopes = useMemo(() => requiredBotScopes(slackOptions), [slackOptions]);
   const slackEvents = useMemo(() => requiredBotEvents(slackOptions), [slackOptions]);
+
+  // Scopes the channel's SAVED config requires — the baseline for detecting
+  // that a pending toggle ADDS a scope the installed Slack app may not hold.
+  const savedSlackScopes = useMemo(() => {
+    if (mode !== 'edit' || editingChannel?.channel_type !== 'slack') return null;
+    return requiredBotScopes({
+      appName: editingChannel.name || 'Agor',
+      publicChannels: Boolean(slackConfig?.enable_channels),
+      privateChannels: Boolean(slackConfig?.enable_groups),
+      groupDms: Boolean(slackConfig?.enable_mpim),
+      alignUsers: Boolean(slackConfig?.align_slack_users),
+      outbound: Boolean(slackConfig?.outbound_enabled),
+      ingestFiles: Boolean(slackConfig?.ingest_files),
+      agentTools: storedAgentTools,
+    });
+  }, [mode, editingChannel, slackConfig, storedAgentTools]);
+
+  const addedSlackScopes = useMemo(() => {
+    if (!savedSlackScopes) return [];
+    const saved = new Set(savedSlackScopes);
+    return slackScopes.filter((scope) => !saved.has(scope));
+  }, [savedSlackScopes, slackScopes]);
+
+  const scopeChangeWarning = (
+    <SlackScopeChangeWarning
+      addedScopes={addedSlackScopes}
+      appInfo={slackAppInfo}
+      options={slackOptions}
+    />
+  );
 
   const botTokenStored = isSecretStored(slackConfig, 'bot_token');
   const appTokenStored = isSecretStored(slackConfig, 'app_token');
@@ -1920,10 +2083,11 @@ const ChannelFormFields: React.FC<{
                           showHelperText={false}
                           showComparisonLink={false}
                         />
-                        <AgenticToolConfigForm
-                          agenticTool={selectedAgent as AgenticToolName}
+                        <AgenticToolConfigurationPicker
+                          tool={selectedAgent as AgenticToolName}
                           mcpServerById={mcpServerById}
                           showHelpText={false}
+                          client={client}
                         />
                       </Space>
                     ),
@@ -2144,10 +2308,11 @@ const ChannelFormFields: React.FC<{
                       showHelperText={false}
                       showComparisonLink={false}
                     />
-                    <AgenticToolConfigForm
-                      agenticTool={selectedAgent as AgenticToolName}
+                    <AgenticToolConfigurationPicker
+                      tool={selectedAgent as AgenticToolName}
                       mcpServerById={mcpServerById}
                       showHelpText={false}
+                      client={client}
                     />
                   </Space>
                 ),
@@ -2196,6 +2361,7 @@ const ChannelFormFields: React.FC<{
         {/* ── Slack guided setup wizard (create steps 1–3) ── */}
         {channelType === 'slack' && mode === 'create' && createStep >= 1 && (
           <SlackSetupWizard
+            client={client}
             form={form}
             userById={userById}
             mcpServerById={mcpServerById}
@@ -2209,6 +2375,12 @@ const ChannelFormFields: React.FC<{
         )}
 
         {/* ── Collapsible sections (Slack edit) ── */}
+        {channelType === 'slack' && mode === 'edit' && (
+          <div style={{ marginBottom: 8 }}>
+            <SlackOutlined style={{ marginInlineEnd: 6 }} />
+            <SlackAppManifestLink appInfo={slackAppInfo} />
+          </div>
+        )}
         {channelType === 'slack' && mode === 'edit' && (
           <Collapse
             ghost
@@ -2227,25 +2399,27 @@ const ChannelFormFields: React.FC<{
                   />
                 ),
                 children: (
-                  <PlatformIdentityFields
-                    alignFieldName="align_slack_users"
-                    alignLabel="Align Slack users"
-                    alignDescription="Match Slack profile email to an Agor user. Unmatched users are rejected."
-                    alignUsers={alignSlackUsers}
-                    userById={userById}
-                    alignedContent={
-                      <CompactAlert
-                        type="info"
-                        heading="Requires users:read.email scope"
-                        description={
-                          <span>
-                            Add <code>users:read.email</code> to your Slack app so Agor can match
-                            Slack profiles by email.
-                          </span>
-                        }
-                      />
-                    }
-                  />
+                  <>
+                    <PlatformIdentityFields
+                      alignFieldName="align_slack_users"
+                      alignLabel="Align Slack users"
+                      alignDescription="Match Slack profile email to an Agor user. Unmatched users are rejected."
+                      alignUsers={alignSlackUsers}
+                      userById={userById}
+                      alignedContent={
+                        <CompactAlert
+                          type="info"
+                          heading="Requires users:read.email scope"
+                          description={
+                            <span>
+                              Add <code>users:read.email</code> to your Slack app so Agor can match
+                              Slack profiles by email.
+                            </span>
+                          }
+                        />
+                      }
+                    />
+                  </>
                 ),
               },
               // ── Credentials ──
@@ -2328,7 +2502,7 @@ const ChannelFormFields: React.FC<{
                     subtitle="recommended scopes & events"
                   />
                 ),
-                children: <SlackManifestPanel options={slackOptions} />,
+                children: <SlackManifestPanel options={slackOptions} appInfo={slackAppInfo} />,
               },
 
               // ── Message Sources ──
@@ -2381,11 +2555,11 @@ const ChannelFormFields: React.FC<{
                     </Form.Item>
 
                     <Form.Item
-                      label="Ingest attached images"
+                      label="Ingest attached files"
                       name="ingest_files"
                       valuePropName="checked"
                       initialValue={false}
-                      tooltip="Download images attached to inbound messages (screenshots) so session agents can view them. Requires the files:read scope."
+                      tooltip="Download images and text files (screenshots, logs, CSV, JSON) attached to inbound messages so session agents can read them. Requires the files:read scope."
                     >
                       <Switch />
                     </Form.Item>
@@ -2426,6 +2600,16 @@ const ChannelFormFields: React.FC<{
                       valuePropName="checked"
                       initialValue={false}
                       tooltip="Let session agents upload files/images to a channel or thread through the gateway MCP tool. Requires the files:write scope."
+                    >
+                      <Switch />
+                    </Form.Item>
+
+                    <Form.Item
+                      label="Agents can download files"
+                      name="agent_file_download"
+                      valuePropName="checked"
+                      initialValue={false}
+                      tooltip="Let session agents download image/text files referenced in Slack history through the gateway MCP tool. Requires the files:read scope."
                     >
                       <Switch />
                     </Form.Item>
@@ -2603,10 +2787,11 @@ const ChannelFormFields: React.FC<{
                       showHelperText={false}
                       showComparisonLink={false}
                     />
-                    <AgenticToolConfigForm
-                      agenticTool={selectedAgent as AgenticToolName}
+                    <AgenticToolConfigurationPicker
+                      tool={selectedAgent as AgenticToolName}
                       mcpServerById={mcpServerById}
                       showHelpText={false}
+                      client={client}
                     />
                   </Space>
                 ),
@@ -2638,6 +2823,27 @@ const ChannelFormFields: React.FC<{
               },
             ]}
           />
+        )}
+
+        {/* Pinned to the bottom of the scrollable form body: the toggles that
+            add scopes live deep inside collapse panels, so an in-flow alert
+            above them is off-screen at the moment the user acts. Sticky keeps
+            it visible while toggling anywhere in the form and again at save
+            time. Solid background so form items don't show through the
+            (translucent) alert fill while it floats. */}
+        {channelType === 'slack' && mode === 'edit' && addedSlackScopes.length > 0 && (
+          <div
+            style={{
+              position: 'sticky',
+              bottom: 0,
+              zIndex: 2,
+              marginTop: 12,
+              padding: '8px 0',
+              background: token.colorBgElevated,
+            }}
+          >
+            {scopeChangeWarning}
+          </div>
         )}
       </div>
     </>
@@ -2689,6 +2895,12 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
   // ── Slack guided-setup state (create mode) ──
   const [slackTestLoading, setSlackTestLoading] = useState(false);
   const [slackTestResult, setSlackTestResult] = useState<SlackTestResult | null>(null);
+  // Slack app identity resolved server-side when the edit modal opens (edit mode).
+  const [slackAppInfo, setSlackAppInfo] = useState<SlackAppInfo | null>(null);
+  // Channel id the in-flight app-info fetch belongs to; a response is dropped
+  // unless it still matches, so reopening the modal on another channel can't
+  // be overwritten by a slower earlier response.
+  const slackAppInfoChannelIdRef = useRef<string | null>(null);
 
   // Keep referenced target branches resolvable in CRUD even when archived branches
   // are excluded from the core store.
@@ -2767,6 +2979,8 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
   const resetSlackState = useCallback(() => {
     setSlackTestLoading(false);
     setSlackTestResult(null);
+    setSlackAppInfo(null);
+    slackAppInfoChannelIdRef.current = null;
   }, []);
 
   // Reset the whole create flow back to its universal first step.
@@ -2826,6 +3040,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
         channel_history: values.agent_channel_history ?? SLACK_AGENT_TOOL_DEFAULTS.channel_history,
         reactions: values.agent_reactions ?? SLACK_AGENT_TOOL_DEFAULTS.reactions,
         file_upload: values.agent_file_upload ?? SLACK_AGENT_TOOL_DEFAULTS.file_upload,
+        file_download: values.agent_file_download ?? SLACK_AGENT_TOOL_DEFAULTS.file_download,
       },
     };
     setSlackTestLoading(true);
@@ -2887,8 +3102,8 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
   // The initial edit-form hydration also flows through selectedAgent/editModalOpen,
   // so skip exactly that one run (consuming the one-shot ref set by handleEdit) —
   // otherwise applying the user's *global* defaults would stomp the channel's own
-  // saved config (e.g. silently wiping mcpServerIds that were just hydrated from
-  // channel.agentic_config). Every subsequent agent change — including switching
+  // saved config (including the independently hydrated MCP selection). Every subsequent
+  // agent change — including switching
   // back to the channel's original agent — legitimately re-applies that agent's
   // defaults, so the form never holds a silent mix of stale fields.
   useEffect(() => {
@@ -2902,7 +3117,6 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       activeForm.setFieldsValue({
         permissionMode: agentDefaults.permissionMode,
         modelConfig: agentDefaults.modelConfig,
-        mcpServerIds: agentDefaults.mcpServerIds,
         codexSandboxMode: agentDefaults.codexSandboxMode,
         codexApprovalPolicy: agentDefaults.codexApprovalPolicy,
         codexNetworkAccess: agentDefaults.codexNetworkAccess,
@@ -2987,6 +3201,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
         channel_history: values.agent_channel_history ?? SLACK_AGENT_TOOL_DEFAULTS.channel_history,
         reactions: values.agent_reactions ?? SLACK_AGENT_TOOL_DEFAULTS.reactions,
         file_upload: values.agent_file_upload ?? SLACK_AGENT_TOOL_DEFAULTS.file_upload,
+        file_download: values.agent_file_download ?? SLACK_AGENT_TOOL_DEFAULTS.file_download,
       };
     } else if (values.channel_type === 'telegram') {
       if (isNewSecretValue(values.telegram_bot_token)) config.bot_token = values.telegram_bot_token;
@@ -2996,23 +3211,29 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
     }
 
     // Build agentic config from form values
+    const presetId =
+      values.agenticToolPresetId && values.agenticToolPresetId !== INLINE_AGENTIC_CONFIGURATION
+        ? (values.agenticToolPresetId as GatewayAgenticConfig['presetId'])
+        : undefined;
     const agenticConfig: GatewayAgenticConfig = {
       agent: (agent || 'claude-code') as AgenticToolName,
-      ...(values.permissionMode ? { permissionMode: values.permissionMode as PermissionMode } : {}),
-      ...(values.modelConfig
+      ...(presetId ? { presetId } : {}),
+      ...(!presetId && values.permissionMode
+        ? { permissionMode: values.permissionMode as PermissionMode }
+        : {}),
+      ...(!presetId && values.modelConfig
         ? { modelConfig: values.modelConfig as GatewayAgenticConfig['modelConfig'] }
         : {}),
-      ...(values.mcpServerIds ? { mcpServerIds: values.mcpServerIds as string[] } : {}),
-      ...(values.codexSandboxMode
+      ...(!presetId && values.codexSandboxMode
         ? { codexSandboxMode: values.codexSandboxMode as GatewayAgenticConfig['codexSandboxMode'] }
         : {}),
-      ...(values.codexApprovalPolicy
+      ...(!presetId && values.codexApprovalPolicy
         ? {
             codexApprovalPolicy:
               values.codexApprovalPolicy as GatewayAgenticConfig['codexApprovalPolicy'],
           }
         : {}),
-      ...(values.codexNetworkAccess !== undefined
+      ...(!presetId && values.codexNetworkAccess !== undefined
         ? { codexNetworkAccess: values.codexNetworkAccess as boolean }
         : {}),
       // Include env vars — filter out empty-key entries only.
@@ -3035,6 +3256,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       ...(values.channel_type !== 'telegram' ? { agor_user_id: values.agor_user_id as UUID } : {}),
       config,
       agentic_config: agenticConfig,
+      mcp_server_ids: (values.mcpServerIds as string[] | undefined) ?? [],
       enabled: (values.enabled as boolean) ?? true,
     };
   };
@@ -3119,6 +3341,29 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
     skipAgentDefaultsAfterEditHydrationRef.current = true;
     setSelectedAgent(agent);
     resetSlackState();
+    // Resolve the Slack app id behind the stored bot token (best-effort; the
+    // backend returns nulls rather than erroring). Fire-and-forget so the modal
+    // opens instantly; the app link degrades to a generic Slack link meanwhile.
+    // The ref pins the response to the channel still being edited — a slow
+    // response for a previously-opened channel must not deep-link this one to
+    // the wrong Slack app.
+    slackAppInfoChannelIdRef.current = channel.channel_type === 'slack' ? channel.id : null;
+    if (channel.channel_type === 'slack' && client) {
+      void (async () => {
+        let info: SlackAppInfo | null = null;
+        try {
+          info =
+            ((await client
+              .service('gateway-channels/app-info')
+              .create({ gatewayChannelId: channel.id })) as SlackAppInfo | undefined) ?? null;
+        } catch {
+          info = null;
+        }
+        if (slackAppInfoChannelIdRef.current === channel.id) {
+          setSlackAppInfo(info);
+        }
+      })();
+    }
     editForm.resetFields();
 
     const config = channel.config as Record<string, unknown>;
@@ -3132,10 +3377,11 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       // Agentic config fields
       permissionMode: channel.agentic_config?.permissionMode,
       modelConfig: channel.agentic_config?.modelConfig,
-      mcpServerIds: channel.agentic_config?.mcpServerIds,
+      mcpServerIds: channel.mcp_server_ids ?? [],
       codexSandboxMode: channel.agentic_config?.codexSandboxMode,
       codexApprovalPolicy: channel.agentic_config?.codexApprovalPolicy,
       codexNetworkAccess: channel.agentic_config?.codexNetworkAccess,
+      agenticToolPresetId: channel.agentic_config?.presetId ?? INLINE_AGENTIC_CONFIGURATION,
       // Env vars: values are masked by the API, so on edit we show the
       // existing keys with empty values — the user re-enters values to update.
       envVars: channel.agentic_config?.envVars ?? [],
@@ -3157,6 +3403,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       formValues.agent_channel_history = agentTools.channel_history;
       formValues.agent_reactions = agentTools.reactions;
       formValues.agent_file_upload = agentTools.file_upload;
+      formValues.agent_file_download = agentTools.file_download;
     } else if (channel.channel_type === 'github') {
       formValues.github_app_id = config?.app_id;
       formValues.github_installation_id = config?.installation_id;
@@ -3360,7 +3607,14 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
             onChange={(event) => setSearchTerm(event.target.value)}
             style={{ width: 360 }}
           />
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalOpen(true)}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => {
+              createForm.setFieldValue('mcpServerIds', currentUser?.default_mcp_server_ids ?? []);
+              setCreateModalOpen(true);
+            }}
+          >
             Add Channel
           </Button>
         </Space>
@@ -3449,6 +3703,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
           style={{ marginTop: 16 }}
         >
           <ChannelFormFields
+            client={client}
             form={createForm}
             mode="create"
             channelType={channelType}
@@ -3464,6 +3719,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
             slackTestResult={slackTestResult}
             slackTestLoading={slackTestLoading}
             onSlackTest={handleSlackTest}
+            slackAppInfo={null}
           />
         </Form>
       </Modal>
@@ -3486,6 +3742,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       >
         <Form form={editForm} layout="vertical" preserve style={{ marginTop: 16 }}>
           <ChannelFormFields
+            client={client}
             form={editForm}
             mode="edit"
             channelType={channelType}
@@ -3502,6 +3759,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
             slackTestResult={slackTestResult}
             slackTestLoading={slackTestLoading}
             onSlackTest={handleSlackEditTest}
+            slackAppInfo={slackAppInfo}
           />
         </Form>
       </Modal>

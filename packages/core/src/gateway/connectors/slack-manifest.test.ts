@@ -5,6 +5,7 @@ import {
   requiredBotEvents,
   requiredBotScopes,
   type SlackWizardOptions,
+  slackAppManifestUrl,
 } from './slack-manifest';
 
 /**
@@ -138,6 +139,20 @@ describe('requiredBotScopes', () => {
     );
   });
 
+  it('adds files:read for the file_download capability and omits it otherwise', () => {
+    expect(requiredBotScopes(withOptions({ agentTools: { file_download: true } }))).toEqual([
+      'chat:write',
+      'files:read',
+      'im:history',
+      'im:read',
+      'users:read',
+    ]);
+    expect(requiredBotScopes(baseOptions)).not.toContain('files:read');
+    expect(requiredBotScopes(withOptions({ agentTools: { file_download: false } }))).not.toContain(
+      'files:read'
+    );
+  });
+
   it('all capabilities on — de-duplicated and sorted', () => {
     const allOn = withOptions({
       publicChannels: true,
@@ -151,6 +166,7 @@ describe('requiredBotScopes', () => {
         channel_history: true,
         reactions: true,
         file_upload: true,
+        file_download: true,
       },
     });
     expect(requiredBotScopes(allOn)).toEqual([
@@ -197,18 +213,20 @@ describe('requiredBotScopes', () => {
 });
 
 describe('resolveSlackAgentTools', () => {
-  it('defaults thread_history ON and channel_history/reactions/file_upload OFF for absent config', () => {
+  it('defaults thread_history ON and channel_history/reactions/file_upload/file_download OFF for absent config', () => {
     expect(resolveSlackAgentTools(undefined)).toEqual({
       thread_history: true,
       channel_history: false,
       reactions: false,
       file_upload: false,
+      file_download: false,
     });
     expect(resolveSlackAgentTools({})).toEqual({
       thread_history: true,
       channel_history: false,
       reactions: false,
       file_upload: false,
+      file_download: false,
     });
   });
 
@@ -219,12 +237,14 @@ describe('resolveSlackAgentTools', () => {
         channel_history: true,
         reactions: true,
         file_upload: true,
+        file_download: true,
       })
     ).toEqual({
       thread_history: false,
       channel_history: true,
       reactions: true,
       file_upload: true,
+      file_download: true,
     });
   });
 
@@ -234,6 +254,7 @@ describe('resolveSlackAgentTools', () => {
       channel_history: false,
       reactions: false,
       file_upload: false,
+      file_download: false,
     });
     expect(
       resolveSlackAgentTools({
@@ -241,18 +262,21 @@ describe('resolveSlackAgentTools', () => {
         channel_history: 1,
         reactions: 'true',
         file_upload: 0,
+        file_download: 'on',
       })
     ).toEqual({
       thread_history: true,
       channel_history: false,
       reactions: false,
       file_upload: false,
+      file_download: false,
     });
     expect(resolveSlackAgentTools([true])).toEqual({
       thread_history: true,
       channel_history: false,
       reactions: false,
       file_upload: false,
+      file_download: false,
     });
   });
 });
@@ -448,5 +472,39 @@ describe('buildSlackManifest', () => {
         },
       }
     `);
+  });
+});
+
+describe('slackAppManifestUrl', () => {
+  it('deep-links to the workspace-scoped manifest editor when both ids are known', () => {
+    // The per-app api.slack.com/apps/{id} path 404s; the manifest editor lives
+    // on the team-scoped app-settings surface.
+    expect(slackAppManifestUrl('A0BH0A7TUGJ', 'T0BELR0LTNG')).toBe(
+      'https://app.slack.com/app-settings/T0BELR0LTNG/A0BH0A7TUGJ/app-manifest'
+    );
+    expect(slackAppManifestUrl('A0BH0A7TUGJ', 'E0123ORG')).toBe(
+      'https://app.slack.com/app-settings/E0123ORG/A0BH0A7TUGJ/app-manifest'
+    );
+  });
+
+  it('falls back to the generic app list when either id is unresolved', () => {
+    expect(slackAppManifestUrl(null, null)).toBe('https://api.slack.com/apps');
+    expect(slackAppManifestUrl(undefined, undefined)).toBe('https://api.slack.com/apps');
+    expect(slackAppManifestUrl('', '')).toBe('https://api.slack.com/apps');
+    expect(slackAppManifestUrl('A0BH0A7TUGJ', null)).toBe('https://api.slack.com/apps');
+    expect(slackAppManifestUrl(null, 'T0BELR0LTNG')).toBe('https://api.slack.com/apps');
+  });
+
+  it('falls back when either id does not match its Slack id shape', () => {
+    // Both ids are interpolated into a URL path, so anything that could alter
+    // the path/query/fragment must be refused, not encoded.
+    expect(slackAppManifestUrl('A123/../evil?x#y', 'T0BELR0LTNG')).toBe(
+      'https://api.slack.com/apps'
+    );
+    expect(slackAppManifestUrl('a123abc', 'T0BELR0LTNG')).toBe('https://api.slack.com/apps');
+    expect(slackAppManifestUrl('B0123ABC', 'T0BELR0LTNG')).toBe('https://api.slack.com/apps');
+    expect(slackAppManifestUrl('A0BH0A7TUGJ', 'T1/../evil?x#y')).toBe('https://api.slack.com/apps');
+    expect(slackAppManifestUrl('A0BH0A7TUGJ', 't0belr0ltng')).toBe('https://api.slack.com/apps');
+    expect(slackAppManifestUrl('A0BH0A7TUGJ', 'X0123ABC')).toBe('https://api.slack.com/apps');
   });
 });
