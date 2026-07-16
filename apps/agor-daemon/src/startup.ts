@@ -173,8 +173,25 @@ async function cleanupOrphanStatusesInTenantScope(
         task.task_id,
         {
           status: TaskStatus.STOPPED,
+          metadata: {
+            ...(task.metadata ?? {}),
+            termination: {
+              kind: 'stopped',
+              source: 'daemon_recovery',
+              reason: wasGraceful
+                ? 'Daemon restarted before the task reached a terminal state.'
+                : 'Daemon recovered a task left active after an ungraceful shutdown.',
+              partial_result_available:
+                task.message_range?.end_index > task.message_range?.start_index,
+              recorded_at: new Date().toISOString(),
+            },
+          },
         },
-        startupParams as never
+        {
+          ...startupParams,
+          suppressTerminalQueueProcessing: true,
+          suppressCompletionCallbacks: true,
+        } as never
       );
       startupDebug(
         `[startup] stopped orphaned task ${shortId(task.task_id)} (was: ${task.status})`
@@ -198,8 +215,22 @@ async function cleanupOrphanStatusesInTenantScope(
         task.task_id,
         {
           status: TaskStatus.STOPPED,
+          metadata: {
+            ...(task.metadata ?? {}),
+            termination: {
+              kind: 'stopped',
+              source: 'daemon_recovery',
+              reason: 'Queued task discarded during daemon startup recovery.',
+              partial_result_available: false,
+              recorded_at: new Date().toISOString(),
+            },
+          },
         },
-        startupParams as never
+        {
+          ...startupParams,
+          suppressTerminalQueueProcessing: true,
+          suppressCompletionCallbacks: true,
+        } as never
       );
     }
   }
@@ -469,6 +500,17 @@ async function injectRestartNoticesInTenantScope(
       console.warn(
         `   ⚠️  Failed to inject restart notice into session ${shortId(sessionId)}:`,
         err
+      );
+    }
+  }
+
+  for (const task of orphanedTasks) {
+    try {
+      await tasksService.dispatchTerminalReceipt(task.task_id, startupParams as never);
+    } catch (error) {
+      console.warn(
+        `   ⚠️  Failed to dispatch restart terminal receipt for task ${shortId(task.task_id)}:`,
+        error
       );
     }
   }

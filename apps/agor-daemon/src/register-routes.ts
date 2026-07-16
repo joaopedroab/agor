@@ -2222,6 +2222,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           data && typeof data === 'object' && 'reason' in data && typeof data.reason === 'string'
             ? data.reason
             : undefined;
+        const stopSource =
+          data && typeof data === 'object' && 'source' in data && data.source === 'mcp'
+            ? 'mcp'
+            : 'user';
 
         const sessionsServiceWithHooks = app.service('sessions') as unknown as SessionsServiceImpl;
 
@@ -2236,7 +2240,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             },
             id as SessionID,
             params,
-            { reason: stopReason }
+            { reason: stopReason, source: stopSource }
           )
         );
 

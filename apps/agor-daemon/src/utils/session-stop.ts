@@ -50,8 +50,8 @@ export async function markStoppedSessionPromptableNoDrain(
  * Stop semantics, in one place:
  * - target only the active task for the session;
  * - preserve queued work so it can drain after Stop;
- * - suppress task-terminal side effects that would independently drain or
- *   dispatch callbacks for a user-stopped turn;
+ * - suppress independent child queue draining while still delivering a
+ *   terminal receipt to a configured parent callback;
  * - leave the session idle/promptable before the caller kicks the queue
  *   drainer after releasing the session turn lock.
  *
@@ -62,7 +62,7 @@ export async function stopSessionPreserveQueue(
   deps: StopSessionDeps,
   sessionId: SessionID,
   params: Params = {},
-  options: { reason?: string } = {}
+  options: { reason?: string; source?: 'user' | 'mcp' | 'system' } = {}
 ): Promise<StopSessionResult> {
   const session = await deps.sessionsService.get(sessionId, params);
 
@@ -108,11 +108,21 @@ export async function stopSessionPreserveQueue(
       {
         status: TaskStatus.STOPPED,
         completed_at: new Date().toISOString(),
+        metadata: {
+          ...(latestTask.metadata ?? {}),
+          termination: {
+            kind: 'stopped',
+            source: options.source ?? 'user',
+            ...(options.reason ? { reason: options.reason } : {}),
+            partial_result_available:
+              latestTask.message_range?.end_index > latestTask.message_range?.start_index,
+            recorded_at: new Date().toISOString(),
+          },
+        },
       },
       {
         ...params,
         suppressTerminalQueueProcessing: true,
-        suppressCompletionCallbacks: true,
       } as Params
     );
   } catch (error) {

@@ -329,7 +329,11 @@ describe('TasksService executor heartbeat helpers', () => {
       { status: 'idle', ready_for_prompt: true },
       undefined
     );
-    expect(service.dispatchCompletionCallbacks).not.toHaveBeenCalled();
+    expect(service.dispatchCompletionCallbacks).toHaveBeenCalledWith(
+      stoppedTask,
+      expect.objectContaining({ session_id: sessionId }),
+      undefined
+    );
     expect(triggerQueueProcessing).toHaveBeenCalledWith(sessionId, undefined);
   });
 

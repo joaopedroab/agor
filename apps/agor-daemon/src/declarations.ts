@@ -134,6 +134,7 @@ export interface TasksServiceImpl extends Service<Task, Partial<Task>, FeathersP
     data: { completed_at?: string; error_message: string },
     params?: FeathersParams
   ): Promise<Task>;
+  dispatchTerminalReceipt(id: string, params?: FeathersParams): Promise<boolean>;
 }
 
 /**

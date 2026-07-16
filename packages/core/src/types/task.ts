@@ -54,6 +54,14 @@ export interface TaskMetadata {
     queued_task_id?: TaskID;
     dispatched_at: string;
   }>;
+  /** Why a task ended without natural completion. */
+  termination?: {
+    kind: 'stopped' | 'timed_out';
+    source: 'user' | 'mcp' | 'daemon_recovery' | 'executor' | 'system';
+    reason?: string;
+    partial_result_available: boolean;
+    recorded_at: string;
+  };
   /**
    * Marks a task whose prompt was authored by the daemon (not typed by a
    * human). Used by widget auto-resume so the UI can label the queued

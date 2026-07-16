@@ -51,6 +51,7 @@ const COMPLETION_SIDE_EFFECT_TASK_STATUSES = new Set<Task['status']>([
   TaskStatus.COMPLETED,
   TaskStatus.FAILED,
   TaskStatus.STOPPED,
+  TaskStatus.TIMED_OUT,
 ]);
 
 function isAnalyticsTerminalTaskStatus(status: Task['status'] | undefined): boolean {
@@ -377,6 +378,15 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     return failedTask;
   }
 
+  async dispatchTerminalReceipt(id: string, params?: TaskParams): Promise<boolean> {
+    const task = await this.get(id, params);
+    if (!isTerminalTaskStatus(task.status)) return false;
+
+    const session = await this.app.service('sessions').get(task.session_id, params);
+    await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
+    return true;
+  }
+
   private async handleExecutorHeartbeat(task: Task, heartbeatAt: string): Promise<void> {
     const payload: ExecutorHeartbeatCallbackPayload = {
       event: 'executor_heartbeat',
@@ -462,6 +472,24 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       );
       return currentTask;
     }
+    if (currentTask && (nextStatus === TaskStatus.STOPPED || nextStatus === TaskStatus.TIMED_OUT)) {
+      data.metadata = {
+        ...(currentTask.metadata ?? {}),
+        ...(data.metadata ?? {}),
+        termination: data.metadata?.termination ?? {
+          kind: nextStatus === TaskStatus.STOPPED ? 'stopped' : 'timed_out',
+          source: 'system',
+          reason:
+            nextStatus === TaskStatus.STOPPED
+              ? 'Task stopped without a more specific reason.'
+              : 'Task timed out without a more specific reason.',
+          partial_result_available:
+            currentTask.message_range !== undefined &&
+            currentTask.message_range.end_index > currentTask.message_range.start_index,
+          recorded_at: new Date().toISOString(),
+        },
+      };
+    }
     const isAnalyticsTerminalTransition =
       isAnalyticsTerminalTaskStatus(nextStatus) &&
       !isAnalyticsTerminalTaskStatus(currentTask?.status);
@@ -543,9 +571,8 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       this.trackTaskCompleted(task);
     }
 
-    // Run completion side effects only for statuses that historically completed
-    // executor turns. Timeout paths patch session state separately and should not
-    // enqueue callbacks, mark sessions promptable, archive forks, or drain queues here.
+    // Run terminal side effects for every executor-ending status. The callback is
+    // a terminal receipt, not proof that the child completed its requested work.
     if (isCompletionSideEffectTransition) {
       // Since tasks are patched one at a time, result is always a single Task (not an array)
       const task = result as Task;
@@ -580,18 +607,14 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
           const suppressCompletionCallbacks = params?.suppressCompletionCallbacks === true;
           const suppressBtwCleanup = params?.suppressBtwCleanup === true;
 
-          // STOPPED tasks (user-cancelled or daemon-shutdown cleanup) never notify
-          // parent sessions. A stopped child represents abandoned work — the parent
-          // should not resume or be informed; it has its own lifecycle.
           const isStop = data.status === TaskStatus.STOPPED;
+          const isTimeout = data.status === TaskStatus.TIMED_OUT;
 
           if (latestTaskId && latestTaskId !== task.task_id) {
             console.log(
               `⏭️ [TasksService] Skipping session terminal-state update - task ${shortId(task.task_id)} is not the latest (latest: ${shortId(latestTaskId)})`
             );
-            // Process completion callbacks only for naturally-terminal tasks (COMPLETED/FAILED).
-            // STOPPED means the work was abandoned — don't notify the parent.
-            if (!suppressCompletionCallbacks && !isStop) {
+            if (!suppressCompletionCallbacks) {
               await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
             }
             return result;
@@ -613,7 +636,11 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
               task.session_id,
               {
                 status:
-                  data.status === TaskStatus.FAILED ? SessionStatus.FAILED : SessionStatus.IDLE,
+                  data.status === TaskStatus.FAILED
+                    ? SessionStatus.FAILED
+                    : isTimeout
+                      ? SessionStatus.TIMED_OUT
+                      : SessionStatus.IDLE,
                 ready_for_prompt: true,
               },
               params
@@ -624,7 +651,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
             );
           }
 
-          if (!suppressCompletionCallbacks && !isStop) {
+          if (!suppressCompletionCallbacks) {
             await this.dispatchCompletionCallbacksAfterCommit(task, session, params);
           }
 
@@ -647,7 +674,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
               }
             }
 
-            if (!suppressCompletionCallbacks && !isStop) {
+            if (!suppressCompletionCallbacks) {
               // Inject a result message into the parent session's conversation.
               // This is a non-prompt system message — it shows up in the UI but doesn't
               // trigger a new prompt cycle. The parent's agent never sees it.
@@ -658,11 +685,11 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
           // Fire queue processing after the outer transaction commits. spawnTaskExecutor
           // (called inside the queue processor) does significant I/O that would otherwise
           // extend this transaction and cause proxy CONNECTION_CLOSED kills.
-          if (!params?.suppressTerminalQueueProcessing) {
+          if (!params?.suppressTerminalQueueProcessing && !isTimeout) {
             await this.triggerQueueProcessingAfterCommit(task.session_id, params);
-          } else if (params?.suppressTerminalQueueProcessing) {
+          } else {
             console.log(
-              `⏭️  [TasksService] Queue trigger suppressed for session ${shortId(task.session_id)} (suppressTerminalQueueProcessing)`
+              `⏭️  [TasksService] Queue trigger suppressed for session ${shortId(task.session_id)} (${isTimeout ? 'timed_out' : 'suppressTerminalQueueProcessing'})`
             );
           }
         } catch (error) {
@@ -1089,6 +1116,8 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
         callbackSessionId: shortId(targetSessionId),
         spawnPrompt,
         status: task.status, // COMPLETED, FAILED, etc.
+        terminationReason: task.metadata?.termination?.reason,
+        terminationSource: task.metadata?.termination?.source,
         completedAt: task.completed_at || new Date().toISOString(),
         messageCount:
           task.message_range?.end_index !== undefined &&

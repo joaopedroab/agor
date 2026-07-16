@@ -10,7 +10,8 @@
  * - childTaskFullId: Full UUIDv7 of task
  * - parentSessionId: Short ID of callback target session (alias: callbackSessionId)
  * - spawnPrompt: Original prompt given to child
- * - status: Task status (COMPLETED, FAILED, etc.)
+ * - status: Task status (completed, failed, stopped, timed_out, etc.)
+ * - terminationReason / terminationSource: Why non-natural execution ended
  * - completedAt: ISO timestamp of completion
  * - messageCount: Number of messages in completed task
  * - toolUseCount: Number of tools used
@@ -24,21 +25,24 @@
 
 import { renderTemplate } from '../templates/handlebars-helpers';
 
-const DEFAULT_TEMPLATE = `[Agor] Child session {{childSessionId}} has {{#if (eq status "completed")}}completed{{else}}failed{{/if}}.
+const DEFAULT_TEMPLATE = `[Agor] Child session {{childSessionId}} reached terminal status: {{status}}.
 
 {{#if spawnPrompt}}## Original Prompt
 
 {{spawnPrompt}}
 
 {{/if}}**Status:** {{status}}
+{{#if terminationReason}}**Termination reason:** {{terminationReason}}
+{{/if}}{{#if terminationSource}}**Termination source:** {{terminationSource}}
+{{/if}}
 **Stats:** {{messageCount}} messages, {{toolUseCount}} tool uses
 
 {{#if lastAssistantMessage}}**Result:**
 {{lastAssistantMessage}}
 
-{{/if}}{{#if (eq status "completed")}}Use \`agor_tasks_get\` (taskId: "{{childTaskFullId}}") or \`agor_sessions_get\` (sessionId: "{{childSessionFullId}}") for more details.{{else}}Investigate the failure using \`agor_tasks_get\` (taskId: "{{childTaskFullId}}") or \`agor_sessions_get\` (sessionId: "{{childSessionFullId}}").
+{{/if}}{{#if (eq status "completed")}}Use \`agor_tasks_get\` (taskId: "{{childTaskFullId}}") or \`agor_sessions_get\` (sessionId: "{{childSessionFullId}}") for more details.{{else}}The child did not complete the requested work. Treat this as a terminal receipt, inspect any partial result, and use \`agor_tasks_get\` (taskId: "{{childTaskFullId}}") or \`agor_sessions_get\` (sessionId: "{{childSessionFullId}}") for details.
 
-Review what went wrong and decide whether to retry or take a different approach.{{/if}}`;
+Decide explicitly whether to retry, resume from a checkpoint, or take a different approach.{{/if}}`;
 
 export interface ChildCompletionContext {
   childSessionId: string; // Canonical short ID (shortId(childSession.session_id))
@@ -49,6 +53,8 @@ export interface ChildCompletionContext {
   callbackSessionId: string; // Alias: Canonical short ID of callback target session
   spawnPrompt?: string; // Original prompt from spawn (optional based on include_original_prompt)
   status: string; // Task status (COMPLETED, FAILED, etc.)
+  terminationReason?: string;
+  terminationSource?: string;
   completedAt: string; // ISO timestamp
   messageCount: number;
   toolUseCount: number;

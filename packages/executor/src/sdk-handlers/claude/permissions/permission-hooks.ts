@@ -254,6 +254,15 @@ export function createCanUseToolCallback(
         await deps.tasksService.patch(taskId, {
           status: TaskStatus.TIMED_OUT,
           completed_at: new Date().toISOString(),
+          metadata: {
+            termination: {
+              kind: 'timed_out',
+              source: 'executor',
+              reason: `Permission request timed out for ${toolName}.`,
+              partial_result_available: true,
+              recorded_at: new Date().toISOString(),
+            },
+          },
         });
 
         if (deps.sessionsService) {

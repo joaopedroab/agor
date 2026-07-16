@@ -1554,7 +1554,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
       const result = await ctx.app
         .service('/sessions/:id/stop')
         .create(
-          { ...(args.reason ? { reason: args.reason } : {}) },
+          { ...(args.reason ? { reason: args.reason } : {}), source: 'mcp' },
           { ...ctx.baseServiceParams, route: { id: sessionId } }
         );
 

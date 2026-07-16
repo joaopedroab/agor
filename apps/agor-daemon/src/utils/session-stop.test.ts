@@ -113,9 +113,17 @@ describe('stopSessionPreserveQueue', () => {
       expect.objectContaining({ status: 'stopped' }),
       expect.objectContaining({
         suppressTerminalQueueProcessing: true,
-        suppressCompletionCallbacks: true,
       })
     );
+    expect(tasksService.patch.mock.calls[0][1]).toMatchObject({
+      metadata: {
+        termination: {
+          kind: 'stopped',
+          source: 'user',
+          reason: 'user requested',
+        },
+      },
+    });
     expect(sessionsService.patch).toHaveBeenCalledWith(
       sessionId,
       { status: 'idle', ready_for_prompt: true },
@@ -182,7 +190,7 @@ describe('stopSessionPreserveQueue', () => {
     expect(tasksService.patch).toHaveBeenCalledWith(
       awaitingInputTask.task_id,
       expect.objectContaining({ status: 'stopped' }),
-      expect.objectContaining({ suppressCompletionCallbacks: true })
+      expect.objectContaining({ suppressTerminalQueueProcessing: true })
     );
   });
 

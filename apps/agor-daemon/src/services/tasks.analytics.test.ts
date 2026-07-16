@@ -143,7 +143,11 @@ describe('TasksService analytics lifecycle events', () => {
       }),
       { userId: runningTask.created_by }
     );
-    expect(sessionsService.patch).not.toHaveBeenCalled();
+    expect(sessionsService.patch).toHaveBeenCalledWith(
+      runningTask.session_id,
+      expect.objectContaining({ status: 'timed_out', ready_for_prompt: true }),
+      undefined
+    );
 
     track.mockClear();
     service.repository.findById = vi

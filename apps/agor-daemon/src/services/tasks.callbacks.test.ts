@@ -265,6 +265,63 @@ describe('TasksService completion callbacks', () => {
     );
   });
 
+  it('queues a terminal receipt with persisted stop details for a stopped child', async () => {
+    const { service, createPending, getStoredTask } = makeService({
+      task: {
+        metadata: { source: 'agor' },
+      },
+    });
+
+    await service.patch(taskId, {
+      status: TaskStatus.STOPPED,
+      completed_at: '2026-01-01T00:00:05.000Z',
+      metadata: {
+        termination: {
+          kind: 'stopped',
+          source: 'mcp',
+          reason: 'Review exceeded its execution budget.',
+          partial_result_available: true,
+          recorded_at: '2026-01-01T00:00:05.000Z',
+        },
+      },
+    });
+
+    await vi.waitFor(() => expect(createPending).toHaveBeenCalledTimes(1));
+    const callbackPrompt = createPending.mock.calls[0][0].full_prompt as string;
+    expect(callbackPrompt).toContain('reached terminal status: stopped');
+    expect(callbackPrompt).toContain('Review exceeded its execution budget.');
+    expect(callbackPrompt).toContain('**Termination source:** mcp');
+    expect(callbackPrompt).toContain('did not complete the requested work');
+    expect(getStoredTask()?.metadata).toMatchObject({
+      source: 'agor',
+      termination: {
+        kind: 'stopped',
+        source: 'mcp',
+      },
+    });
+  });
+
+  it('delivers a timed-out receipt without draining the child queue', async () => {
+    const { service, createPending, sessionsPatch, triggerQueueProcessing } = makeService();
+
+    await service.patch(taskId, {
+      status: TaskStatus.TIMED_OUT,
+      completed_at: '2026-01-01T00:00:05.000Z',
+    });
+
+    await vi.waitFor(() => expect(createPending).toHaveBeenCalledTimes(1));
+    expect(sessionsPatch).toHaveBeenCalledWith(
+      childSessionId,
+      expect.objectContaining({ status: 'timed_out', ready_for_prompt: true }),
+      undefined
+    );
+    expect(triggerQueueProcessing).not.toHaveBeenCalledWith(childSessionId, undefined);
+    expect(triggerQueueProcessing).toHaveBeenCalledWith(parentSessionId, {});
+    const callbackPrompt = createPending.mock.calls[0][0].full_prompt as string;
+    expect(callbackPrompt).toContain('reached terminal status: timed_out');
+    expect(callbackPrompt).toContain('Task timed out without a more specific reason.');
+  });
+
   it('includeOriginalPrompt=false queues one templated callback without an original prompt section', async () => {
     const { service, createPending } = makeService({
       childSession: {
