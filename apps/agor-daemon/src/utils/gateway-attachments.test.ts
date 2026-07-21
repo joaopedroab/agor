@@ -1,10 +1,11 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { InboundFile } from '@agor/core/gateway';
+import type { GatewayConnector, InboundAttachment, InboundFile } from '@agor/core/gateway';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildPromptWithAttachments,
+  ingestConnectorAttachments,
   ingestInboundImageAttachments,
   isAllowedSlackFileUrl,
   isIngestableImageFile,
@@ -80,6 +81,81 @@ describe('buildPromptWithAttachments', () => {
     expect(buildPromptWithAttachments('', ['/tmp/a.png', '/tmp/b.png'])).toBe(
       'Attached files:\n- /tmp/a.png\n- /tmp/b.png'
     );
+  });
+});
+
+describe('ingestConnectorAttachments', () => {
+  let uploadDir: string;
+
+  beforeEach(async () => {
+    uploadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agor-connector-attachments-'));
+    vi.spyOn(os, 'homedir').mockReturnValue(uploadDir);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await fs.rm(uploadDir, { recursive: true, force: true });
+  });
+
+  it('downloads through the connector and stores with the canonical upload policy', async () => {
+    const attachment: InboundAttachment = {
+      id: 'provider-private-id',
+      kind: 'file',
+      filename: '../Unsafe:Report.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 4,
+      caption: 'review this',
+    };
+    const downloadAttachment = vi.fn(async () => ({
+      bytes: new Uint8Array([37, 80, 68, 70]),
+      filename: attachment.filename,
+      mimeType: attachment.mimeType,
+      sizeBytes: 4,
+    }));
+    const connector = {
+      channelType: 'telegram',
+      sendMessage: vi.fn(),
+      downloadAttachment,
+    } as unknown as GatewayConnector;
+
+    const result = await ingestConnectorAttachments({ connector, attachments: [attachment] });
+
+    expect(downloadAttachment).toHaveBeenCalledWith({
+      attachment,
+      maxBytes: MAX_UPLOAD_FILE_SIZE,
+    });
+    expect(result).toHaveLength(1);
+    expect(path.basename(result[0].path)).toMatch(/^Unsafe_Report_\d+\.pdf$/);
+    expect(result[0]).toMatchObject({
+      size: 4,
+      mimeType: 'application/pdf',
+      caption: 'review this',
+    });
+    expect(await fs.readFile(result[0].path)).toEqual(Buffer.from([37, 80, 68, 70]));
+  });
+
+  it('rejects disallowed MIME types before invoking the connector', async () => {
+    const downloadAttachment = vi.fn();
+    const connector = {
+      channelType: 'telegram',
+      sendMessage: vi.fn(),
+      downloadAttachment,
+    } as unknown as GatewayConnector;
+
+    await expect(
+      ingestConnectorAttachments({
+        connector,
+        attachments: [
+          {
+            id: 'voice-id',
+            kind: 'file',
+            filename: 'voice.ogg',
+            mimeType: 'audio/ogg',
+          },
+        ],
+      })
+    ).rejects.toMatchObject({ attachmentReason: 'unsupported_mime_type' });
+    expect(downloadAttachment).not.toHaveBeenCalled();
   });
 });
 

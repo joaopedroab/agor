@@ -112,29 +112,6 @@ export interface TelegramTransportFailure {
 
 export type TelegramTransportResult = TelegramTransportSuccess | TelegramTransportFailure;
 
-export type TelegramAuthRejectionReason =
-  | 'missing_numeric_sender_id'
-  | 'unlinked_user'
-  | 'ambiguous_link';
-
-export interface TelegramLinkedUserCandidate {
-  user_id: string;
-}
-
-export interface TelegramInboundAuthSuccess {
-  ok: true;
-  telegramUserId: string;
-  agorUserId: string;
-}
-
-export interface TelegramInboundAuthFailure {
-  ok: false;
-  reason: TelegramAuthRejectionReason;
-  telegramUserId?: string;
-}
-
-export type TelegramInboundAuthDecision = TelegramInboundAuthSuccess | TelegramInboundAuthFailure;
-
 export type TelegramCommandIntent =
   | { kind: 'regular_message' }
   | { kind: 'help' }
@@ -392,35 +369,6 @@ export function telegramExternalIdentityRef(telegramUserId: unknown): {
     issuer: TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
     subject,
   };
-}
-
-/**
- * Decide whether a normalized Telegram sender is allowed to act as an Agor user.
- *
- * This is intentionally pure: callers provide already-looked-up explicit links
- * and the decision fails closed for missing, unlinked, or duplicate/ambiguous
- * links. Usernames never participate in this decision.
- */
-export function decideTelegramInboundAuth(input: {
-  telegramUserId: unknown;
-  linkedUsers: ReadonlyArray<TelegramLinkedUserCandidate>;
-}): TelegramInboundAuthDecision {
-  const telegramUserId = normalizeTelegramExternalSubject(input.telegramUserId);
-  if (!telegramUserId) {
-    return { ok: false, reason: 'missing_numeric_sender_id' };
-  }
-
-  const uniqueUserIds = Array.from(
-    new Set(input.linkedUsers.map((candidate) => candidate.user_id).filter(Boolean))
-  );
-  if (uniqueUserIds.length === 0) {
-    return { ok: false, reason: 'unlinked_user', telegramUserId };
-  }
-  if (uniqueUserIds.length > 1) {
-    return { ok: false, reason: 'ambiguous_link', telegramUserId };
-  }
-
-  return { ok: true, telegramUserId, agorUserId: uniqueUserIds[0] };
 }
 
 /**

@@ -717,7 +717,15 @@ describe('GatewayChannelsTable Telegram configuration', () => {
 
   it('keeps the stored Telegram bot token when the edit field is blank or redacted', async () => {
     const onUpdate = vi.fn();
-    renderEditTable(null, makeTelegramChannel(), onUpdate);
+    const channel = makeTelegramChannel();
+    channel.config = {
+      ...channel.config,
+      telegram_polling_state: {
+        last_processed_update_id: 42,
+        acknowledged_at: '2026-07-21T12:00:00.000Z',
+      },
+    };
+    renderEditTable(null, channel, onUpdate);
     expandPanel('Telegram Credentials');
 
     expect(screen.getByText('Stored')).toBeInTheDocument();
@@ -737,5 +745,6 @@ describe('GatewayChannelsTable Telegram configuration', () => {
       },
     });
     expect(onUpdate.mock.calls[0][1].config).not.toHaveProperty('bot_token');
+    expect(onUpdate.mock.calls[0][1].config).not.toHaveProperty('telegram_polling_state');
   });
 });

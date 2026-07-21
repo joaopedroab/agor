@@ -19,7 +19,7 @@ import type {
   TenantScopeAwareDatabase,
   TenantScopedDatabase,
 } from './client';
-import { isPostgresDatabase } from './database-wrapper';
+import { isPostgresDatabase, runTransactionWithRetry } from './database-wrapper';
 
 const tenantScopedProxyTargets = new WeakMap<object, RawDatabase | Database>();
 const tenantScopedProxyOptions = new WeakMap<object, TenantScopedDatabaseProxyOptions>();
@@ -142,6 +142,51 @@ export async function runWithTenantDatabaseScope<T>(
     );
   });
   await drainTenantDatabasePostCommitCallbacks(baseDb, tenantId, postCommitCallbacks);
+  return result;
+}
+
+/**
+ * Run idempotent database-only tenant work in a retryable top-level transaction.
+ *
+ * This is deliberately separate from `runWithTenantDatabaseScope`: retrying an
+ * arbitrary tenant callback could repeat external side effects. Callers must
+ * opt in per small, idempotent transition. On PostgreSQL, contention raised by
+ * the outer commit is retried here; on SQLite, repositories remain the owner of
+ * their transaction boundary and this only establishes the tenant context.
+ */
+export async function runWithIdempotentTenantDatabaseScopeRetry<T>(
+  db: TenantScopeAwareDatabase | RawDatabase | Database,
+  tenantId: TenantID | string | undefined,
+  work: (db: TenantScopedDatabase) => Promise<T>
+): Promise<T> {
+  if (tenantDatabaseScope.getStore()) {
+    throw new Error('Retryable tenant database work must start outside an active database scope');
+  }
+
+  const baseDb = unwrapTenantScopedDatabaseProxy(db);
+  if (!isPostgresDatabase(baseDb) || !tenantId) {
+    return runWithTenantDatabaseScope(baseDb, tenantId, work);
+  }
+
+  let committedPostCommitCallbacks: Array<() => Promise<void>> = [];
+  const result = await runTransactionWithRetry(baseDb, async (scopedDb) => {
+    const attemptPostCommitCallbacks: Array<() => Promise<void>> = [];
+    await (scopedDb as unknown as { execute(query: unknown): Promise<unknown> }).execute(
+      sql`SELECT set_config('agor.tenant_id', ${tenantId}, true)`
+    );
+    const attemptResult = await tenantDatabaseScope.run(
+      {
+        db: scopedDb,
+        kind: 'tenant',
+        tenantId,
+        postCommitCallbacks: attemptPostCommitCallbacks,
+      },
+      () => work(scopedDb as TenantScopedDatabase)
+    );
+    committedPostCommitCallbacks = attemptPostCommitCallbacks;
+    return attemptResult;
+  });
+  await drainTenantDatabasePostCommitCallbacks(baseDb, tenantId, committedPostCommitCallbacks);
   return result;
 }
 

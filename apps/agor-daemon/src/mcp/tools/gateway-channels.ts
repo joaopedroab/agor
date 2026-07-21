@@ -266,21 +266,12 @@ const gatewayChannelCreateSchema = z
     // Only the secret requirements are gated on enabled — non-secret required
     // config below is always enforced.
     if (value.enabled !== false) {
-      const requiredSecretMessages: Record<string, string> = {
-        bot_token:
-          'config.bot_token is required for Slack. Prefer a bot token stored outside the transcript when possible.',
-        app_token: 'config.app_token is required for Slack Socket Mode.',
-        private_key: 'config.private_key is required for GitHub gateway channels.',
-        app_password: 'config.app_password is required for Teams gateway channels.',
-      };
       for (const field of getRequiredSecretFields(value.channelType, config)) {
         if (!config[field]) {
           issue.addIssue({
             code: 'custom',
             path: ['config', field],
-            message:
-              requiredSecretMessages[field] ??
-              `config.${field} is required for ${value.channelType} gateway channels.`,
+            message: `config.${field} is required for ${value.channelType} gateway channels.`,
           });
         }
       }
@@ -321,17 +312,7 @@ const gatewayChannelCreateSchema = z
     }
   });
 
-const gatewayChannelCreateInputSchema = gatewayChannelCreateSchema.superRefine((value, issue) => {
-  const config = value.config ?? {};
-  if (value.channelType === 'telegram' && value.enabled !== false && !config.bot_token) {
-    issue.addIssue({
-      code: 'custom',
-      path: ['config', 'bot_token'],
-      message:
-        'config.bot_token is required to create an enabled Telegram gateway channel. Set config.enable_polling=true only when you explicitly want polling transport to start.',
-    });
-  }
-});
+const gatewayChannelCreateInputSchema = gatewayChannelCreateSchema;
 
 const slackThreadHistorySchema = z
   .strictObject({

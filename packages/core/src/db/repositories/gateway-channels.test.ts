@@ -260,6 +260,7 @@ describe('GatewayChannelRepository', () => {
       expect(
         getRequiredSecretFields('slack', { outbound_enabled: true, enable_channels: true })
       ).toEqual(['bot_token', 'app_token']);
+      expect(getRequiredSecretFields('telegram', {})).toEqual(['bot_token']);
     });
   });
 
@@ -277,9 +278,7 @@ describe('GatewayChannelRepository', () => {
         enabled: true,
         config: {},
       })
-    ).rejects.toThrow(
-      'config.bot_token is required to create or enable a Telegram gateway channel'
-    );
+    ).rejects.toThrow('missing required secret(s) bot_token');
 
     const disabled = await repo.create({
       name: 'Telegram Disabled',
@@ -318,7 +317,7 @@ describe('GatewayChannelRepository', () => {
     });
 
     await expect(repo.update(disabled.id, { enabled: true })).rejects.toThrow(
-      'config.bot_token is required to create or enable a Telegram gateway channel'
+      'missing required secret(s) bot_token'
     );
 
     const enabled = await repo.update(disabled.id, {
@@ -470,6 +469,170 @@ describe('GatewayChannelRepository', () => {
           acknowledged_at: '2026-07-10T12:00:00.000Z',
         },
       });
+    }
+  );
+
+  dbTest('atomically grants only one active Telegram polling claim', async ({ db }) => {
+    const branch = await seedBranch(db);
+    const repo = new GatewayChannelRepository(db);
+    const channel = await repo.create({
+      name: 'Telegram Polling',
+      created_by: generateId() as UUID,
+      channel_type: 'telegram',
+      target_branch_id: branch.branch_id as UUID,
+      enabled: true,
+      config: { bot_token: 'telegram-token-placeholder', enable_polling: true },
+    });
+    const now = new Date('2026-07-21T12:00:00.000Z');
+
+    const claims = await Promise.all([
+      repo.claimTelegramPollingUpdate(channel.id, 1000, { staleAfterMs: 60_000, now }),
+      repo.claimTelegramPollingUpdate(channel.id, 1000, { staleAfterMs: 60_000, now }),
+    ]);
+
+    expect(claims.filter((claim) => claim.status === 'acquired')).toHaveLength(1);
+    expect(claims.filter((claim) => claim.status === 'active')).toHaveLength(1);
+    const acquired = claims.find((claim) => claim.status === 'acquired');
+    expect(acquired).toMatchObject({ status: 'acquired', reclaimed: false });
+    if (acquired?.status !== 'acquired') throw new Error('Expected one acquired claim');
+    await expect(repo.findById(channel.id)).resolves.toMatchObject({
+      config: {
+        telegram_polling_state: {
+          inflight_update: {
+            update_id: 1000,
+            status: 'reserved',
+            updated_at: now.toISOString(),
+            lease_token: acquired.leaseToken,
+          },
+        },
+      },
+    });
+  });
+
+  dbTest('reclaims a stale Telegram polling claim inside the same transaction', async ({ db }) => {
+    const branch = await seedBranch(db);
+    const repo = new GatewayChannelRepository(db);
+    const channel = await repo.create({
+      name: 'Telegram Polling',
+      created_by: generateId() as UUID,
+      channel_type: 'telegram',
+      target_branch_id: branch.branch_id as UUID,
+      enabled: true,
+      config: {
+        bot_token: 'telegram-token-placeholder',
+        telegram_polling_state: {
+          inflight_update: {
+            update_id: 1000,
+            status: 'side_effects_started',
+            updated_at: '2026-07-21T11:58:59.000Z',
+            lease_token: 'old-lease',
+          },
+        },
+      },
+    });
+    const now = new Date('2026-07-21T12:00:00.000Z');
+
+    const reclaimed = await repo.claimTelegramPollingUpdate(channel.id, 1000, {
+      staleAfterMs: 60_000,
+      now,
+    });
+    expect(reclaimed).toMatchObject({ status: 'acquired', reclaimed: true });
+    if (reclaimed.status !== 'acquired') throw new Error('Expected stale claim to be reclaimed');
+    expect(reclaimed.leaseToken).not.toBe('old-lease');
+    await expect(repo.findById(channel.id)).resolves.toMatchObject({
+      config: {
+        telegram_polling_state: {
+          inflight_update: {
+            update_id: 1000,
+            status: 'reserved',
+            updated_at: now.toISOString(),
+            lease_token: reclaimed.leaseToken,
+          },
+        },
+      },
+    });
+    await expect(
+      repo.markTelegramPollingSideEffectsStarted(channel.id, 1000, 'old-lease')
+    ).resolves.toBe(false);
+    await expect(
+      repo.markTelegramPollingSideEffectsCompleted(channel.id, 1000, 'old-lease')
+    ).resolves.toBe(false);
+    await expect(
+      repo.acknowledgeTelegramPollingUpdate(channel.id, 1000, 'old-lease')
+    ).resolves.toBe(false);
+    await expect(repo.releaseTelegramPollingUpdate(channel.id, 1000, 'old-lease')).resolves.toBe(
+      false
+    );
+  });
+
+  dbTest(
+    'owns the complete leased Telegram polling lifecycle and processed idempotency',
+    async ({ db }) => {
+      const branch = await seedBranch(db);
+      const repo = new GatewayChannelRepository(db);
+      const channel = await repo.create({
+        name: 'Telegram Polling',
+        created_by: generateId() as UUID,
+        channel_type: 'telegram',
+        target_branch_id: branch.branch_id as UUID,
+        enabled: true,
+        config: { bot_token: 'telegram-token-placeholder' },
+      });
+      const claimed = await repo.claimTelegramPollingUpdate(channel.id, 1000, {
+        staleAfterMs: 60_000,
+        now: new Date('2026-07-21T12:00:00.000Z'),
+      });
+      if (claimed.status !== 'acquired') throw new Error('Expected polling claim');
+
+      await expect(
+        repo.markTelegramPollingSideEffectsStarted(
+          channel.id,
+          1000,
+          claimed.leaseToken,
+          new Date('2026-07-21T12:00:01.000Z')
+        )
+      ).resolves.toBe(true);
+      await expect(
+        repo.markTelegramPollingSideEffectsCompleted(
+          channel.id,
+          1000,
+          claimed.leaseToken,
+          new Date('2026-07-21T12:00:02.000Z')
+        )
+      ).resolves.toBe(true);
+      await expect(
+        repo.claimTelegramPollingUpdate(channel.id, 1000, {
+          staleAfterMs: 60_000,
+          now: new Date('2026-07-21T12:00:03.000Z'),
+        })
+      ).resolves.toEqual({ status: 'side_effects_completed', leaseToken: claimed.leaseToken });
+      await expect(
+        repo.acknowledgeTelegramPollingUpdate(
+          channel.id,
+          1000,
+          claimed.leaseToken,
+          new Date('2026-07-21T12:00:04.000Z')
+        )
+      ).resolves.toBe(true);
+      await expect(repo.findById(channel.id)).resolves.toMatchObject({
+        config: {
+          telegram_polling_state: {
+            last_processed_update_id: 1000,
+            acknowledged_at: '2026-07-21T12:00:04.000Z',
+            recent_processed_update_ids: [1000],
+          },
+        },
+      });
+      const after = await repo.findById(channel.id);
+      expect(
+        (after?.config.telegram_polling_state as Record<string, unknown>).inflight_update
+      ).toBeUndefined();
+      await expect(
+        repo.claimTelegramPollingUpdate(channel.id, 1000, {
+          staleAfterMs: 60_000,
+          now: new Date('2026-07-21T12:00:05.000Z'),
+        })
+      ).resolves.toEqual({ status: 'processed' });
     }
   );
 

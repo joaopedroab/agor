@@ -23,6 +23,7 @@ import type {
 } from '@agor-live/client';
 import {
   GATEWAY_REDACTED_SENTINEL,
+  getRequiredSecretFields,
   resolveSlackAgentTools,
   SLACK_AGENT_TOOL_DEFAULTS,
 } from '@agor-live/client';
@@ -1234,7 +1235,13 @@ const TelegramSetupPanel: React.FC<{
                 ({ getFieldValue }) => ({
                   validator: (_rule, value) => {
                     const enabled = getFieldValue('enabled') !== false;
-                    if (enabled && !botTokenStored && !isNewSecretValue(value)) {
+                    const config = isNewSecretValue(value) ? { bot_token: value } : {};
+                    if (
+                      enabled &&
+                      !botTokenStored &&
+                      getRequiredSecretFields('telegram', config).includes('bot_token') &&
+                      !config.bot_token
+                    ) {
                       return Promise.reject(
                         new Error('Bot token is required to create or enable a Telegram channel')
                       );
@@ -2930,6 +2937,9 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
     for (const field of SENSITIVE_FIELDS) {
       delete sanitizedExisting[field];
     }
+    // Poll delivery state is daemon-owned. Never round-trip a stale edit-form
+    // snapshot over the listener's durable cursor.
+    delete sanitizedExisting.telegram_polling_state;
     const config: Record<string, unknown> = { ...sanitizedExisting };
     if (values.channel_type === 'github') {
       // GitHub App credentials from form input

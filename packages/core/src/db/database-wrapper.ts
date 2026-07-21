@@ -36,6 +36,45 @@ export function txAsDb(tx: unknown): Database {
   return tx as unknown as Database;
 }
 
+const DEFAULT_TRANSACTION_CONTENTION_RETRIES = 20;
+const MAX_DATABASE_ERROR_CAUSE_DEPTH = 8;
+
+function isRetryableTransactionContention(error: unknown): boolean {
+  const seen = new Set<object>();
+  let current = error;
+  for (let depth = 0; depth < MAX_DATABASE_ERROR_CAUSE_DEPTH; depth++) {
+    if (typeof current !== 'object' || current === null || seen.has(current)) return false;
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (code === 'SQLITE_BUSY' || code === '40001' || code === '40P01') return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * Run one database transaction and retry transient dialect contention.
+ *
+ * SQLite can surface `SQLITE_BUSY` when concurrent writers begin together
+ * despite `busy_timeout`; PostgreSQL uses serialization/deadlock codes 40001
+ * and 40P01. Keeping that scheduling policy here lets repositories own domain
+ * rules without branching on database-specific errors.
+ */
+export async function runTransactionWithRetry<T>(
+  db: Database,
+  operation: (tx: Database) => Promise<T>,
+  maxRetries = DEFAULT_TRANSACTION_CONTENTION_RETRIES
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await db.transaction(async (tx) => operation(txAsDb(tx)));
+    } catch (error) {
+      if (!isRetryableTransactionContention(error) || attempt >= maxRetries) throw error;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2 ** attempt, 25)));
+    }
+  }
+}
+
 /**
  * Result of a mutation query (INSERT/UPDATE/DELETE)
  */

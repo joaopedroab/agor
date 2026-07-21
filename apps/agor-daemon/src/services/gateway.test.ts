@@ -1,9 +1,10 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { TenantScopeAwareDatabase } from '@agor/core/db';
+import type { Database, TenantScopeAwareDatabase } from '@agor/core/db';
 import {
   attachHiddenTenant,
+  createTenantScopedDatabaseProxy,
   getCurrentTenantId,
   runWithTenantDatabaseScope,
   shortId,
@@ -89,11 +90,8 @@ function makeGatewayHarness(args: {
   alignmentUser?: User | null;
   consumeLinkTokenResult?: unknown;
   sessionUrl?: string | null;
-  updateConfig?: (
-    id: string,
-    configPatch: Record<string, unknown>,
-    currentChannel: GatewayChannel
-  ) => Promise<GatewayChannel>;
+  releasePollingUpdate?: () => Promise<boolean>;
+  acknowledgePollingUpdate?: () => Promise<boolean>;
 }) {
   let channel = args.channel ?? slackChannel;
   let mapping = args.existingMapping ?? null;
@@ -130,20 +128,152 @@ function makeGatewayHarness(args: {
     args.db ?? ({ run: vi.fn() } as unknown as TenantScopeAwareDatabase),
     app as never
   );
+  let leaseSequence = 0;
+  const getPollingState = () =>
+    channel.config.telegram_polling_state &&
+    typeof channel.config.telegram_polling_state === 'object'
+      ? (channel.config.telegram_polling_state as Record<string, unknown>)
+      : {};
+  const setPollingState = (state: Record<string, unknown>) => {
+    channel = {
+      ...channel,
+      config: { ...channel.config, telegram_polling_state: state },
+    } as GatewayChannel;
+  };
+  const matchingInflight = (updateId: number, leaseToken: string) => {
+    const inflight = getPollingState().inflight_update;
+    if (!inflight || typeof inflight !== 'object') return undefined;
+    const value = inflight as Record<string, unknown>;
+    return value.update_id === updateId && value.lease_token === leaseToken ? value : undefined;
+  };
   const channelRepo = {
     findByKey: vi.fn(async () => channel),
     findById: vi.fn(async () => channel),
     updateLastMessage: vi.fn(async () => undefined),
+    claimTelegramPollingUpdate: vi.fn(
+      async (_id: string, updateId: number, options: { staleAfterMs: number; now?: Date }) => {
+        const state =
+          channel.config.telegram_polling_state &&
+          typeof channel.config.telegram_polling_state === 'object'
+            ? (channel.config.telegram_polling_state as Record<string, unknown>)
+            : {};
+        const lastProcessed = state.last_processed_update_id;
+        const recent = Array.isArray(state.recent_processed_update_ids)
+          ? state.recent_processed_update_ids
+          : [];
+        if (
+          (typeof lastProcessed === 'number' && updateId <= lastProcessed) ||
+          recent.includes(updateId)
+        ) {
+          return { status: 'processed' as const };
+        }
+
+        const inflight =
+          state.inflight_update && typeof state.inflight_update === 'object'
+            ? (state.inflight_update as Record<string, unknown>)
+            : undefined;
+        if (
+          inflight?.update_id === updateId &&
+          inflight.status === 'side_effects_completed' &&
+          typeof inflight.lease_token === 'string'
+        ) {
+          return {
+            status: 'side_effects_completed' as const,
+            leaseToken: inflight.lease_token,
+          };
+        }
+        const now = options.now ?? new Date();
+        if (inflight) {
+          const updatedAt =
+            typeof inflight.updated_at === 'string' ? Date.parse(inflight.updated_at) : Number.NaN;
+          const stale =
+            !Number.isFinite(updatedAt) || now.getTime() - updatedAt >= options.staleAfterMs;
+          if (!stale) {
+            return {
+              status: 'active' as const,
+              inflightStatus: inflight.status,
+              updateId: inflight.update_id,
+            };
+          }
+        }
+
+        const leaseToken = `lease-${++leaseSequence}`;
+        setPollingState({
+          ...state,
+          inflight_update: {
+            update_id: updateId,
+            status: 'reserved',
+            updated_at: now.toISOString(),
+            lease_token: leaseToken,
+          },
+        });
+        return { status: 'acquired' as const, reclaimed: Boolean(inflight), leaseToken };
+      }
+    ),
+    markTelegramPollingSideEffectsStarted: vi.fn(
+      async (_id: string, updateId: number, leaseToken: string) => {
+        const inflight = matchingInflight(updateId, leaseToken);
+        if (inflight?.status !== 'reserved') return false;
+        setPollingState({
+          ...getPollingState(),
+          inflight_update: {
+            ...inflight,
+            status: 'side_effects_started',
+            updated_at: new Date().toISOString(),
+          },
+        });
+        return true;
+      }
+    ),
+    markTelegramPollingSideEffectsCompleted: vi.fn(
+      async (_id: string, updateId: number, leaseToken: string) => {
+        const inflight = matchingInflight(updateId, leaseToken);
+        if (inflight?.status !== 'side_effects_started') return false;
+        setPollingState({
+          ...getPollingState(),
+          inflight_update: {
+            ...inflight,
+            status: 'side_effects_completed',
+            updated_at: new Date().toISOString(),
+          },
+        });
+        return true;
+      }
+    ),
+    releaseTelegramPollingUpdate: vi.fn(
+      async (_id: string, updateId: number, leaseToken: string) => {
+        if (args.releasePollingUpdate && !(await args.releasePollingUpdate())) return false;
+        if (!matchingInflight(updateId, leaseToken)) return false;
+        const state = { ...getPollingState() };
+        delete state.inflight_update;
+        setPollingState(state);
+        return true;
+      }
+    ),
+    acknowledgeTelegramPollingUpdate: vi.fn(
+      async (_id: string, updateId: number, leaseToken: string) => {
+        if (args.acknowledgePollingUpdate && !(await args.acknowledgePollingUpdate())) return false;
+        const inflight = matchingInflight(updateId, leaseToken);
+        if (inflight?.status !== 'side_effects_completed') return false;
+        const state = { ...getPollingState() };
+        const lastProcessed = state.last_processed_update_id;
+        const recent = Array.isArray(state.recent_processed_update_ids)
+          ? state.recent_processed_update_ids
+          : [];
+        state.last_processed_update_id =
+          typeof lastProcessed === 'number' ? Math.max(lastProcessed, updateId) : updateId;
+        state.acknowledged_at = new Date().toISOString();
+        state.recent_processed_update_ids = [...new Set([...recent, updateId])];
+        delete state.inflight_update;
+        setPollingState(state);
+        return true;
+      }
+    ),
     updateConfig: vi.fn(async (id: string, configPatch: Record<string, unknown>) => {
-      channel = args.updateConfig
-        ? await args.updateConfig(id, configPatch, channel)
-        : ({
-            ...channel,
-            config: {
-              ...channel.config,
-              ...configPatch,
-            },
-          } as GatewayChannel);
+      channel = {
+        ...channel,
+        config: { ...channel.config, ...configPatch },
+      } as GatewayChannel;
       return channel;
     }),
   };
@@ -180,21 +310,17 @@ function makeGatewayHarness(args: {
           issuer: string;
           subject: string;
         }) => Promise<User | null>;
-        findUsersByExternalIdentity: (ref: {
-          provider: string;
-          issuer: string;
-          subject: string;
-        }) => Promise<User[]>;
         findByEmailForAlignment: (email: string) => Promise<User | null>;
         consumeExternalIdentityLinkToken: (input: Record<string, unknown>) => Promise<unknown>;
       };
     }
   ).usersRepo = {
-    findByExternalIdentity: vi.fn(async () => args.externalIdentityUser ?? null),
-    findUsersByExternalIdentity: vi.fn(
-      async () =>
-        args.externalIdentityUsers ?? (args.externalIdentityUser ? [args.externalIdentityUser] : [])
-    ),
+    findByExternalIdentity: vi.fn(async () => {
+      const matches =
+        args.externalIdentityUsers ??
+        (args.externalIdentityUser ? [args.externalIdentityUser] : []);
+      return matches.length === 1 ? matches[0] : null;
+    }),
     findByEmailForAlignment: vi.fn(async () =>
       args.alignmentUser === undefined ? user : args.alignmentUser
     ),
@@ -589,7 +715,7 @@ describe('GatewayService Telegram alignment', () => {
     });
     const usersRepo = (
       service as unknown as {
-        usersRepo: { findUsersByExternalIdentity: ReturnType<typeof vi.fn> };
+        usersRepo: { findByExternalIdentity: ReturnType<typeof vi.fn> };
       }
     ).usersRepo;
 
@@ -606,7 +732,7 @@ describe('GatewayService Telegram alignment', () => {
     });
 
     expect(result).toMatchObject({ success: true, sessionId: 'sess-new', created: true });
-    expect(usersRepo.findUsersByExternalIdentity).toHaveBeenCalledWith({
+    expect(usersRepo.findByExternalIdentity).toHaveBeenCalledWith({
       provider: 'telegram',
       issuer: 'telegram',
       subject: '123456789',
@@ -668,7 +794,7 @@ describe('GatewayService Telegram alignment', () => {
     const usersRepo = (
       service as unknown as {
         usersRepo: {
-          findUsersByExternalIdentity: ReturnType<typeof vi.fn>;
+          findByExternalIdentity: ReturnType<typeof vi.fn>;
           findByEmailForAlignment: ReturnType<typeof vi.fn>;
         };
       }
@@ -687,7 +813,7 @@ describe('GatewayService Telegram alignment', () => {
     });
 
     expect(result).toEqual({ success: false, sessionId: '', created: false });
-    expect(usersRepo.findUsersByExternalIdentity).toHaveBeenCalledWith({
+    expect(usersRepo.findByExternalIdentity).toHaveBeenCalledWith({
       provider: 'telegram',
       issuer: 'telegram',
       subject: '123456789',
@@ -721,7 +847,7 @@ describe('GatewayService Telegram alignment', () => {
     const usersRepo = (
       service as unknown as {
         usersRepo: {
-          findUsersByExternalIdentity: ReturnType<typeof vi.fn>;
+          findByExternalIdentity: ReturnType<typeof vi.fn>;
           findByEmailForAlignment: ReturnType<typeof vi.fn>;
         };
       }
@@ -741,7 +867,7 @@ describe('GatewayService Telegram alignment', () => {
     });
 
     expect(result).toEqual({ success: false, sessionId: '', created: false });
-    expect(usersRepo.findUsersByExternalIdentity).toHaveBeenCalledWith({
+    expect(usersRepo.findByExternalIdentity).toHaveBeenCalledWith({
       provider: 'telegram',
       issuer: 'telegram',
       subject: '123456789',
@@ -775,7 +901,7 @@ describe('GatewayService Telegram alignment', () => {
     const usersRepo = (
       service as unknown as {
         usersRepo: {
-          findUsersByExternalIdentity: ReturnType<typeof vi.fn>;
+          findByExternalIdentity: ReturnType<typeof vi.fn>;
           findByEmailForAlignment: ReturnType<typeof vi.fn>;
         };
       }
@@ -797,7 +923,7 @@ describe('GatewayService Telegram alignment', () => {
     });
 
     expect(result).toMatchObject({ success: true, sessionId: 'sess-new', created: true });
-    expect(usersRepo.findUsersByExternalIdentity).toHaveBeenCalledWith({
+    expect(usersRepo.findByExternalIdentity).toHaveBeenCalledWith({
       provider: 'telegram',
       issuer: 'telegram',
       subject: '123456789',
@@ -1030,19 +1156,12 @@ describe('GatewayService Telegram alignment', () => {
         releasePrompt = finish;
       });
       promptCreate.mockImplementationOnce(async () => {
-        expect(channelRepo.updateConfig).toHaveBeenCalledWith('chan-telegram', {
-          telegram_polling_state: expect.objectContaining({
-            inflight_update: expect.objectContaining({
-              update_id: 1000,
-              status: 'side_effects_started',
-            }),
-          }),
-        });
-        expect(channelRepo.updateConfig).not.toHaveBeenCalledWith('chan-telegram', {
-          telegram_polling_state: expect.objectContaining({
-            last_processed_update_id: 1000,
-          }),
-        });
+        expect(channelRepo.markTelegramPollingSideEffectsStarted).toHaveBeenCalledWith(
+          'chan-telegram',
+          1000,
+          'lease-1'
+        );
+        expect(channelRepo.acknowledgeTelegramPollingUpdate).not.toHaveBeenCalled();
         resolve();
         await promptCanFinish;
         return {
@@ -1080,18 +1199,43 @@ describe('GatewayService Telegram alignment', () => {
     });
 
     await promptStarted;
-    expect(channelRepo.updateConfig).not.toHaveBeenCalledWith('chan-telegram', {
-      telegram_polling_state: expect.objectContaining({
-        last_processed_update_id: 1000,
-      }),
-    });
+    expect(channelRepo.acknowledgeTelegramPollingUpdate).not.toHaveBeenCalled();
     releasePrompt?.();
     await handlePromise;
-    expect(channelRepo.updateConfig).toHaveBeenCalledWith('chan-telegram', {
-      telegram_polling_state: expect.objectContaining({
-        last_processed_update_id: 1000,
-      }),
+    expect(channelRepo.acknowledgeTelegramPollingUpdate).toHaveBeenCalledWith(
+      'chan-telegram',
+      1000,
+      'lease-1'
+    );
+  });
+
+  it('starts side effects for only one of two concurrent callbacks claiming the same update', async () => {
+    const { service, promptCreate, sessionsCreate, channelRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      externalIdentityUser: telegramUser,
     });
+    let releasePrompt: (() => void) | undefined;
+    const promptStarted = new Promise<void>((resolve) => {
+      promptCreate.mockImplementationOnce(async () => {
+        resolve();
+        await new Promise<void>((finish) => {
+          releasePrompt = finish;
+        });
+        return { task_id: 'task-1', session_id: 'sess-new', status: 'running' };
+      });
+    });
+
+    const first = handleTelegramListenerMessage(service, telegramChannel, 1000);
+    await promptStarted;
+    await expect(handleTelegramListenerMessage(service, telegramChannel, 1000)).rejects.toThrow(
+      'blocked by active side_effects_started claim'
+    );
+    releasePrompt?.();
+    await first;
+
+    expect(channelRepo.claimTelegramPollingUpdate).toHaveBeenCalledTimes(2);
+    expect(sessionsCreate).toHaveBeenCalledTimes(1);
+    expect(promptCreate).toHaveBeenCalledTimes(1);
   });
 
   it('does not process already acknowledged Telegram polling updates after service recreation', async () => {
@@ -1114,7 +1258,7 @@ describe('GatewayService Telegram alignment', () => {
 
     expect(sessionsCreate).not.toHaveBeenCalled();
     expect(promptCreate).not.toHaveBeenCalled();
-    expect(channelRepo.updateConfig).not.toHaveBeenCalled();
+    expect(channelRepo.markTelegramPollingSideEffectsStarted).not.toHaveBeenCalled();
   });
 
   it('leaves failed Telegram polling processing unacknowledged so it can retry', async () => {
@@ -1133,19 +1277,11 @@ describe('GatewayService Telegram alignment', () => {
     await expect(handleTelegramListenerMessage(service, telegramChannel, 1000)).rejects.toThrow(
       'temporary prompt failure'
     );
-    expect(channelRepo.updateConfig).not.toHaveBeenCalledWith('chan-telegram', {
-      telegram_polling_state: expect.objectContaining({
-        last_processed_update_id: 1000,
-      }),
-    });
+    expect(channelRepo.acknowledgeTelegramPollingUpdate).not.toHaveBeenCalled();
 
     await handleTelegramListenerMessage(service, telegramChannel, 1000);
     expect(promptCreate).toHaveBeenCalledTimes(2);
-    expect(channelRepo.updateConfig).toHaveBeenCalledWith('chan-telegram', {
-      telegram_polling_state: expect.objectContaining({
-        last_processed_update_id: 1000,
-      }),
-    });
+    expect(channelRepo.acknowledgeTelegramPollingUpdate).toHaveBeenCalledTimes(1);
   });
 
   it('does not replay-acknowledge a failed Telegram update when reservation cleanup fails', async () => {
@@ -1153,26 +1289,12 @@ describe('GatewayService Telegram alignment', () => {
     const { service, sessionsCreate, promptCreate, channelRepo } = makeGatewayHarness({
       channel: telegramChannel,
       externalIdentityUser: telegramUser,
-      updateConfig: async (_id, configPatch, currentChannel) => {
-        const pollingState = configPatch.telegram_polling_state as
-          | Record<string, unknown>
-          | undefined;
-        if (
-          failReservationCleanup &&
-          pollingState &&
-          !('inflight_update' in pollingState) &&
-          !('last_processed_update_id' in pollingState)
-        ) {
+      releasePollingUpdate: async () => {
+        if (failReservationCleanup) {
           failReservationCleanup = false;
           throw new Error('cleanup config write failure');
         }
-        return {
-          ...currentChannel,
-          config: {
-            ...currentChannel.config,
-            ...configPatch,
-          },
-        } as GatewayChannel;
+        return true;
       },
     });
     promptCreate.mockRejectedValueOnce(new Error('temporary prompt failure'));
@@ -1183,60 +1305,142 @@ describe('GatewayService Telegram alignment', () => {
     expect(promptCreate).toHaveBeenCalledTimes(1);
 
     await expect(handleTelegramListenerMessage(service, telegramChannel, 1000)).rejects.toThrow(
-      'ambiguous processing state'
+      'blocked by active side_effects_started claim'
     );
 
     expect(promptCreate).toHaveBeenCalledTimes(1);
     expect(sessionsCreate).toHaveBeenCalledTimes(1);
-    expect(
-      channelRepo.updateConfig.mock.calls.some(([, configPatch]) => {
-        const pollingState = configPatch.telegram_polling_state as
-          | Record<string, unknown>
-          | undefined;
-        return pollingState?.last_processed_update_id === 1000;
-      })
-    ).toBe(false);
+    expect(channelRepo.acknowledgeTelegramPollingUpdate).not.toHaveBeenCalled();
   });
 
-  it('does not duplicate Telegram side effects when final durable acknowledgement write fails and the update replays', async () => {
-    let failNextProcessedAck = true;
-    const { service, sessionsCreate, promptCreate, channelRepo } = makeGatewayHarness({
-      channel: telegramChannel,
+  it('retries a stale Telegram side-effects reservation after a crash', async () => {
+    const restartedTelegramChannel = {
+      ...telegramChannel,
+      config: {
+        ...telegramChannel.config,
+        telegram_polling_state: {
+          inflight_update: {
+            update_id: 1000,
+            status: 'side_effects_started',
+            updated_at: '2026-07-21T00:00:00.000Z',
+          },
+        },
+      },
+    } as GatewayChannel;
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { service, promptCreate, channelRepo } = makeGatewayHarness({
+      channel: restartedTelegramChannel,
       externalIdentityUser: telegramUser,
-      updateConfig: async (_id, configPatch, currentChannel) => {
-        const pollingState = configPatch.telegram_polling_state as
-          | Record<string, unknown>
-          | undefined;
-        if (pollingState?.last_processed_update_id === 1000 && failNextProcessedAck) {
+    });
+
+    await handleTelegramListenerMessage(service, restartedTelegramChannel, 1000);
+
+    expect(promptCreate).toHaveBeenCalledTimes(1);
+    expect(channelRepo.acknowledgeTelegramPollingUpdate).toHaveBeenCalledWith(
+      'chan-telegram',
+      1000,
+      'lease-1'
+    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Retrying stale Telegram update'));
+    warnSpy.mockRestore();
+  });
+
+  it('commits each Telegram polling transition independently and resumes completed acknowledgement without replaying side effects', async () => {
+    const transactionEvents: string[] = [];
+    let transactionSequence = 0;
+    let failNextOuterCommitWithContention = false;
+    const baseDb = {
+      transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => {
+        const transactionId = `tx-${++transactionSequence}`;
+        transactionEvents.push(`begin:${transactionId}`);
+        try {
+          const result = await callback({
+            execute: vi.fn(async () => []),
+            marker: vi.fn(() => transactionId),
+          });
+          if (failNextOuterCommitWithContention) {
+            failNextOuterCommitWithContention = false;
+            transactionEvents.push(`contention:${transactionId}`);
+            throw Object.assign(new Error('outer commit serialization failure'), {
+              cause: { code: '40001' },
+            });
+          }
+          transactionEvents.push(`commit:${transactionId}`);
+          return result;
+        } catch (error) {
+          transactionEvents.push(`rollback:${transactionId}`);
+          throw error;
+        }
+      }),
+    };
+    const db = createTenantScopedDatabaseProxy(baseDb as unknown as Database);
+    let failNextProcessedAck = true;
+    const { service, channelRepo } = makeGatewayHarness({
+      channel: telegramChannel,
+      db,
+      externalIdentityUser: telegramUser,
+      acknowledgePollingUpdate: async () => {
+        if (failNextProcessedAck) {
           failNextProcessedAck = false;
+          transactionEvents.push('acknowledgement-failed');
           throw new Error('temporary config write failure');
         }
-        return {
-          ...currentChannel,
-          config: {
-            ...currentChannel.config,
-            ...configPatch,
-          },
-        } as GatewayChannel;
+        transactionEvents.push('acknowledgement-retried');
+        return true;
       },
+    });
+    const createSpy = vi.spyOn(service, 'create').mockImplementation(async () => {
+      transactionEvents.push('external-side-effects');
+      return { success: true, sessionId: 'sess-new', created: true };
     });
 
     await expect(handleTelegramListenerMessage(service, telegramChannel, 1000)).rejects.toThrow(
       'temporary config write failure'
     );
-    expect(sessionsCreate).toHaveBeenCalledTimes(1);
-    expect(promptCreate).toHaveBeenCalledTimes(1);
+    expect(baseDb.transaction).toHaveBeenCalledTimes(5);
+    expect(transactionEvents.indexOf('commit:tx-4')).toBeLessThan(
+      transactionEvents.indexOf('begin:tx-5')
+    );
+    expect(transactionEvents).toContain('rollback:tx-5');
+    expect(createSpy).toHaveBeenCalledTimes(1);
 
     await handleTelegramListenerMessage(service, telegramChannel, 1000);
 
-    expect(sessionsCreate).toHaveBeenCalledTimes(1);
-    expect(promptCreate).toHaveBeenCalledTimes(1);
-    expect(channelRepo.updateConfig).toHaveBeenLastCalledWith('chan-telegram', {
-      telegram_polling_state: expect.objectContaining({
-        last_processed_update_id: 1000,
-        recent_processed_update_ids: expect.arrayContaining([1000]),
-      }),
-    });
+    expect(baseDb.transaction).toHaveBeenCalledTimes(7);
+    expect(transactionEvents).toContain('commit:tx-7');
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(channelRepo.markTelegramPollingSideEffectsStarted).toHaveBeenCalledTimes(1);
+    expect(channelRepo.markTelegramPollingSideEffectsCompleted).toHaveBeenCalledTimes(1);
+    expect(channelRepo.acknowledgeTelegramPollingUpdate).toHaveBeenCalledTimes(2);
+
+    failNextOuterCommitWithContention = true;
+    await handleTelegramListenerMessage(service, telegramChannel, 1000);
+    expect(baseDb.transaction).toHaveBeenCalledTimes(9);
+    expect(transactionEvents.slice(-5)).toEqual([
+      'begin:tx-8',
+      'contention:tx-8',
+      'rollback:tx-8',
+      'begin:tx-9',
+      'commit:tx-9',
+    ]);
+    expect(createSpy).toHaveBeenCalledTimes(1);
+
+    createSpy.mockRejectedValueOnce(new Error('gateway processing failed'));
+    await expect(handleTelegramListenerMessage(service, telegramChannel, 1001)).rejects.toThrow(
+      'gateway processing failed'
+    );
+    expect(baseDb.transaction).toHaveBeenCalledTimes(13);
+    expect(transactionEvents.slice(-8)).toEqual([
+      'begin:tx-10',
+      'commit:tx-10',
+      'begin:tx-11',
+      'commit:tx-11',
+      'begin:tx-12',
+      'rollback:tx-12',
+      'begin:tx-13',
+      'commit:tx-13',
+    ]);
+    expect(channelRepo.releaseTelegramPollingUpdate).toHaveBeenCalledTimes(1);
   });
 
   it('redacts Telegram inbound text from retryable listener processing errors', async () => {
@@ -1276,11 +1480,7 @@ describe('GatewayService Telegram alignment', () => {
         text: expect.stringContaining('/link <token>'),
       })
     );
-    expect(channelRepo.updateConfig).toHaveBeenCalledWith('chan-telegram', {
-      telegram_polling_state: expect.objectContaining({
-        last_processed_update_id: 1000,
-      }),
-    });
+    expect(channelRepo.acknowledgeTelegramPollingUpdate).toHaveBeenCalledTimes(1);
   });
 
   it('/new without a prompt clears the current Telegram mapping and waits for the next message', async () => {

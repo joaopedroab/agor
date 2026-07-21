@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import { getConnector, hasConnector } from '../connector-registry';
 import type { TelegramGetUpdatesRequest } from './telegram';
 import {
-  decideTelegramInboundAuth,
   handleTelegramUpdate,
   markdownToTelegramHtml,
   normalizeTelegramInboundUpdate,
@@ -232,54 +231,6 @@ describe('Telegram explicit link/auth helpers', () => {
     });
     expect(telegramExternalIdentityRef('username')).toBeNull();
     expect(telegramExternalIdentityRef(0)).toBeNull();
-  });
-
-  it('resolves exactly one explicitly linked Agor user', () => {
-    expect(
-      decideTelegramInboundAuth({
-        telegramUserId: 123456789,
-        linkedUsers: [{ user_id: 'agor-user-1' }],
-      })
-    ).toEqual({
-      ok: true,
-      telegramUserId: '123456789',
-      agorUserId: 'agor-user-1',
-    });
-  });
-
-  it('fails closed for unlinked Telegram users', () => {
-    expect(
-      decideTelegramInboundAuth({
-        telegramUserId: 123456789,
-        linkedUsers: [],
-      })
-    ).toEqual({
-      ok: false,
-      reason: 'unlinked_user',
-      telegramUserId: '123456789',
-    });
-  });
-
-  it('fails closed for duplicate/ambiguous Telegram links', () => {
-    expect(
-      decideTelegramInboundAuth({
-        telegramUserId: 123456789,
-        linkedUsers: [{ user_id: 'agor-user-1' }, { user_id: 'agor-user-2' }],
-      })
-    ).toEqual({
-      ok: false,
-      reason: 'ambiguous_link',
-      telegramUserId: '123456789',
-    });
-  });
-
-  it('does not use usernames as a fallback identity', () => {
-    expect(
-      decideTelegramInboundAuth({
-        telegramUserId: 'trusted_username',
-        linkedUsers: [{ user_id: 'agor-user-1' }],
-      })
-    ).toEqual({ ok: false, reason: 'missing_numeric_sender_id' });
   });
 });
 

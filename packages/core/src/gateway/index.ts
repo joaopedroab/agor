@@ -48,7 +48,6 @@ export {
   TeamsConnector,
 } from './connectors/teams';
 export type {
-  TelegramAuthRejectionReason,
   TelegramCommandIntent,
   TelegramConfig,
   TelegramConnectorOptions,
@@ -56,10 +55,8 @@ export type {
   TelegramFileInfo,
   TelegramGetFileRequest,
   TelegramGetUpdatesRequest,
-  TelegramInboundAuthDecision,
   TelegramInboundNormalizationResult,
   TelegramInboundRejectionReason,
-  TelegramLinkedUserCandidate,
   TelegramTransportFailure,
   TelegramTransportRejectionReason,
   TelegramTransportResult,
@@ -67,7 +64,6 @@ export type {
   TelegramUpdateClient,
 } from './connectors/telegram';
 export {
-  decideTelegramInboundAuth,
   handleTelegramUpdate,
   normalizeTelegramInboundUpdate,
   parseTelegramCommandIntent,

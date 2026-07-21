@@ -22,7 +22,15 @@ import {
 import { eq, like } from 'drizzle-orm';
 import { generateId } from '../../lib/ids';
 import type { Database } from '../client';
-import { deleteFrom, insert, select, update } from '../database-wrapper';
+import {
+  deleteFrom,
+  insert,
+  lockRowForUpdate,
+  runTransactionWithRetry,
+  select,
+  txAsDb,
+  update,
+} from '../database-wrapper';
 import { decryptApiKey, encryptApiKey } from '../encryption';
 import { type GatewayChannelInsert, type GatewayChannelRow, gatewayChannels } from '../schema';
 import {
@@ -32,6 +40,97 @@ import {
   EntityNotFoundError,
   RepositoryError,
 } from './base';
+
+type TelegramPollingInflightStatus = 'reserved' | 'side_effects_started' | 'side_effects_completed';
+
+interface TelegramPollingInflightUpdate {
+  update_id: number;
+  status: TelegramPollingInflightStatus;
+  updated_at: string;
+  lease_token?: string;
+}
+
+interface TelegramPollingState {
+  last_processed_update_id?: unknown;
+  recent_processed_update_ids?: unknown;
+  inflight_update?: unknown;
+  [key: string]: unknown;
+}
+
+export type TelegramPollingUpdateClaimResult =
+  | { status: 'acquired'; reclaimed: boolean; leaseToken: string }
+  | { status: 'processed' }
+  | { status: 'active'; inflightStatus: TelegramPollingInflightStatus; updateId: number }
+  | { status: 'side_effects_completed'; leaseToken: string };
+
+const TELEGRAM_RECENT_PROCESSED_UPDATE_LIMIT = 20;
+
+function telegramSafeUpdateId(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function telegramPollingState(channel: GatewayChannel): TelegramPollingState {
+  const state = channel.config.telegram_polling_state;
+  return state && typeof state === 'object' && !Array.isArray(state)
+    ? (state as TelegramPollingState)
+    : {};
+}
+
+function telegramInflightUpdate(
+  state: TelegramPollingState
+): TelegramPollingInflightUpdate | undefined {
+  const inflight = state.inflight_update;
+  if (!inflight || typeof inflight !== 'object' || Array.isArray(inflight)) return undefined;
+  const updateId = telegramSafeUpdateId((inflight as Record<string, unknown>).update_id);
+  const status = (inflight as Record<string, unknown>).status;
+  const updatedAt = (inflight as Record<string, unknown>).updated_at;
+  const leaseToken = (inflight as Record<string, unknown>).lease_token;
+  if (
+    updateId === undefined ||
+    (status !== 'reserved' &&
+      status !== 'side_effects_started' &&
+      status !== 'side_effects_completed') ||
+    typeof updatedAt !== 'string'
+  ) {
+    return undefined;
+  }
+  return {
+    update_id: updateId,
+    status,
+    updated_at: updatedAt,
+    ...(typeof leaseToken === 'string' && leaseToken ? { lease_token: leaseToken } : {}),
+  };
+}
+
+function telegramUpdateWasProcessed(state: TelegramPollingState, updateId: number): boolean {
+  const lastProcessed = telegramSafeUpdateId(state.last_processed_update_id);
+  const recent = Array.isArray(state.recent_processed_update_ids)
+    ? state.recent_processed_update_ids.filter(
+        (value): value is number => telegramSafeUpdateId(value) === value
+      )
+    : [];
+  return (lastProcessed !== undefined && updateId <= lastProcessed) || recent.includes(updateId);
+}
+
+function telegramLeaseMatches(
+  state: TelegramPollingState,
+  updateId: number,
+  leaseToken: string
+): TelegramPollingInflightUpdate | undefined {
+  const inflight = telegramInflightUpdate(state);
+  return inflight?.update_id === updateId && inflight.lease_token === leaseToken
+    ? inflight
+    : undefined;
+}
+
+function appendTelegramProcessedUpdateId(state: TelegramPollingState, updateId: number): number[] {
+  const recent = Array.isArray(state.recent_processed_update_ids)
+    ? state.recent_processed_update_ids.filter(
+        (value): value is number => telegramSafeUpdateId(value) === value
+      )
+    : [];
+  return [...new Set([...recent, updateId])].slice(-TELEGRAM_RECENT_PROCESSED_UPDATE_LIMIT);
+}
 
 /**
  * Encrypt sensitive fields within a config object
@@ -182,11 +281,6 @@ export class GatewayChannelRepository
     const channelType = data.channel_type ?? 'slack';
     const enabled = data.enabled ?? true;
     const config = data.config ?? {};
-    if (channelType === 'telegram' && enabled && !config.bot_token) {
-      throw new RepositoryError(
-        'config.bot_token is required to create or enable a Telegram gateway channel'
-      );
-    }
 
     const encryptedAgenticConfig = encryptAgenticConfig(
       (data.agentic_config as unknown as Record<string, unknown> | null) ?? null
@@ -344,56 +438,49 @@ export class GatewayChannelRepository
   async update(id: string, updates: Partial<GatewayChannel>): Promise<GatewayChannel> {
     try {
       const fullId = await this.resolveId(id);
+      return await this.db.transaction(async (tx) => {
+        const txDb = txAsDb(tx);
+        await lockRowForUpdate(txDb, this.db, gatewayChannels, eq(gatewayChannels.id, fullId));
+        const currentRow = await select(txDb)
+          .from(gatewayChannels)
+          .where(eq(gatewayChannels.id, fullId))
+          .one();
+        if (!currentRow) throw new EntityNotFoundError('GatewayChannel', id);
 
-      const current = await this.findById(fullId);
-      if (!current) {
-        throw new EntityNotFoundError('GatewayChannel', id);
-      }
-
-      // Merge updates, but preserve existing encrypted credentials if update has empty values
-      const merged = { ...current, ...updates };
-
-      // Preserve existing credentials if updates contain empty, falsy, or redacted values.
-      // The API redacts sensitive fields to '••••••••' in responses, so if the client
-      // sends that sentinel back it means "no change" — not "set token to bullets".
-      if (updates.config) {
-        const mergedConfig = { ...current.config, ...updates.config };
-        for (const field of GATEWAY_SENSITIVE_CONFIG_FIELDS) {
-          const updateValue = updates.config[field];
-          if (
-            (!updateValue || updateValue === GATEWAY_REDACTED_SENTINEL) &&
-            current.config[field]
-          ) {
-            mergedConfig[field] = current.config[field];
+        const current = this.rowToChannel(currentRow);
+        const merged = { ...current, ...updates };
+        if (updates.config) {
+          const mergedConfig = { ...current.config, ...updates.config };
+          for (const field of GATEWAY_SENSITIVE_CONFIG_FIELDS) {
+            const updateValue = updates.config[field];
+            if (
+              (!updateValue || updateValue === GATEWAY_REDACTED_SENTINEL) &&
+              current.config[field]
+            ) {
+              mergedConfig[field] = current.config[field];
+            }
           }
+          merged.config = mergedConfig;
         }
-        merged.config = mergedConfig;
-      }
 
-      this.assertRequiredSecretsWhenEnabled(merged);
-
-      const insertData = this.channelToInsert(merged);
-
-      await update(this.db, gatewayChannels)
-        .set({
-          name: insertData.name,
-          channel_type: insertData.channel_type,
-          target_branch_id: insertData.target_branch_id,
-          agor_user_id: insertData.agor_user_id,
-          enabled: insertData.enabled,
-          config: insertData.config,
-          agentic_config: insertData.agentic_config,
-          updated_at: new Date(),
-        })
-        .where(eq(gatewayChannels.id, fullId))
-        .run();
-
-      const updated = await this.findById(fullId);
-      if (!updated) {
-        throw new RepositoryError('Failed to retrieve updated gateway channel');
-      }
-
-      return updated;
+        this.assertRequiredSecretsWhenEnabled(merged);
+        const insertData = this.channelToInsert(merged);
+        const row = await update(txDb, gatewayChannels)
+          .set({
+            name: insertData.name,
+            channel_type: insertData.channel_type,
+            target_branch_id: insertData.target_branch_id,
+            agor_user_id: insertData.agor_user_id,
+            enabled: insertData.enabled,
+            config: insertData.config,
+            agentic_config: insertData.agentic_config,
+            updated_at: new Date(),
+          })
+          .where(eq(gatewayChannels.id, fullId))
+          .returning()
+          .one();
+        return this.rowToChannel(row);
+      });
     } catch (error) {
       if (error instanceof RepositoryError) throw error;
       if (error instanceof EntityNotFoundError) throw error;
@@ -418,6 +505,184 @@ export class GatewayChannelRepository
   ): Promise<GatewayChannel> {
     return this.update(id, {
       config: configPatch,
+    });
+  }
+
+  private async mutateTelegramPollingState<Result>(
+    id: GatewayChannelID | string,
+    mutation: (state: TelegramPollingState) => { result: Result; nextState?: TelegramPollingState }
+  ): Promise<Result> {
+    const fullId = await this.resolveId(id);
+    return runTransactionWithRetry(this.db, async (txDb) => {
+      await lockRowForUpdate(txDb, this.db, gatewayChannels, eq(gatewayChannels.id, fullId));
+      const currentRow = await select(txDb)
+        .from(gatewayChannels)
+        .where(eq(gatewayChannels.id, fullId))
+        .one();
+      if (!currentRow) throw new EntityNotFoundError('GatewayChannel', id);
+
+      const current = this.rowToChannel(currentRow);
+      const outcome = mutation(telegramPollingState(current));
+      if (outcome.nextState) {
+        const insertData = this.channelToInsert({
+          ...current,
+          config: { ...current.config, telegram_polling_state: outcome.nextState },
+        });
+        await update(txDb, gatewayChannels)
+          .set({ config: insertData.config, updated_at: new Date() })
+          .where(eq(gatewayChannels.id, fullId))
+          .run();
+      }
+      return outcome.result;
+    });
+  }
+
+  /**
+   * Atomically inspect and claim one Telegram polling update.
+   *
+   * The row lock and config write share one transaction, so an active claim is
+   * never reported as acquired to a second listener callback. Stale claims may
+   * be replaced after the caller-owned lease duration.
+   */
+  async claimTelegramPollingUpdate(
+    id: GatewayChannelID | string,
+    updateId: number,
+    options: { staleAfterMs: number; now?: Date }
+  ): Promise<TelegramPollingUpdateClaimResult> {
+    return this.mutateTelegramPollingState<TelegramPollingUpdateClaimResult>(id, (state) => {
+      if (telegramUpdateWasProcessed(state, updateId)) {
+        return { result: { status: 'processed' as const } };
+      }
+
+      const inflight = telegramInflightUpdate(state);
+      if (
+        inflight?.update_id === updateId &&
+        inflight.status === 'side_effects_completed' &&
+        inflight.lease_token
+      ) {
+        return {
+          result: {
+            status: 'side_effects_completed' as const,
+            leaseToken: inflight.lease_token,
+          },
+        };
+      }
+
+      const now = options.now ?? new Date();
+      if (inflight) {
+        const updatedAt = Date.parse(inflight.updated_at);
+        const stale =
+          !Number.isFinite(updatedAt) || now.getTime() - updatedAt >= options.staleAfterMs;
+        if (!stale) {
+          return {
+            result: {
+              status: 'active' as const,
+              inflightStatus: inflight.status,
+              updateId: inflight.update_id,
+            },
+          };
+        }
+      }
+
+      const leaseToken = generateId();
+      const nextState: TelegramPollingState = {
+        ...state,
+        inflight_update: {
+          update_id: updateId,
+          status: 'reserved',
+          updated_at: now.toISOString(),
+          lease_token: leaseToken,
+        },
+      };
+      return {
+        result: {
+          status: 'acquired' as const,
+          reclaimed: Boolean(inflight),
+          leaseToken,
+        },
+        nextState,
+      };
+    });
+  }
+
+  async markTelegramPollingSideEffectsStarted(
+    id: GatewayChannelID | string,
+    updateId: number,
+    leaseToken: string,
+    now = new Date()
+  ): Promise<boolean> {
+    return this.mutateTelegramPollingState(id, (state) => {
+      const inflight = telegramLeaseMatches(state, updateId, leaseToken);
+      if (inflight?.status !== 'reserved') return { result: false };
+      return {
+        result: true,
+        nextState: {
+          ...state,
+          inflight_update: {
+            ...inflight,
+            status: 'side_effects_started',
+            updated_at: now.toISOString(),
+          },
+        },
+      };
+    });
+  }
+
+  async markTelegramPollingSideEffectsCompleted(
+    id: GatewayChannelID | string,
+    updateId: number,
+    leaseToken: string,
+    now = new Date()
+  ): Promise<boolean> {
+    return this.mutateTelegramPollingState(id, (state) => {
+      const inflight = telegramLeaseMatches(state, updateId, leaseToken);
+      if (inflight?.status !== 'side_effects_started') return { result: false };
+      return {
+        result: true,
+        nextState: {
+          ...state,
+          inflight_update: {
+            ...inflight,
+            status: 'side_effects_completed',
+            updated_at: now.toISOString(),
+          },
+        },
+      };
+    });
+  }
+
+  async releaseTelegramPollingUpdate(
+    id: GatewayChannelID | string,
+    updateId: number,
+    leaseToken: string
+  ): Promise<boolean> {
+    return this.mutateTelegramPollingState(id, (state) => {
+      if (!telegramLeaseMatches(state, updateId, leaseToken)) return { result: false };
+      const nextState = { ...state };
+      delete nextState.inflight_update;
+      return { result: true, nextState };
+    });
+  }
+
+  async acknowledgeTelegramPollingUpdate(
+    id: GatewayChannelID | string,
+    updateId: number,
+    leaseToken: string,
+    now = new Date()
+  ): Promise<boolean> {
+    return this.mutateTelegramPollingState(id, (state) => {
+      const inflight = telegramLeaseMatches(state, updateId, leaseToken);
+      if (inflight?.status !== 'side_effects_completed') return { result: false };
+      const lastProcessed = telegramSafeUpdateId(state.last_processed_update_id);
+      const nextState: TelegramPollingState = {
+        ...state,
+        last_processed_update_id:
+          lastProcessed === undefined ? updateId : Math.max(lastProcessed, updateId),
+        acknowledged_at: now.toISOString(),
+        recent_processed_update_ids: appendTelegramProcessedUpdateId(state, updateId),
+      };
+      delete nextState.inflight_update;
+      return { result: true, nextState };
     });
   }
 

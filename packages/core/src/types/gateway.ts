@@ -81,6 +81,8 @@ export function getRequiredSecretFields(
       return ['private_key'];
     case 'teams':
       return ['app_password'];
+    case 'telegram':
+      return ['bot_token'];
     default:
       return [];
   }

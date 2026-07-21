@@ -19,11 +19,19 @@ import type {
   UUID,
 } from '@agor/core/types';
 import { toAgenticToolsStatus } from '@agor/core/types';
-import { and, eq, isNull, like, sql } from 'drizzle-orm';
+import { eq, like, sql } from 'drizzle-orm';
 import { normalizeStoredEnvMap, type RawStoredEnvVar } from '../../config/env-vars';
 import { generateId, shortId } from '../../lib/ids';
 import type { Database } from '../client';
-import { deleteFrom, insert, jsonExtract, select, update } from '../database-wrapper';
+import {
+  deleteFrom,
+  insert,
+  lockRowForUpdate,
+  runTransactionWithRetry,
+  select,
+  txAsDb,
+  update,
+} from '../database-wrapper';
 import { decryptApiKey, encryptApiKey } from '../encryption';
 import { type UserInsert as SchemaUserInsert, type UserRow, users } from '../schema';
 import {
@@ -88,7 +96,6 @@ export type ConsumeExternalIdentityLinkTokenResult =
 type StoredUserData = UserRow['data'] & {
   external_identities?: UserExternalIdentity[];
   external_identity_link_tokens?: UserExternalIdentityLinkToken[];
-  external_identity_link_token_nonce?: string;
 };
 
 /**
@@ -120,10 +127,6 @@ function externalIdentityLinkTokenHash(provider: string, issuer: string, token: 
 
 function generateLinkToken(): string {
   return randomBytes(24).toString('base64url');
-}
-
-function generateLinkTokenConsumeNonce(): string {
-  return randomBytes(16).toString('base64url');
 }
 
 /**
@@ -188,7 +191,6 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
       env_vars_raw?: SchemaUserInsert['data']['env_vars'];
       external_identities_raw?: UserExternalIdentity[];
       external_identity_link_tokens_raw?: UserExternalIdentityLinkToken[];
-      external_identity_link_token_nonce_raw?: string;
     }
   ): SchemaUserInsert {
     const now = new Date();
@@ -233,7 +235,6 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
         // across generic profile/preference updates just like credential blobs.
         external_identities: user.external_identities_raw,
         external_identity_link_tokens: user.external_identity_link_tokens_raw,
-        external_identity_link_token_nonce: user.external_identity_link_token_nonce_raw,
         default_agentic_config: user.default_agentic_config,
       },
     };
@@ -447,30 +448,29 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
    */
   async unlinkExternalIdentity(userId: string, ref: ExternalIdentityRef): Promise<InternalUser> {
     const fullId = await this.resolveId(userId);
-    const row = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
-    if (!row) {
-      throw new EntityNotFoundError('User', userId);
-    }
+    return this.db.transaction(async (tx) => {
+      const txDb = txAsDb(tx);
+      await lockRowForUpdate(txDb, this.db, users, eq(users.user_id, fullId));
+      const row = await select(txDb).from(users).where(eq(users.user_id, fullId)).one();
+      if (!row) throw new EntityNotFoundError('User', userId);
 
-    const data = ((row as UserRow).data ?? {}) as StoredUserData;
-    const key = externalIdentityKey(ref.provider, ref.issuer, ref.subject);
-    const external_identities = getExternalIdentities(data).filter(
-      (identity) => identity.key !== key
-    );
-
-    await update(this.db, users)
-      .set({
-        data: { ...data, external_identities },
-        updated_at: new Date(),
-      })
-      .where(eq(users.user_id, fullId))
-      .run();
-
-    const updated = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
-    if (!updated) {
-      throw new RepositoryError('Failed to retrieve updated user');
-    }
-    return this.rowToUser(updated as UserRow);
+      const data = ((row as UserRow).data ?? {}) as StoredUserData;
+      const key = externalIdentityKey(ref.provider, ref.issuer, ref.subject);
+      const updated = await update(txDb, users)
+        .set({
+          data: {
+            ...data,
+            external_identities: getExternalIdentities(data).filter(
+              (identity) => identity.key !== key
+            ),
+          },
+          updated_at: new Date(),
+        })
+        .where(eq(users.user_id, fullId))
+        .returning()
+        .one();
+      return this.rowToUser(updated as UserRow);
+    });
   }
 
   /**
@@ -484,54 +484,51 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
     input: LinkExternalIdentityInput
   ): Promise<InternalUser> {
     const fullId = await this.resolveId(userId);
-    const row = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
-    if (!row) {
-      throw new EntityNotFoundError('User', userId);
-    }
-
-    const data = ((row as UserRow).data ?? {}) as StoredUserData;
     const key = externalIdentityKey(input.provider, input.issuer, input.subject);
-    const rows = (await select(this.db).from(users).all()) as UserRow[];
-    const owner = rows.find((candidate) => {
-      if (candidate.user_id === fullId) return false;
-      const identities = getExternalIdentities(candidate.data as StoredUserData);
-      return identities.some((identity) => identity.key === key);
-    });
-    if (owner) {
-      throw new RepositoryError(
-        `External identity ${input.provider}:${input.issuer}:${input.subject} is already linked to another user`
+    return this.db.transaction(async (tx) => {
+      const txDb = txAsDb(tx);
+      // External identities live in users.data, so serialize this small admin/link
+      // mutation across user rows instead of adding a provider-specific table.
+      await lockRowForUpdate(txDb, this.db, users, sql`true`);
+      const rows = (await select(txDb).from(users).all()) as UserRow[];
+      const row = rows.find((candidate) => candidate.user_id === fullId);
+      if (!row) throw new EntityNotFoundError('User', userId);
+      const owner = rows.find(
+        (candidate) =>
+          candidate.user_id !== fullId &&
+          getExternalIdentities(candidate.data as StoredUserData).some(
+            (identity) => identity.key === key
+          )
       );
-    }
+      if (owner) {
+        throw new RepositoryError(
+          `External identity ${input.provider}:${input.issuer}:${input.subject} is already linked to another user`
+        );
+      }
 
-    const identity: UserExternalIdentity = {
-      key,
-      provider: input.provider,
-      issuer: input.issuer,
-      subject: input.subject,
-      ...(input.email ? { email: input.email } : {}),
-      ...(input.name ? { name: input.name } : {}),
-      last_login_at: input.last_login_at ?? new Date().toISOString(),
-    };
-    const existing = getExternalIdentities(data);
-    const external_identities = existing.some((candidate) => candidate.key === key)
-      ? existing.map((candidate) =>
-          candidate.key === key ? { ...candidate, ...identity } : candidate
-        )
-      : [...existing, identity];
-
-    await update(this.db, users)
-      .set({
-        data: { ...data, external_identities },
-        updated_at: new Date(),
-      })
-      .where(eq(users.user_id, fullId))
-      .run();
-
-    const updated = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
-    if (!updated) {
-      throw new RepositoryError('Failed to retrieve updated user');
-    }
-    return this.rowToUser(updated as UserRow);
+      const data = (row.data ?? {}) as StoredUserData;
+      const identity: UserExternalIdentity = {
+        key,
+        provider: input.provider,
+        issuer: input.issuer,
+        subject: input.subject,
+        ...(input.email ? { email: input.email } : {}),
+        ...(input.name ? { name: input.name } : {}),
+        last_login_at: input.last_login_at ?? new Date().toISOString(),
+      };
+      const existing = getExternalIdentities(data);
+      const external_identities = existing.some((candidate) => candidate.key === key)
+        ? existing.map((candidate) =>
+            candidate.key === key ? { ...candidate, ...identity } : candidate
+          )
+        : [...existing, identity];
+      const updated = await update(txDb, users)
+        .set({ data: { ...data, external_identities }, updated_at: new Date() })
+        .where(eq(users.user_id, fullId))
+        .returning()
+        .one();
+      return this.rowToUser(updated as UserRow);
+    });
   }
 
   /**
@@ -543,12 +540,6 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
     input: CreateExternalIdentityLinkTokenInput
   ): Promise<CreateExternalIdentityLinkTokenResult> {
     const intendedUserId = await this.resolveId(input.intended_user_id);
-    const row = await select(this.db).from(users).where(eq(users.user_id, intendedUserId)).one();
-    if (!row) {
-      throw new EntityNotFoundError('User', input.intended_user_id);
-    }
-
-    const data = ((row as UserRow).data ?? {}) as StoredUserData;
     const now = new Date().toISOString();
     const token = input.token ?? generateLinkToken();
     const tokenRecord: UserExternalIdentityLinkToken = {
@@ -562,21 +553,28 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
       created_at: now,
       expires_at: input.expires_at,
     };
-    const activeTokens = getExternalIdentityLinkTokens(data)
-      .filter((candidate) => candidate.consumed_at || Date.parse(candidate.expires_at) > Date.now())
-      .slice(-24);
-
-    await update(this.db, users)
-      .set({
-        data: {
-          ...data,
-          external_identity_link_tokens: [...activeTokens, tokenRecord],
-          external_identity_link_token_nonce: generateLinkTokenConsumeNonce(),
-        },
-        updated_at: new Date(),
-      })
-      .where(eq(users.user_id, intendedUserId))
-      .run();
+    await this.db.transaction(async (tx) => {
+      const txDb = txAsDb(tx);
+      await lockRowForUpdate(txDb, this.db, users, eq(users.user_id, intendedUserId));
+      const row = await select(txDb).from(users).where(eq(users.user_id, intendedUserId)).one();
+      if (!row) throw new EntityNotFoundError('User', input.intended_user_id);
+      const data = ((row as UserRow).data ?? {}) as StoredUserData;
+      const activeTokens = getExternalIdentityLinkTokens(data)
+        .filter(
+          (candidate) => candidate.consumed_at || Date.parse(candidate.expires_at) > Date.now()
+        )
+        .slice(-24);
+      await update(txDb, users)
+        .set({
+          data: {
+            ...data,
+            external_identity_link_tokens: [...activeTokens, tokenRecord],
+          },
+          updated_at: new Date(),
+        })
+        .where(eq(users.user_id, intendedUserId))
+        .run();
+    });
 
     return {
       token,
@@ -608,15 +606,12 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
     const now = input.now ?? new Date();
     const nowIso = now.toISOString();
 
-    // Link tokens live inside the users JSON blob, so there is no token row
-    // to atomically UPDATE by primary key. Use an optimistic compare-and-set on
-    // a cryptographically random nonce in the same users.data blob instead of
-    // users.updated_at: SQLite timestamp precision can preserve the same
-    // updated_at value across a stale read/write race, while this nonce is
-    // always replaced during the token mutation. After a conflict, re-read so
-    // contenders observe consumed_at and fail closed as used_token.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const rows = (await select(this.db).from(users).all()) as UserRow[];
+    return runTransactionWithRetry(this.db, async (txDb) => {
+      // The token and identity both live in users.data. Lock the small user set
+      // before checking either so two tokens cannot claim the same subject and
+      // two consumers cannot spend the same token from stale preimages.
+      await lockRowForUpdate(txDb, this.db, users, sql`true`);
+      const rows = (await select(txDb).from(users).all()) as UserRow[];
       const tokenMatches: Array<{ row: UserRow; token: UserExternalIdentityLinkToken }> = [];
 
       for (const row of rows) {
@@ -633,17 +628,19 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
         }
       }
 
-      if (tokenMatches.length === 0) return { ok: false, reason: 'invalid_token' };
-      if (tokenMatches.length > 1) return { ok: false, reason: 'ambiguous_token' };
+      if (tokenMatches.length === 0)
+        return { ok: false as const, reason: 'invalid_token' as const };
+      if (tokenMatches.length > 1)
+        return { ok: false as const, reason: 'ambiguous_token' as const };
 
       const [{ row: tokenRow, token: storedToken }] = tokenMatches;
-      if (storedToken.consumed_at) return { ok: false, reason: 'used_token' };
+      if (storedToken.consumed_at) return { ok: false as const, reason: 'used_token' as const };
       const expiresAtMs = Date.parse(storedToken.expires_at);
       if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now.getTime()) {
-        return { ok: false, reason: 'expired_token' };
+        return { ok: false as const, reason: 'expired_token' as const };
       }
       if (storedToken.intended_user_id !== tokenRow.user_id) {
-        return { ok: false, reason: 'target_user_not_found' };
+        return { ok: false as const, reason: 'target_user_not_found' as const };
       }
 
       const key = externalIdentityKey(input.provider, input.issuer, input.subject);
@@ -651,8 +648,10 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
         const identities = getExternalIdentities(candidate.data as StoredUserData);
         return identities.some((identity) => identity.key === key);
       });
-      if (existingMatches.length > 1) return { ok: false, reason: 'ambiguous_link' };
-      if (existingMatches.length === 1) return { ok: false, reason: 'already_linked' };
+      if (existingMatches.length > 1)
+        return { ok: false as const, reason: 'ambiguous_link' as const };
+      if (existingMatches.length === 1)
+        return { ok: false as const, reason: 'already_linked' as const };
 
       const targetData = (tokenRow.data ?? {}) as StoredUserData;
       const externalIdentity: UserExternalIdentity = {
@@ -674,41 +673,28 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
               }
             : candidate
       );
-      const previousNonce = targetData.external_identity_link_token_nonce;
-      const nextNonce = generateLinkTokenConsumeNonce();
-
-      const nonceExpression = jsonExtract(
-        this.db,
-        users.data,
-        'external_identity_link_token_nonce'
-      );
-      const casWhere = previousNonce
-        ? and(eq(users.user_id, tokenRow.user_id), eq(nonceExpression, previousNonce))
-        : and(eq(users.user_id, tokenRow.user_id), isNull(nonceExpression));
-      const result = await update(this.db, users)
+      const result = await update(txDb, users)
         .set({
           data: {
             ...targetData,
             external_identities: [...getExternalIdentities(targetData), externalIdentity],
             external_identity_link_tokens,
-            external_identity_link_token_nonce: nextNonce,
           },
           updated_at: new Date(),
         })
-        .where(casWhere)
+        .where(eq(users.user_id, tokenRow.user_id))
         .run();
 
       if (result.rowsAffected === 1) {
         return {
-          ok: true,
+          ok: true as const,
           user_id: tokenRow.user_id,
           token_id: storedToken.token_id,
           external_identity: externalIdentity,
         };
       }
-    }
-
-    return { ok: false, reason: 'used_token' };
+      return { ok: false as const, reason: 'target_user_not_found' as const };
+    });
   }
 
   /**
@@ -725,69 +711,54 @@ export class UsersRepository implements BaseRepository<InternalUser, Partial<Int
    */
   async update(id: string, updates: Partial<InternalUser>): Promise<InternalUser> {
     const fullId = await this.resolveId(id);
+    return this.db.transaction(async (tx) => {
+      const txDb = txAsDb(tx);
+      await lockRowForUpdate(txDb, this.db, users, eq(users.user_id, fullId));
+      const rawRow = (await select(txDb)
+        .from(users)
+        .where(eq(users.user_id, fullId))
+        .one()) as UserRow | null;
+      if (!rawRow) throw new EntityNotFoundError('User', id);
 
-    // Get current user
-    const current = await this.findById(fullId);
-    if (!current) {
-      throw new EntityNotFoundError('User', id);
-    }
-
-    // Validate unix_username uniqueness if being changed
-    if (updates.unix_username && updates.unix_username !== current.unix_username) {
-      const isTaken = await this.isUnixUsernameTaken(updates.unix_username, fullId);
-      if (isTaken) {
-        throw new RepositoryError(
-          `Unix username "${updates.unix_username}" is already in use by another user`
-        );
+      const current = this.rowToUser(rawRow);
+      if (updates.unix_username && updates.unix_username !== current.unix_username) {
+        const owner = await select(txDb)
+          .from(users)
+          .where(eq(users.unix_username, updates.unix_username))
+          .one();
+        if (owner && owner.user_id !== fullId) {
+          throw new RepositoryError(
+            `Unix username "${updates.unix_username}" is already in use by another user`
+          );
+        }
       }
-    }
 
-    // Merge updates. Preserve the encrypted agentic_tools and env_vars blobs
-    // from the raw row so a generic field update (name, preferences, etc.)
-    // doesn't nuke stored credentials — the boolean projection on `current`
-    // can't round-trip back to encrypted bytes.
-    const rawRow = await this.getRawRow(fullId);
-    const merged = { ...current, ...updates } as Partial<InternalUser> & {
-      agentic_tools_raw?: StoredAgenticTools;
-      env_vars_raw?: SchemaUserInsert['data']['env_vars'];
-      external_identities_raw?: UserExternalIdentity[];
-      external_identity_link_tokens_raw?: UserExternalIdentityLinkToken[];
-      external_identity_link_token_nonce_raw?: string;
-    };
-    if (rawRow?.data.agentic_tools) {
-      merged.agentic_tools_raw = rawRow.data.agentic_tools as StoredAgenticTools;
-    }
-    if (rawRow?.data.env_vars) {
-      merged.env_vars_raw = rawRow.data.env_vars;
-    }
-    if (rawRow?.data.external_identities) {
-      merged.external_identities_raw = rawRow.data.external_identities;
-    }
-    if (rawRow?.data.external_identity_link_tokens) {
-      merged.external_identity_link_tokens_raw = rawRow.data.external_identity_link_tokens;
-    }
-    if (rawRow?.data.external_identity_link_token_nonce) {
-      merged.external_identity_link_token_nonce_raw =
-        rawRow.data.external_identity_link_token_nonce;
-    }
-    const insertData = this.userToInsert(merged);
+      // Internal JSON fields are not projected on the public user DTO; preserve
+      // them from the locked row so profile updates cannot overwrite a link or token.
+      const merged = { ...current, ...updates } as Partial<InternalUser> & {
+        agentic_tools_raw?: StoredAgenticTools;
+        env_vars_raw?: SchemaUserInsert['data']['env_vars'];
+        external_identities_raw?: UserExternalIdentity[];
+        external_identity_link_tokens_raw?: UserExternalIdentityLinkToken[];
+      };
+      if (rawRow.data.agentic_tools) {
+        merged.agentic_tools_raw = rawRow.data.agentic_tools as StoredAgenticTools;
+      }
+      if (rawRow.data.env_vars) merged.env_vars_raw = rawRow.data.env_vars;
+      if (rawRow.data.external_identities) {
+        merged.external_identities_raw = rawRow.data.external_identities;
+      }
+      if (rawRow.data.external_identity_link_tokens) {
+        merged.external_identity_link_tokens_raw = rawRow.data.external_identity_link_tokens;
+      }
 
-    // Update database
-    await update(this.db, users)
-      .set({
-        ...insertData,
-        updated_at: new Date(),
-      })
-      .where(eq(users.user_id, fullId))
-      .run();
-
-    const row = await select(this.db).from(users).where(eq(users.user_id, fullId)).one();
-
-    if (!row) {
-      throw new RepositoryError('Failed to retrieve updated user');
-    }
-
-    return this.rowToUser(row as UserRow);
+      const row = await update(txDb, users)
+        .set({ ...this.userToInsert(merged), updated_at: new Date() })
+        .where(eq(users.user_id, fullId))
+        .returning()
+        .one();
+      return this.rowToUser(row as UserRow);
+    });
   }
 
   /**

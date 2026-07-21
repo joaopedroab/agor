@@ -19,6 +19,7 @@ import {
   gatewayTokenParamsSchema,
   gatewayTokenSubmitSchema,
   gatewayTokenWidget,
+  isSupportedGatewayTokenChannelType,
   registerGatewayTokenWidget,
 } from './index';
 
@@ -101,6 +102,10 @@ describe('gateway_token widget — registry registration', () => {
 });
 
 describe('gateway_token widget — paramsSchema', () => {
+  it('supports Telegram through the existing gateway credential widget', () => {
+    expect(isSupportedGatewayTokenChannelType('telegram')).toBe(true);
+  });
+
   it('accepts the non-secret params', () => {
     expect(gatewayTokenParamsSchema.safeParse(defaultParams).success).toBe(true);
   });

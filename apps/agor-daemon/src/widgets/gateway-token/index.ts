@@ -2,7 +2,7 @@
  * gateway_token widget — registry entry and registration.
  *
  * Concrete widget type: an admin supplies a gateway channel's platform
- * credentials (Slack bot/app tokens, GitHub private key, Teams app password)
+ * credentials (Slack/Telegram bot tokens, GitHub private key, Teams app password)
  * through an inline form. The values flow browser → daemon via
  * `POST /widgets/:widget_id/submit` and land in the channel's encrypted
  * `config` through the gateway-channels service — never through the agent's
@@ -33,6 +33,7 @@ const SUPPORTED_CHANNEL_TYPES = [
   'slack',
   'github',
   'teams',
+  'telegram',
 ] as const satisfies readonly ChannelType[];
 
 export function isSupportedGatewayTokenChannelType(channelType: string): boolean {

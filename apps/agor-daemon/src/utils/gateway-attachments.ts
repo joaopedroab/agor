@@ -13,7 +13,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import type { InboundFile } from '@agor/core/gateway';
+import type { GatewayConnector, InboundAttachment, InboundFile } from '@agor/core/gateway';
 import {
   ALLOWED_UPLOAD_MIME_TYPES,
   buildUploadFilename,
@@ -27,6 +27,14 @@ export interface AttachmentIngestResult {
   paths: string[];
   /** Image attachments that could not be fetched or stored. */
   failed: number;
+}
+
+export interface StoredGatewayAttachment {
+  filename: string;
+  path: string;
+  size: number;
+  mimeType: string;
+  caption?: string;
 }
 
 const MAX_REDIRECT_HOPS = 3;
@@ -82,6 +90,78 @@ export function buildPromptWithAttachments(text: string, attachmentPaths: string
     return `${trimmedText}\n\n${attachmentBlock}`;
   }
   return trimmedText ? `${attachmentBlock}\n\n${trimmedText}` : attachmentBlock;
+}
+
+function attachmentError(message: string, reason: string): Error {
+  return Object.assign(new Error(message), { attachmentReason: reason });
+}
+
+/** Download connector-owned attachments and store them through the normal upload policy. */
+export async function ingestConnectorAttachments(args: {
+  connector: GatewayConnector;
+  attachments: readonly InboundAttachment[];
+}): Promise<StoredGatewayAttachment[]> {
+  if (!args.connector.downloadAttachment) {
+    throw attachmentError('Connector does not support attachment downloads', 'unsupported_type');
+  }
+
+  const stored: StoredGatewayAttachment[] = [];
+  let totalBytes = 0;
+  for (const attachment of args.attachments) {
+    const mime = attachment.mimeType.split(';')[0].trim().toLowerCase();
+    if (!ALLOWED_UPLOAD_MIME_TYPES.has(mime)) {
+      throw attachmentError(
+        `Unsupported attachment MIME type: ${mime || 'unknown'}`,
+        'unsupported_mime_type'
+      );
+    }
+    if (
+      typeof attachment.sizeBytes === 'number' &&
+      (attachment.sizeBytes > MAX_UPLOAD_FILE_SIZE ||
+        totalBytes + attachment.sizeBytes > MAX_UPLOAD_FILE_SIZE)
+    ) {
+      throw attachmentError('Attachment exceeds size limit', 'oversized');
+    }
+
+    const downloaded = await args.connector.downloadAttachment({
+      attachment,
+      maxBytes: MAX_UPLOAD_FILE_SIZE,
+    });
+    const downloadedMime = downloaded.mimeType.split(';')[0].trim().toLowerCase();
+    if (!ALLOWED_UPLOAD_MIME_TYPES.has(downloadedMime)) {
+      throw attachmentError(
+        `Unsupported attachment MIME type: ${downloadedMime || 'unknown'}`,
+        'unsupported_mime_type'
+      );
+    }
+    totalBytes += downloaded.bytes.byteLength;
+    if (totalBytes > MAX_UPLOAD_FILE_SIZE) {
+      throw attachmentError('Attachment batch exceeds size limit', 'oversized');
+    }
+
+    await fs.mkdir(getUploadDirectory(), { recursive: true });
+    const baseTimestamp = Date.now();
+    let saved: StoredGatewayAttachment | undefined;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const filename = buildUploadFilename(downloaded.filename, baseTimestamp + attempt);
+      const filePath = path.join(getUploadDirectory(), filename);
+      try {
+        await fs.writeFile(filePath, downloaded.bytes, { flag: 'wx' });
+        saved = {
+          filename,
+          path: filePath,
+          size: downloaded.bytes.byteLength,
+          mimeType: downloadedMime,
+          ...(attachment.caption ? { caption: attachment.caption } : {}),
+        };
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt === 4) throw error;
+      }
+    }
+    if (saved) stored.push(saved);
+  }
+  return stored;
 }
 
 /**

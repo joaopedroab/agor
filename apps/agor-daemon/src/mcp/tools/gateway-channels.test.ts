@@ -149,7 +149,9 @@ describe('agor_gateway_channels MCP tools', () => {
       config: { connection_mode: 'socket', app_token: 'xapp-1' },
     });
     expect(missingBot.success).toBe(false);
-    expect(String(missingBot.error)).toContain('config.bot_token is required for Slack');
+    expect(String(missingBot.error)).toContain(
+      'config.bot_token is required for slack gateway channels'
+    );
 
     const missingApp = tools.agor_gateway_channels_create.cfg.inputSchema.safeParse({
       name: 'Eng Slack',
@@ -159,7 +161,7 @@ describe('agor_gateway_channels MCP tools', () => {
     });
     expect(missingApp.success).toBe(false);
     expect(String(missingApp.error)).toContain(
-      'config.app_token is required for Slack Socket Mode'
+      'config.app_token is required for slack gateway channels'
     );
   });
 
@@ -182,7 +184,9 @@ describe('agor_gateway_channels MCP tools', () => {
       config: {},
     });
     expect(enabledMissing.success).toBe(false);
-    expect(String(enabledMissing.error)).toContain('config.bot_token is required for Slack');
+    expect(String(enabledMissing.error)).toContain(
+      'config.bot_token is required for slack gateway channels'
+    );
   });
 
   it('enforces non-secret required config on disabled create', async () => {
@@ -935,7 +939,7 @@ describe('agor_gateway_channels MCP tools', () => {
     });
     expect(enabledWithoutToken.success).toBe(false);
     expect(String(enabledWithoutToken.error)).toContain(
-      'config.bot_token is required to create an enabled Telegram gateway channel'
+      'config.bot_token is required for telegram gateway channels'
     );
 
     const disabledPlaceholder = tools.agor_gateway_channels_create.cfg.inputSchema.safeParse({
@@ -2007,6 +2011,10 @@ describe('getRequiredSecretFields — Slack app_token required unless explicitly
     expect(
       getRequiredSecretFields('slack', { outbound_enabled: true, connection_mode: 'socket' })
     ).toEqual(['bot_token', 'app_token']);
+  });
+
+  it('requires bot_token for Telegram through the shared secret owner', () => {
+    expect(getRequiredSecretFields('telegram', {})).toEqual(['bot_token']);
   });
 });
 

@@ -7,6 +7,7 @@ import {
   getCurrentTenantId,
   MissingTenantDatabaseScopeError,
   requireCurrentTenantId,
+  runWithIdempotentTenantDatabaseScopeRetry,
   runWithoutTenantDatabaseScope,
   runWithSystemDatabaseScope,
   runWithTenantDatabaseScope,
@@ -81,6 +82,46 @@ describe('tenant-scoped database proxy', () => {
 
     expect(base.transaction).toHaveBeenCalledTimes(1);
     expect(tx.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries outer commit contention only for explicitly idempotent tenant work', async () => {
+    const events: string[] = [];
+    let transactionAttempt = 0;
+    const base = {
+      transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => {
+        transactionAttempt += 1;
+        const marker = `tx-${transactionAttempt}`;
+        events.push(`begin:${marker}`);
+        const result = await callback({
+          execute: vi.fn(async () => []),
+          marker: vi.fn(() => marker),
+        });
+        if (transactionAttempt === 1) {
+          events.push(`contention:${marker}`);
+          throw Object.assign(new Error('outer commit serialization failure'), {
+            cause: { code: '40001' },
+          });
+        }
+        events.push(`commit:${marker}`);
+        return result;
+      }),
+      marker: vi.fn(() => 'base'),
+    };
+    const db = createTenantScopedDatabaseProxy(base as unknown as Database);
+
+    await runWithIdempotentTenantDatabaseScopeRetry(db, 'tenant-a', async () => {
+      events.push(`work:${(db as unknown as { marker(): string }).marker()}`);
+    });
+
+    expect(events).toEqual([
+      'begin:tx-1',
+      'work:tx-1',
+      'contention:tx-1',
+      'begin:tx-2',
+      'work:tx-2',
+      'commit:tx-2',
+    ]);
+    expect(base.transaction).toHaveBeenCalledTimes(2);
   });
 
   it('rejects nested scopes that try to switch tenants', async () => {

@@ -14,6 +14,7 @@ import {
   getCurrentTenantId,
   getHiddenTenantId,
   MCPServerRepository,
+  runWithIdempotentTenantDatabaseScopeRetry,
   runWithoutTenantDatabaseScope,
   runWithTenantDatabaseScope,
   SessionRepository,
@@ -34,7 +35,6 @@ import type {
   SlackThreadHistoryResult,
 } from '@agor/core/gateway';
 import {
-  decideTelegramInboundAuth,
   formatGatewayContext,
   formatGatewayFollowUpRoutingMessage,
   formatGatewaySessionCreatedMessage,
@@ -72,14 +72,12 @@ import { getSessionUrl } from '@agor/core/utils/url';
 import { hasBranchPermission } from '../utils/branch-authorization.js';
 import {
   buildPromptWithAttachments,
+  ingestConnectorAttachments,
   ingestInboundImageAttachments,
+  type StoredGatewayAttachment,
 } from '../utils/gateway-attachments.js';
 import { deferWithTenantDatabaseScope } from '../utils/tenant-db-scope.js';
-import {
-  ALLOWED_UPLOAD_MIME_TYPES,
-  MAX_UPLOAD_FILE_SIZE,
-  writeUploadedBuffer,
-} from '../utils/upload.js';
+import { MAX_UPLOAD_FILE_SIZE } from '../utils/upload.js';
 
 /**
  * Inbound message data (platform → session)
@@ -113,87 +111,13 @@ interface RouteMessageData {
   metadata?: Record<string, unknown>;
 }
 
-const TELEGRAM_POLLING_STATE_CONFIG_KEY = 'telegram_polling_state';
-const TELEGRAM_RECENT_PROCESSED_UPDATE_LIMIT = 20;
-
-type TelegramPollingInflightStatus = 'reserved' | 'side_effects_started' | 'side_effects_completed';
-
-interface TelegramPollingInflightUpdate {
-  update_id: number;
-  status: TelegramPollingInflightStatus;
-  updated_at: string;
-}
-
-interface TelegramPollingState {
-  last_processed_update_id?: unknown;
-  acknowledged_at?: unknown;
-  recent_processed_update_ids?: unknown;
-  inflight_update?: unknown;
-}
+const TELEGRAM_INFLIGHT_RETRY_AFTER_MS = 60_000;
 
 function getTelegramUpdateIdFromMetadata(metadata?: Record<string, unknown>): number | undefined {
   const updateId = metadata?.telegram_update_id;
   return typeof updateId === 'number' && Number.isSafeInteger(updateId) && updateId >= 0
     ? updateId
     : undefined;
-}
-
-function telegramSafeUpdateId(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
-}
-
-function asTelegramPollingState(channel: GatewayChannel): TelegramPollingState {
-  const state = (channel.config as Record<string, unknown>)[TELEGRAM_POLLING_STATE_CONFIG_KEY];
-  return state && typeof state === 'object' && !Array.isArray(state)
-    ? (state as TelegramPollingState)
-    : {};
-}
-
-function getTelegramLastProcessedUpdateId(channel: GatewayChannel): number | undefined {
-  return telegramSafeUpdateId(asTelegramPollingState(channel).last_processed_update_id);
-}
-
-function getTelegramRecentProcessedUpdateIds(channel: GatewayChannel): number[] {
-  const recent = asTelegramPollingState(channel).recent_processed_update_ids;
-  if (!Array.isArray(recent)) return [];
-  return recent.filter((value): value is number => telegramSafeUpdateId(value) === value);
-}
-
-function getTelegramInflightUpdate(
-  channel: GatewayChannel
-): TelegramPollingInflightUpdate | undefined {
-  const inflight = asTelegramPollingState(channel).inflight_update;
-  if (!inflight || typeof inflight !== 'object' || Array.isArray(inflight)) return undefined;
-  const updateId = telegramSafeUpdateId((inflight as Record<string, unknown>).update_id);
-  const status = (inflight as Record<string, unknown>).status;
-  const updatedAt = (inflight as Record<string, unknown>).updated_at;
-  if (
-    typeof updateId !== 'number' ||
-    (status !== 'reserved' &&
-      status !== 'side_effects_started' &&
-      status !== 'side_effects_completed') ||
-    typeof updatedAt !== 'string'
-  ) {
-    return undefined;
-  }
-  return { update_id: updateId, status, updated_at: updatedAt };
-}
-
-function hasTelegramProcessedUpdate(channel: GatewayChannel, updateId: number): boolean {
-  const lastProcessedUpdateId = getTelegramLastProcessedUpdateId(channel);
-  return (
-    (typeof lastProcessedUpdateId === 'number' && updateId <= lastProcessedUpdateId) ||
-    getTelegramRecentProcessedUpdateIds(channel).includes(updateId)
-  );
-}
-
-function appendTelegramRecentProcessedUpdateId(
-  channel: GatewayChannel,
-  updateId: number
-): number[] {
-  return [...new Set([...getTelegramRecentProcessedUpdateIds(channel), updateId])].slice(
-    -TELEGRAM_RECENT_PROCESSED_UPDATE_LIMIT
-  );
 }
 
 /**
@@ -684,24 +608,12 @@ function buildGatewayContext(channel: GatewayChannel, data: PostMessageData): Ga
   }
 }
 
-function normalizeMimeType(value: string): string {
-  return (value || '').split(';')[0].trim().toLowerCase();
-}
-
 function formatAttachmentSize(bytes: number | undefined): string {
   if (typeof bytes !== 'number') return 'unknown size';
   if (bytes < 1024) return `${bytes} B`;
   const kb = bytes / 1024;
   if (kb < 1024) return `${kb.toFixed(1)} KB`;
   return `${(kb / 1024).toFixed(1)} MB`;
-}
-
-interface StoredGatewayAttachment {
-  filename: string;
-  path: string;
-  size: number;
-  mimeType: string;
-  caption?: string;
 }
 
 function buildAttachmentPrompt(args: {
@@ -877,181 +789,6 @@ export class GatewayService {
       this.activeListeners.get(channel.id) ??
       getConnector(channel.channel_type as ChannelType, channel.config)
     );
-  }
-
-  private async getFreshChannelForDeliveryState(channel: GatewayChannel): Promise<GatewayChannel> {
-    return (await this.channelRepo.findById(channel.id)) ?? channel;
-  }
-
-  private async isTelegramUpdateAlreadyProcessed(
-    channel: GatewayChannel,
-    updateId: number
-  ): Promise<boolean> {
-    const freshChannel = await this.getFreshChannelForDeliveryState(channel);
-    return hasTelegramProcessedUpdate(freshChannel, updateId);
-  }
-
-  private async writeTelegramPollingState(
-    channel: GatewayChannel,
-    buildState: (freshChannel: GatewayChannel) => TelegramPollingState
-  ): Promise<GatewayChannel> {
-    const freshChannel = await this.getFreshChannelForDeliveryState(channel);
-    return await this.channelRepo.updateConfig(channel.id, {
-      [TELEGRAM_POLLING_STATE_CONFIG_KEY]: buildState(freshChannel),
-    });
-  }
-
-  private async reserveTelegramUpdate(
-    channel: GatewayChannel,
-    updateId: number
-  ): Promise<'reserved' | 'processed' | TelegramPollingInflightStatus> {
-    const freshChannel = await this.getFreshChannelForDeliveryState(channel);
-    if (hasTelegramProcessedUpdate(freshChannel, updateId)) {
-      return 'processed';
-    }
-
-    const inflight = getTelegramInflightUpdate(freshChannel);
-    if (inflight?.update_id === updateId) {
-      return inflight.status;
-    }
-
-    await this.channelRepo.updateConfig(channel.id, {
-      [TELEGRAM_POLLING_STATE_CONFIG_KEY]: {
-        ...asTelegramPollingState(freshChannel),
-        inflight_update: {
-          update_id: updateId,
-          status: 'reserved',
-          updated_at: new Date().toISOString(),
-        },
-      },
-    });
-    return 'reserved';
-  }
-
-  private async markTelegramUpdateSideEffectsStarted(
-    channel: GatewayChannel,
-    updateId: number
-  ): Promise<void> {
-    await this.writeTelegramPollingState(channel, (freshChannel) => ({
-      ...asTelegramPollingState(freshChannel),
-      inflight_update: {
-        update_id: updateId,
-        status: 'side_effects_started',
-        updated_at: new Date().toISOString(),
-      },
-    }));
-  }
-
-  private async markTelegramUpdateSideEffectsCompleted(
-    channel: GatewayChannel,
-    updateId: number
-  ): Promise<void> {
-    await this.writeTelegramPollingState(channel, (freshChannel) => ({
-      ...asTelegramPollingState(freshChannel),
-      inflight_update: {
-        update_id: updateId,
-        status: 'side_effects_completed',
-        updated_at: new Date().toISOString(),
-      },
-    }));
-  }
-
-  private async clearTelegramUpdateReservation(
-    channel: GatewayChannel,
-    updateId: number
-  ): Promise<void> {
-    await this.writeTelegramPollingState(channel, (freshChannel) => {
-      const state = { ...asTelegramPollingState(freshChannel) };
-      const inflight = getTelegramInflightUpdate(freshChannel);
-      if (inflight?.update_id === updateId) {
-        delete state.inflight_update;
-      }
-      return state;
-    });
-  }
-
-  private async acknowledgeTelegramUpdate(
-    channel: GatewayChannel,
-    updateId: number
-  ): Promise<void> {
-    await this.writeTelegramPollingState(channel, (freshChannel) => {
-      const state = { ...asTelegramPollingState(freshChannel) };
-      const lastProcessedUpdateId = getTelegramLastProcessedUpdateId(freshChannel);
-      state.last_processed_update_id =
-        typeof lastProcessedUpdateId === 'number'
-          ? Math.max(lastProcessedUpdateId, updateId)
-          : updateId;
-      state.acknowledged_at = new Date().toISOString();
-      state.recent_processed_update_ids = appendTelegramRecentProcessedUpdateId(
-        freshChannel,
-        updateId
-      );
-
-      const inflight = getTelegramInflightUpdate(freshChannel);
-      if (inflight?.update_id === updateId) {
-        delete state.inflight_update;
-      }
-      return state;
-    });
-  }
-
-  private async storeInboundAttachments(
-    channel: GatewayChannel,
-    attachments: readonly InboundAttachment[] | undefined
-  ): Promise<StoredGatewayAttachment[]> {
-    if (!attachments?.length) return [];
-    const connector = this.getConnectorForChannel(channel);
-    if (!connector.downloadAttachment) {
-      throw Object.assign(new Error('Connector does not support attachment downloads'), {
-        attachmentReason: 'unsupported_type',
-      });
-    }
-
-    const stored: StoredGatewayAttachment[] = [];
-    let totalBytes = 0;
-    for (const attachment of attachments) {
-      const mime = normalizeMimeType(attachment.mimeType);
-      if (!ALLOWED_UPLOAD_MIME_TYPES.has(mime)) {
-        throw Object.assign(new Error(`Unsupported attachment MIME type: ${mime || 'unknown'}`), {
-          attachmentReason: 'unsupported_mime_type',
-        });
-      }
-      if (typeof attachment.sizeBytes === 'number' && attachment.sizeBytes > MAX_UPLOAD_FILE_SIZE) {
-        throw Object.assign(new Error('Attachment exceeds size limit'), {
-          attachmentReason: 'oversized',
-        });
-      }
-      if (
-        typeof attachment.sizeBytes === 'number' &&
-        totalBytes + attachment.sizeBytes > MAX_UPLOAD_FILE_SIZE
-      ) {
-        throw Object.assign(new Error('Attachment batch exceeds size limit'), {
-          attachmentReason: 'oversized',
-        });
-      }
-
-      const downloaded = await connector.downloadAttachment({
-        attachment,
-        maxBytes: MAX_UPLOAD_FILE_SIZE,
-      });
-      totalBytes += downloaded.sizeBytes;
-      if (totalBytes > MAX_UPLOAD_FILE_SIZE) {
-        throw Object.assign(new Error('Attachment batch exceeds size limit'), {
-          attachmentReason: 'oversized',
-        });
-      }
-
-      const saved = await writeUploadedBuffer({
-        bytes: downloaded.bytes,
-        filename: downloaded.filename,
-        mimeType: downloaded.mimeType,
-      });
-      stored.push({
-        ...saved,
-        ...(attachment.caption ? { caption: attachment.caption } : {}),
-      });
-    }
-    return stored;
   }
 
   private truncateSlackInline(value: string, maxChars = 70): string {
@@ -2242,19 +1979,10 @@ export class GatewayService {
         };
       }
 
-      const matchedUsers = await this.usersRepo.findUsersByExternalIdentity({
-        provider: TELEGRAM_EXTERNAL_IDENTITY_PROVIDER,
-        issuer: TELEGRAM_EXTERNAL_IDENTITY_ISSUER,
-        subject: identityRef.subject,
-      });
-      const authDecision = decideTelegramInboundAuth({
-        telegramUserId: identityRef.subject,
-        linkedUsers: matchedUsers,
-      });
-
-      if (!authDecision.ok) {
+      const matchedUser = await this.usersRepo.findByExternalIdentity(identityRef);
+      if (!matchedUser) {
         console.log(
-          `[gateway] Telegram user alignment failed: ${authDecision.reason} for Telegram user ${identityRef.subject} (thread=${data.thread_id})`
+          `[gateway] Telegram user alignment failed: no unique link for Telegram user ${identityRef.subject} (thread=${data.thread_id})`
         );
         if (telegramCommand?.kind === 'new_session') {
           this.sendSystemMessage(
@@ -2271,9 +1999,9 @@ export class GatewayService {
       }
 
       console.log(
-        `[gateway] Telegram user aligned via external identity: ${authDecision.telegramUserId} → Agor user ${shortId(authDecision.agorUserId)}`
+        `[gateway] Telegram user aligned via external identity: ${identityRef.subject} → Agor user ${shortId(matchedUser.user_id)}`
       );
-      user = await usersService.get(authDecision.agorUserId);
+      user = await usersService.get(matchedUser.user_id);
     }
 
     // --- Slack user alignment ---
@@ -2444,7 +2172,10 @@ export class GatewayService {
 
     if (data.attachments?.length) {
       try {
-        storedInboundAttachments = await this.storeInboundAttachments(channel, data.attachments);
+        storedInboundAttachments = await ingestConnectorAttachments({
+          connector: this.getConnectorForChannel(channel),
+          attachments: data.attachments,
+        });
       } catch (error) {
         const attachmentReason =
           typeof (error as { attachmentReason?: unknown }).attachmentReason === 'string'
@@ -3339,48 +3070,73 @@ export class GatewayService {
       throw new Error(`Missing tenant context for gateway listener channel ${channel.id}`);
     }
 
-    await runWithTenantDatabaseScope(this.db, tenantId, async () => {
-      const telegramUpdateId =
-        channel.channel_type === 'telegram'
-          ? getTelegramUpdateIdFromMetadata(msg.metadata)
-          : undefined;
-      if (typeof telegramUpdateId === 'number') {
-        if (await this.isTelegramUpdateAlreadyProcessed(channel, telegramUpdateId)) {
-          console.debug(
-            `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
-          );
-          return;
-        }
-
-        const reservationStatus = await this.reserveTelegramUpdate(channel, telegramUpdateId);
-        if (reservationStatus === 'processed') {
-          console.debug(
-            `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
-          );
-          return;
-        }
-        if (reservationStatus === 'side_effects_completed') {
-          console.warn(
-            `[gateway] Telegram update ${telegramUpdateId} replay reached channel ${shortId(
-              channel.id
-            )} after side effects completed; finalizing durable acknowledgement without repeating side effects`
-          );
-          await this.acknowledgeTelegramUpdate(channel, telegramUpdateId);
-          return;
-        }
-        if (reservationStatus === 'side_effects_started') {
+    let telegramLeaseToken: string | undefined;
+    const telegramUpdateId =
+      channel.channel_type === 'telegram'
+        ? getTelegramUpdateIdFromMetadata(msg.metadata)
+        : undefined;
+    if (typeof telegramUpdateId === 'number') {
+      const claim = await runWithIdempotentTenantDatabaseScopeRetry(this.db, tenantId, () =>
+        this.channelRepo.claimTelegramPollingUpdate(channel.id, telegramUpdateId, {
+          staleAfterMs: TELEGRAM_INFLIGHT_RETRY_AFTER_MS,
+        })
+      );
+      if (claim.status === 'processed') {
+        console.debug(
+          `[gateway] Telegram update ${telegramUpdateId} already processed for channel ${shortId(channel.id)}`
+        );
+        return;
+      }
+      if (claim.status === 'side_effects_completed') {
+        console.warn(
+          `[gateway] Telegram update ${telegramUpdateId} replay reached channel ${shortId(
+            channel.id
+          )} after side effects completed; finalizing durable acknowledgement without repeating side effects`
+        );
+        const acknowledged = await runWithIdempotentTenantDatabaseScopeRetry(
+          this.db,
+          tenantId,
+          () =>
+            this.channelRepo.acknowledgeTelegramPollingUpdate(
+              channel.id,
+              telegramUpdateId,
+              claim.leaseToken
+            )
+        );
+        if (!acknowledged) {
           throw new Error(
-            `Telegram update ${telegramUpdateId} for channel ${shortId(
-              channel.id
-            )} has ambiguous processing state; refusing to acknowledge without replay`
+            `Telegram update ${telegramUpdateId} completed lease is no longer current`
           );
         }
-
-        await this.markTelegramUpdateSideEffectsStarted(channel, telegramUpdateId);
+        return;
+      }
+      if (claim.status === 'active') {
+        throw new Error(
+          `[gateway] Telegram update ${telegramUpdateId} is blocked by active ${claim.inflightStatus} claim for update ${claim.updateId} on channel ${shortId(channel.id)}`
+        );
+      }
+      telegramLeaseToken = claim.leaseToken;
+      if (claim.reclaimed) {
+        console.warn(
+          `[gateway] Retrying stale Telegram update ${telegramUpdateId} for channel ${shortId(channel.id)}`
+        );
       }
 
-      try {
-        await this.create({
+      const started = await runWithIdempotentTenantDatabaseScopeRetry(this.db, tenantId, () =>
+        this.channelRepo.markTelegramPollingSideEffectsStarted(
+          channel.id,
+          telegramUpdateId,
+          claim.leaseToken
+        )
+      );
+      if (!started) {
+        throw new Error(`Telegram update ${telegramUpdateId} lease was lost before processing`);
+      }
+    }
+
+    try {
+      await runWithTenantDatabaseScope(this.db, tenantId, () =>
+        this.create({
           channel_key: channel.channel_key,
           thread_id: msg.threadId,
           text: msg.text,
@@ -3389,26 +3145,52 @@ export class GatewayService {
           ...(msg.attachmentRejection ? { attachmentRejection: msg.attachmentRejection } : {}),
           ...(msg.files ? { files: msg.files } : {}),
           metadata: msg.metadata,
-        });
-      } catch (error) {
-        if (typeof telegramUpdateId === 'number') {
-          try {
-            await this.clearTelegramUpdateReservation(channel, telegramUpdateId);
-          } catch (clearError) {
-            console.warn(
-              `[gateway] Failed to clear Telegram update ${telegramUpdateId} reservation after processing error:`,
-              redactProviderErrorMessage(clearError)
-            );
-          }
+        })
+      );
+    } catch (error) {
+      if (typeof telegramUpdateId === 'number' && telegramLeaseToken) {
+        try {
+          await runWithIdempotentTenantDatabaseScopeRetry(this.db, tenantId, () =>
+            this.channelRepo.releaseTelegramPollingUpdate(
+              channel.id,
+              telegramUpdateId,
+              telegramLeaseToken
+            )
+          );
+        } catch (clearError) {
+          console.warn(
+            `[gateway] Failed to clear Telegram update ${telegramUpdateId} reservation after processing error:`,
+            redactProviderErrorMessage(clearError)
+          );
         }
-        throw error;
       }
+      throw error;
+    }
 
-      if (typeof telegramUpdateId === 'number') {
-        await this.markTelegramUpdateSideEffectsCompleted(channel, telegramUpdateId);
-        await this.acknowledgeTelegramUpdate(channel, telegramUpdateId);
+    if (typeof telegramUpdateId === 'number' && telegramLeaseToken) {
+      const completed = await runWithIdempotentTenantDatabaseScopeRetry(this.db, tenantId, () =>
+        this.channelRepo.markTelegramPollingSideEffectsCompleted(
+          channel.id,
+          telegramUpdateId,
+          telegramLeaseToken
+        )
+      );
+      if (!completed) {
+        throw new Error(`Telegram update ${telegramUpdateId} lease was lost after processing`);
       }
-    });
+      const acknowledged = await runWithIdempotentTenantDatabaseScopeRetry(this.db, tenantId, () =>
+        this.channelRepo.acknowledgeTelegramPollingUpdate(
+          channel.id,
+          telegramUpdateId,
+          telegramLeaseToken
+        )
+      );
+      if (!acknowledged) {
+        throw new Error(
+          `Telegram update ${telegramUpdateId} lease was lost before acknowledgement`
+        );
+      }
+    }
   }
 
   /**
