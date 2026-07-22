@@ -3,10 +3,12 @@
 import type { AgorClient, User, UserID } from '@agor-live/client';
 import { hasMinimumRole } from '@agor-live/client';
 import { ClipboardAddon } from '@xterm/addon-clipboard';
+import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Terminal } from '@xterm/xterm';
-import { App, Modal } from 'antd';
+import { App, Badge, Modal } from 'antd';
 import { useEffect, useRef, useState } from 'react';
+import { loadWebglRenderer } from '../../utils/xtermWebgl';
 import '@xterm/xterm/css/xterm.css';
 import { WEB_TERMINAL_MIN_ROLE } from './constants';
 
@@ -88,7 +90,9 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
   const { modal } = App.useApp();
   const terminalDivRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
   const [modalReady, setModalReady] = useState(false);
   const [zellijMissing, setZellijMissing] = useState(false);
   const [sessionInfo, setSessionInfo] = useState<{
@@ -117,6 +121,11 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
 
     let mounted = true;
     let currentChannel: string | null = null;
+    let initialCommandsSent = false;
+    // Monotonic attach generation: each (re)attach bumps it and a disconnect
+    // bumps it, so a stale/out-of-order attach resolve can't flip the modal
+    // back to connected after the socket has moved on.
+    let attachGeneration = 0;
     let transformData: (value: string) => string = (value) => value;
     const socket = client.io;
 
@@ -125,6 +134,10 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
       if (socket) {
         socket.off('terminal:output', handleChannelOutput);
         socket.off('terminal:exit', handleChannelExit);
+        socket.off('terminal:ready', handleChannelReady);
+        socket.off('terminal:error', handleChannelError);
+        socket.off('connect', handleReconnect);
+        socket.off('disconnect', handleDisconnect);
         if (currentChannel) {
           socket.emit('leave', currentChannel);
         }
@@ -146,6 +159,25 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
         terminalRef.current.writeln('[Close and reopen terminal to start a new session]');
         setIsConnected(false);
       }
+    };
+
+    // Readiness is the authoritative connected signal — the executor confirmed
+    // its PTY is spawned and attached. We flip on this rather than on the
+    // terminals.create resolution so a post-spawn executor crash surfaces
+    // instead of leaving the modal wedged on a blank screen.
+    const handleChannelReady = (payload: { userId: string }) => {
+      if (payload.userId !== user?.user_id) return;
+      setIsConnected(true);
+      setReconnecting(false);
+    };
+
+    const handleChannelError = (payload: { userId: string; message?: string }) => {
+      if (payload.userId !== user?.user_id) return;
+      if (terminalRef.current) {
+        terminalRef.current.writeln(`\r\n[Terminal error: ${payload.message ?? 'attach failed'}]`);
+      }
+      setIsConnected(false);
+      setReconnecting(false);
     };
 
     // Create xterm instance with common configuration
@@ -209,19 +241,64 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
       });
       terminal.loadAddon(webLinksAddon);
 
+      // GPU renderer first (falls back to DOM if WebGL is unavailable), then
+      // fit the terminal to the modal body instead of the hardcoded 160×40.
+      loadWebglRenderer(terminal);
+      const fitAddon = new FitAddon();
+      terminal.loadAddon(fitAddon);
+      fitAddonRef.current = fitAddon;
+
       return terminal;
     };
 
-    // Setup terminal (channel I/O via Zellij executor)
-    const setupTerminal = async () => {
-      const terminal = createTerminalInstance();
+    const fitToContainer = () => {
+      if (!terminalDivRef.current || !fitAddonRef.current) return;
+      const box = terminalDivRef.current.getBoundingClientRect();
+      if (box.width <= 0 || box.height <= 0) return;
+      try {
+        fitAddonRef.current.fit();
+      } catch {
+        /* xterm refuses absurd sizes; ignore */
+      }
+    };
 
+    // Create the xterm instance and wire persistent listeners once. Only the
+    // server-side room join is lost on a socket reconnect, so these survive it;
+    // `attach` re-joins and re-issues the (idempotent) create.
+    const terminal = createTerminalInstance();
+    transformData = expandOscHyperlinks;
+    // Size the terminal to the modal body before announcing dims to the daemon,
+    // then keep it fitted as the viewport (and thus the modal) resizes — see the
+    // ResizeObserver below.
+    fitToContainer();
+    socket.on('terminal:output', handleChannelOutput);
+    socket.on('terminal:exit', handleChannelExit);
+    socket.on('terminal:ready', handleChannelReady);
+    socket.on('terminal:error', handleChannelError);
+
+    terminal.onData((data) => {
+      socket.emit('terminal:input', {
+        userId: user?.user_id,
+        input: data,
+      });
+    });
+    terminal.onResize(({ cols, rows }) => {
+      socket.emit('terminal:resize', {
+        userId: user?.user_id,
+        cols,
+        rows,
+      });
+    });
+
+    const attach = async () => {
+      const generation = ++attachGeneration;
       try {
         // Request terminal from daemon
-        // This spawns an executor with zellij.attach if not already running
+        // This spawns an executor with zellij.attach if not already running.
+        // Idempotent, so re-issuing it on reconnect is safe.
         const result = (await client.service('terminals').create({
-          rows: 40,
-          cols: 160,
+          rows: terminal.rows,
+          cols: terminal.cols,
           branchId,
         })) as {
           userId: UserID;
@@ -229,15 +306,17 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
           sessionName: string;
           isNew: boolean;
           branchName?: string;
+          ready?: boolean;
         };
 
-        if (!mounted) {
+        // Drop a stale/superseded attach (a later reconnect started, or the
+        // socket dropped while this call was in flight) so a late resolve
+        // can't wrongly flip the modal back to connected.
+        if (!mounted || generation !== attachGeneration || !socket.connected) {
           return;
         }
 
         currentChannel = result.channel;
-        setIsConnected(true);
-        transformData = expandOscHyperlinks;
         setSessionInfo({
           zellijSession: result.sessionName,
           zellijReused: !result.isNew,
@@ -251,27 +330,6 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
         // Join the user's terminal channel
         socket.emit('join', result.channel);
 
-        // Listen for terminal output via channel
-        socket.on('terminal:output', handleChannelOutput);
-        socket.on('terminal:exit', handleChannelExit);
-
-        // Handle user input - send via channel
-        terminal.onData((data) => {
-          socket.emit('terminal:input', {
-            userId: user?.user_id,
-            input: data,
-          });
-        });
-
-        // Handle terminal resize
-        terminal.onResize(({ cols, rows }) => {
-          socket.emit('terminal:resize', {
-            userId: user?.user_id,
-            cols,
-            rows,
-          });
-        });
-
         // Send initial resize to trigger Zellij full redraw (important for reconnections)
         // This ensures the tab bar and status bar are properly rendered
         socket.emit('terminal:resize', {
@@ -280,8 +338,10 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
           rows: terminal.rows,
         });
 
-        // Execute initial commands if provided
-        if (initialCommands.length > 0) {
+        // Execute initial commands once, on the first successful attach — not
+        // on every reconnect, which would re-run them against the live session.
+        if (initialCommands.length > 0 && !initialCommandsSent) {
+          initialCommandsSent = true;
           for (const cmd of initialCommands) {
             socket.emit('terminal:input', {
               userId: user?.user_id,
@@ -289,9 +349,18 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
             });
           }
         }
+
+        // Warm path: the executor is already attached, so connect right away.
+        // Cold path: wait for the executor's `terminal:ready` ack.
+        if (result.ready) {
+          setIsConnected(true);
+          setReconnecting(false);
+        }
       } catch (error) {
+        if (!mounted || generation !== attachGeneration) return;
         console.error('[Terminal] Failed to create terminal:', error);
         const message = error instanceof Error ? error.message : String(error);
+        setReconnecting(false);
         // Surface the "Zellij not installed" case as a friendly inline panel
         // with a link to the install docs, rather than a raw xterm error.
         if (/zellij is not installed/i.test(message)) {
@@ -309,19 +378,45 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
       }
     };
 
+    // The socket auto-reconnects after a network blip or daemon restart, but
+    // the server-side room membership and (possibly) the executor are gone.
+    // Re-join + re-issue create on every (re)connect and surface a visible
+    // "reconnecting" state rather than silently freezing.
+    const handleReconnect = () => {
+      setReconnecting(true);
+      setIsConnected(false);
+      void attach();
+    };
+    const handleDisconnect = () => {
+      // Invalidate any in-flight attach so a late resolve can't flip us back
+      // to connected while we're actually down.
+      attachGeneration++;
+      setIsConnected(false);
+      setReconnecting(true);
+    };
+    socket.on('connect', handleReconnect);
+    socket.on('disconnect', handleDisconnect);
+
     // Setup terminal
-    setupTerminal();
+    void attach();
+
+    // Re-fit when the modal body resizes (viewport changes, browser zoom).
+    const ro = new ResizeObserver(() => fitToContainer());
+    if (terminalDivRef.current) ro.observe(terminalDivRef.current);
 
     return () => {
       mounted = false;
-      // Cleanup terminal instance
+      ro.disconnect();
+      // Cleanup terminal instance (also disposes its loaded addons).
       if (terminalRef.current) {
         terminalRef.current.dispose();
         terminalRef.current = null;
       }
+      fitAddonRef.current = null;
       // Zellij session persists - just clean up listeners
       removeChannelListeners();
       setIsConnected(false);
+      setReconnecting(false);
       setSessionInfo({});
       setZellijMissing(false);
     };
@@ -401,7 +496,14 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, color: '#fff' }}>
-          <div ref={terminalDivRef} />
+          {reconnecting ? (
+            <Badge status="warning" text="Reconnecting…" />
+          ) : !isConnected ? (
+            <Badge status="processing" text="Connecting to terminal…" />
+          ) : null}
+          {/* Concrete size gives @xterm/addon-fit a box to measure; the
+              width="auto" Modal then sizes itself to the terminal. */}
+          <div ref={terminalDivRef} style={{ width: '80vw', maxWidth: 1100, height: '70vh' }} />
         </div>
       )}
     </Modal>

@@ -3,6 +3,8 @@ title: Containerized Execution
 description: Running Agor executors in Kubernetes, Docker, or other containerized environments with shared storage
 ---
 
+import { ExecutorDiagram } from '../../components/ExecutorDiagram';
+
 # Containerized Execution
 
 This guide covers running Agor's executor component in containerized environments like Kubernetes, enabling scalable and isolated execution of AI coding agents.
@@ -18,37 +20,15 @@ Agor's architecture separates the **daemon** (orchestration layer) from the **ex
 
 ### The Executor Model
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Daemon (Orchestration Layer)                               │
-│  - REST/WebSocket API                                       │
-│  - Database (sessions, tasks, branches)                    │
-│  - User authentication                                      │
-│  - Never touches git data directly                          │
-│                                                             │
-│  Spawns executor via:                                       │
-│  - Local: spawn('agor-executor', ['--stdin'])              │
-│  - Remote: template → kubectl run ... | agor-executor      │
-└─────────────────────────────────────────────────────────────┘
-                          │
-                          │ JSON payload via stdin
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Executor (Isolation Boundary)                              │
-│  - Receives typed JSON payload                              │
-│  - Connects back to daemon via WebSocket                    │
-│  - Runs agent SDKs (Claude, Gemini, Codex)                 │
-│  - Manages git operations (clone, branch)                 │
-│  - Handles terminal sessions (Zellij)                       │
-│  - Short-lived: exits when command completes                │
-└─────────────────────────────────────────────────────────────┘
-```
+<ExecutorDiagram />
+
+The daemon owns orchestration and delegates all git **mutations** to the executor — it still runs read-only git probes (remote URL, default branch) and credential scrubbing itself. Each executor process handles a single command and exits, except terminal (Zellij) executors, which stay alive until closed.
 
 ### What the Executor Does
 
 | Command               | Purpose                                        |
 | --------------------- | ---------------------------------------------- |
-| `prompt`              | Execute agent SDK (Claude Code, Gemini, Codex) |
+| `prompt`              | Run an agent harness (Claude Code, Codex, Gemini, OpenCode, Copilot, Cursor) |
 | `git.clone`           | Clone repository with Unix group setup         |
 | `git.branch.add`    | Create git branch with permissions           |
 | `git.branch.remove` | Remove branch and cleanup                    |
@@ -195,13 +175,13 @@ before the rest of the storage discussion.
 holds `repos/` and `branches/`) MUST also be persistent.** The database
 stores absolute paths to every repository clone and every branch on
 disk. If the database survives a pod restart but the filesystem does not
-— for example, the database is backed by a `PersistentVolumeClaim` while
-`$HOME` is an `emptyDir` — then on redeploy the daemon will reference
+(for example, the database is backed by a `PersistentVolumeClaim` while
+`$HOME` is an `emptyDir`), then on redeploy the daemon will reference
 paths that no longer exist. Opening a terminal or running a session will
 fail when the executor tries to `chdir` into a directory that's gone.
 
 The daemon will surface a clear error in this state (`cwd does not exist
-on disk: ...` — see [issue
+on disk: ...`, see [issue
 \#1109](https://github.com/preset-io/agor/issues/1109)), but the only
 real fix is to restore the volume or, if the volume is unrecoverable,
 clean up the orphan database rows using
@@ -212,7 +192,7 @@ Safe configurations:
 - **Both persistent**: Database on PVC, `$HOME` (or `data_home`) on
   PVC/EFS/NFS. Recommended for production.
 - **Both ephemeral**: Database on `emptyDir`, `$HOME` on `emptyDir`. Fine
-  for short-lived test pods — everything resets together.
+  for short-lived test pods. Everything resets together.
 - **Avoid mixing**: Persistent database + ephemeral filesystem is the
   broken state described above.
 

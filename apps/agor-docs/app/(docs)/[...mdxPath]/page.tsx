@@ -1,8 +1,10 @@
 import { readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { importPage } from 'nextra/pages';
+import { FAQ_SCHEMA } from '../../../lib/faqSchema';
 import {
   DEFAULT_DESCRIPTION,
+  DEFAULT_TITLE,
   type FrontMatterLike,
   getCanonicalUrl,
   getSocialImage,
@@ -51,10 +53,7 @@ export async function generateMetadata(props: PageProps) {
   const { metadata } = await importPage(params.mdxPath);
   const pathname = `/${params.mdxPath?.join('/') ?? ''}`;
   const pageTitle = metadata.title ?? 'agor';
-  const title =
-    pageTitle === 'agor'
-      ? 'agor – Team command center for all things agentic'
-      : `${pageTitle} – agor`;
+  const title = pageTitle === 'agor' ? DEFAULT_TITLE : `${pageTitle} – agor`;
   const description = metadata.description || DEFAULT_DESCRIPTION;
   const frontMatter = metadata as FrontMatterLike;
   const image = getSocialImage(frontMatter);
@@ -95,10 +94,42 @@ export default async function Page(props: PageProps) {
   const params = await props.params;
   const { default: MDXContent, toc, metadata, sourceCode } = await importPage(params.mdxPath);
   const frontMatter = metadata as FrontMatterLike;
+  const pathname = `/${params.mdxPath?.join('/') ?? ''}`;
+  const isBlogPost = params.mdxPath?.[0] === 'blog' && params.mdxPath.length > 1;
+  const blogPostingSchema =
+    isBlogPost && frontMatter.date
+      ? {
+          '@context': 'https://schema.org',
+          '@type': 'BlogPosting',
+          headline: frontMatter.title,
+          description: frontMatter.description,
+          datePublished: new Date(frontMatter.date).toISOString(),
+          image: getSocialImage(frontMatter),
+          url: getCanonicalUrl(pathname, frontMatter.canonical),
+          author: { '@type': 'Organization', name: 'Preset Inc.', url: 'https://preset.io' },
+          publisher: { '@type': 'Organization', name: 'Preset Inc.', url: 'https://preset.io' },
+        }
+      : null;
 
   return (
     <Wrapper toc={toc} metadata={metadata} sourceCode={sourceCode}>
-      {frontMatter.image && params.mdxPath?.[0] === 'blog' && params.mdxPath.length > 1 ? (
+      {/* FAQPage structured data — mirrors the visible Q&A in content/faq.mdx
+          (see lib/faqSchema.ts). */}
+      {params.mdxPath?.length === 1 && params.mdxPath[0] === 'faq' ? (
+        <script
+          type="application/ld+json"
+          // biome-ignore lint/security/noDangerouslySetInnerHtml: JSON-LD is static and controlled, not user-provided.
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(FAQ_SCHEMA) }}
+        />
+      ) : null}
+      {blogPostingSchema ? (
+        <script
+          type="application/ld+json"
+          // biome-ignore lint/security/noDangerouslySetInnerHtml: JSON-LD is static and controlled, not user-provided.
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(blogPostingSchema) }}
+        />
+      ) : null}
+      {frontMatter.image && isBlogPost ? (
         // biome-ignore lint/performance/noImgElement: Static blog hero image
         <img
           src={frontMatter.image}

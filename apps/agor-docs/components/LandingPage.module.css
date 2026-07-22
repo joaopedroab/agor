@@ -1,27 +1,134 @@
+/* Visually-hidden utility for screen-reader-only text (e.g. the carousel
+ * "Slide N of M" wording behind the decorative "01 / 04" counters). */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .landingShell {
-  --landing-ink: #f8fafc;
-  --landing-muted: #aeb9c8;
+  /* Marketing type system — fonts loaded via next/font in app/layout.tsx */
+  --font-display-stack: var(--font-display), "Space Grotesk", system-ui, sans-serif;
+  --font-body-stack: var(--font-body), "Hanken Grotesk", system-ui, sans-serif;
+  --font-mono-stack: var(--font-mono-label), "JetBrains Mono", ui-monospace, monospace;
+  --landing-ink: #eafff9;
+  --landing-muted: #9fc4bd;
   --landing-line: rgba(255, 255, 255, 0.12);
-  --landing-teal: #7fe8df;
-  --landing-blue: #7fe8df;
-  --landing-gradient: linear-gradient(90deg, #2e9a92 0%, #7fe8df 50%, #a8f5ed 100%);
-  --landing-eyebrow-gradient: linear-gradient(90deg, #a8f5ed 0%, #7fe8df 45%, #2e9a92 100%);
+  --landing-teal: #34e6c4;
+  --landing-blue: #34e6c4;
+  --landing-gradient: linear-gradient(90deg, #2e9a92 0%, #34e6c4 50%, #a8f5ed 100%);
+  --landing-eyebrow-gradient: linear-gradient(90deg, #a8f5ed 0%, #34e6c4 45%, #2e9a92 100%);
   --landing-mint: #d9fb89;
   --landing-pink: #ffc3df;
   --landing-sky: #9bdcff;
+  position: relative;
   width: 100vw;
   margin-left: calc(50% - 50vw);
   margin-right: calc(50% - 50vw);
   margin-top: -4rem;
   color: var(--landing-ink);
+  font-family: var(--font-body-stack);
   background:
-    radial-gradient(circle at 18% 12%, rgba(46, 154, 146, 0.22), transparent 30rem),
-    radial-gradient(circle at 82% 8%, rgba(35, 136, 242, 0.16), transparent 34rem),
-    linear-gradient(180deg, #05070b 0%, #09111d 36%, #070b12 72%, #05070b 100%);
+    radial-gradient(circle at 82% 8%, rgba(46, 154, 146, 0.12), transparent 34rem),
+    linear-gradient(180deg, #07100f 0%, #0a1614 36%, #081210 72%, #07100f 100%);
+  /* clip (not hidden): still contains the problem-section fly-ins, but does
+   * not create a scroll container — position: sticky inside the shell (the
+   * scroll-locked surface carousel) must stick to the VIEWPORT. */
+  overflow: clip;
+}
+
+/* Hero banner — looping product-demo video behind the hero copy */
+.heroBanner {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: calc(100vh - 64px);
   overflow: hidden;
 }
 
+.heroVideo {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  /* Poster doubles as the reduced-motion / video-loading backdrop. */
+  background: url("/videos/agor-hero-poster.jpg") center top / cover no-repeat;
+}
+
+.heroVideo video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center top;
+}
+
+/* Scrim keeps the centered copy legible over the busy board UI and fades the
+ * banner into the page background at the bottom. Center-weighted radial
+ * matches the centered hero layout. */
+.heroVideo::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(
+      ellipse 82% 72% at 50% 40%,
+      rgba(7, 16, 15, 0.38) 0%,
+      rgba(7, 16, 15, 0.22) 52%,
+      rgba(7, 16, 15, 0.08) 78%
+    ),
+    linear-gradient(
+      180deg,
+      rgba(7, 16, 15, 0.45) 0%,
+      rgba(7, 16, 15, 0.06) 32%,
+      rgba(7, 16, 15, 0.95) 100%
+    );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .heroVideo video {
+    display: none;
+  }
+}
+
+/* Aurora (ReactBits) backdrop behind the harness + multiplayer band */
+.auroraBand {
+  position: relative;
+}
+
+.bandAurora {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 100%;
+  z-index: 0;
+  pointer-events: none;
+  /* Aurora shader glows from the top edge; flip so the warm light rises
+   * from the bottom of the band instead. */
+  transform: scaleY(-1);
+}
+
+.auroraBand > section {
+  position: relative;
+  z-index: 1;
+}
+
+/* Keep all landing content above backdrop canvases */
+.landingShell > section,
+.landingShell > footer {
+  position: relative;
+  z-index: 1;
+}
+
 .heroSection,
+.problemSection,
 .liveSection,
 .workspaceSection,
 .productShowcase,
@@ -36,84 +143,116 @@
   padding-top: 128px;
 }
 
-.heroGrid {
-  display: grid;
-  grid-template-columns: minmax(0, 0.98fr) minmax(430px, 1.02fr);
-  gap: 42px;
-  align-items: center;
+/* The teammates ring is dense — give the section extra air on both sides so
+ * it doesn't read as packed between the showcase and the capabilities. */
+.workspaceSection {
+  padding-top: clamp(120px, 14vh, 190px);
+  padding-bottom: clamp(120px, 14vh, 190px);
 }
 
 .heroCopy {
-  max-width: 610px;
+  position: relative;
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: clamp(30px, 3.4vw, 48px) clamp(24px, 4vw, 56px) clamp(32px, 3.8vw, 54px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 28px;
+  background: rgba(7, 16, 15, 0.42);
+  backdrop-filter: blur(9px) saturate(1.15);
+  -webkit-backdrop-filter: blur(9px) saturate(1.15);
+  text-align: center;
 }
 
-.brandMark {
+/* Without backdrop-filter support the tint must carry legibility alone */
+@supports not (backdrop-filter: blur(1px)) {
+  .heroCopy {
+    background: rgba(7, 16, 15, 0.78);
+  }
+}
+
+/* Mono badge pill straddling the glass pane's top edge (50% in / 50% out) */
+.heroBadge {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translate(-50%, -50%);
   display: inline-flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 34px;
-  color: var(--landing-ink);
-  font-size: 1.58rem;
-  font-weight: 850;
-}
-
-.brandMark img {
-  width: 72px;
-  height: 72px;
-  border-radius: 50%;
-  box-shadow: 0 0 34px rgba(127, 232, 223, 0.2);
-}
-
-.brandMark span {
-  background: var(--landing-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-.kicker,
-.eyebrow {
-  margin: 0 0 16px;
+  gap: 9px;
+  margin: 0;
+  padding: 7px 15px 7px 11px;
+  border: 1px solid rgba(52, 230, 196, 0.22);
+  border-radius: 100px;
+  background: rgba(7, 16, 15, 0.9);
+  white-space: nowrap;
   color: var(--landing-teal);
-  background: var(--landing-eyebrow-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  font-size: 0.82rem;
-  font-weight: 800;
-  letter-spacing: 0.13em;
+  font-family: var(--font-mono-stack);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.eyebrow {
+  display: block;
+  margin: 0 0 22px;
+  color: var(--landing-teal);
+  font-family: var(--font-mono-stack);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
 }
 
 .heroCopy h1,
 .sectionHeader h2,
-.liveCopy h2,
 .workspaceCopy h2,
 .controlSection h2,
 .finalCta h2 {
   margin: 0;
   color: var(--landing-ink);
-  font-weight: 820;
-  letter-spacing: -0.055em;
-  line-height: 0.95;
+  /* Hairline (100) headers use the body grotesque — Space Grotesk floors at 300. */
+  font-family: var(--font-body-stack);
+  font-weight: 100;
+  letter-spacing: -0.03em;
+  line-height: 1.02;
 }
 
 .heroCopy h1 {
-  max-width: 720px;
+  max-width: 18ch;
+  margin: 0 auto;
   font-size: clamp(3.45rem, 6.5vw, 5.75rem);
   overflow-wrap: normal;
   word-break: normal;
   hyphens: none;
 }
 
-.heroProvocation {
-  max-width: 560px;
-  margin: 24px 0 0;
+/* Gradient accent phrase inside headings (mockup treatment, mint → sky).
+ * One keyword phrase per heading, site-wide on the landing page. */
+.headingAccent {
+  font-weight: 600;
+  background: linear-gradient(110deg, #34e6c4, #7ad9ff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Amber variant for the problem-section headline — the warning register
+ * (sampled from the roster radar's IDLE color #e8c468). Mint stays reserved
+ * for the solution, which arrives at the section's pivot line. */
+.headingAccentWarm {
+  font-weight: 600;
+  background: linear-gradient(110deg, #e8c468, #f5af19);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Single ink-weighted emphasis word per heading, paired with the colored
+ * .headingAccent phrase against the thin (300) base. */
+.headingStrong {
+  font-weight: 700;
   color: var(--landing-ink);
-  font-size: clamp(1.18rem, 1.8vw, 1.55rem);
-  font-weight: 620;
-  line-height: 1.62;
-  letter-spacing: -0.025em;
 }
 
 .heroActions {
@@ -121,35 +260,29 @@
   flex-wrap: wrap;
   gap: 14px;
   align-items: center;
+  justify-content: center;
   margin-top: 34px;
 }
 
 .footerEtymology {
   margin: 6px 0 0;
   color: var(--landing-muted);
-  font-size: 0.74rem;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-family: var(--font-display-stack);
+  font-size: 0.85rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
 }
 
 .footerEtymology span {
   color: var(--landing-teal);
-  font-weight: 800;
-}
-
-.heroMeta {
-  margin: 18px 0 0;
-  color: var(--landing-muted);
-  font-size: 0.92rem;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+  font-weight: 700;
 }
 
 .harnessStrip {
   max-width: 1180px;
   margin: 0 auto;
-  padding: 4px 28px 40px;
+  padding: 44px 28px 56px;
+  border-top: 1px solid rgba(52, 230, 196, 0.14);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -159,13 +292,10 @@
 
 .harnessLabel {
   color: var(--landing-teal);
-  background: var(--landing-eyebrow-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  font-size: 0.82rem;
-  font-weight: 800;
-  letter-spacing: 0.13em;
+  font-family: var(--font-mono-stack);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
 }
 
@@ -216,18 +346,20 @@
 }
 
 .harnessName {
+  font-family: var(--font-display-stack);
   font-size: 1rem;
-  font-weight: 700;
+  font-weight: 500;
   letter-spacing: -0.01em;
 }
 
 .harnessBeta {
   padding: 2px 8px;
   border-radius: 999px;
-  background: rgba(127, 232, 223, 0.14);
+  background: rgba(52, 230, 196, 0.14);
   color: var(--landing-teal);
+  font-family: var(--font-mono-stack);
   font-size: 0.66rem;
-  font-weight: 800;
+  font-weight: 500;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -241,15 +373,18 @@
 }
 
 .primaryButton,
-.secondaryButton,
-.textButton {
+.secondaryButton {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-height: 48px;
   padding: 0 20px;
+  border: 0;
   border-radius: 999px;
-  font-weight: 750;
+  font: inherit;
+  font-family: var(--font-display-stack);
+  font-weight: 600;
+  cursor: pointer;
   text-decoration: none;
   transition:
     transform 160ms ease,
@@ -260,19 +395,18 @@
 
 .landingShell .primaryButton {
   color: #031311;
-  background: linear-gradient(135deg, #2e9a92 0%, #7fe8df 100%);
-  box-shadow: 0 16px 34px rgba(46, 154, 146, 0.3);
+  background: linear-gradient(135deg, #2e9a92 0%, #34e6c4 100%);
+  box-shadow: 0 16px 34px rgba(52, 230, 196, 0.28);
 }
 
 .primaryButton:hover,
-.secondaryButton:hover,
-.textButton:hover {
+.secondaryButton:hover {
   transform: translateY(-2px);
 }
 
 .landingShell .primaryButton:hover {
   color: #031311;
-  box-shadow: 0 20px 44px rgba(127, 232, 223, 0.34);
+  box-shadow: 0 20px 44px rgba(52, 230, 196, 0.36);
 }
 
 .landingShell .secondaryButton {
@@ -285,16 +419,8 @@
 }
 
 .landingShell .secondaryButton:hover {
-  border-color: rgba(35, 136, 242, 0.35);
+  border-color: rgba(52, 230, 196, 0.35);
   color: var(--landing-ink);
-}
-
-.landingShell .textButton {
-  border: 0;
-  color: var(--landing-muted);
-  background: transparent;
-  cursor: pointer;
-  font-family: inherit;
 }
 
 .githubIcon {
@@ -303,75 +429,17 @@
   margin-right: 0.45em;
 }
 
-.screenshotCollage {
-  position: relative;
-  min-height: 560px;
-  perspective: 1400px;
-}
-
-.mainScreenshotFrame {
-  position: absolute;
-  z-index: 2;
-  top: 70px;
-  left: -18px;
-  width: min(760px, 124%);
-  aspect-ratio: 3384 / 1978;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 10px;
-  overflow: hidden;
-  background: rgba(9, 17, 30, 0.86);
-  box-shadow: 0 36px 90px rgba(0, 0, 0, 0.42);
-  backdrop-filter: blur(16px);
-  transform: rotateY(-4deg) rotateX(1deg) rotateZ(-1.4deg);
-  transform-origin: center;
-}
-
-.mainScreenshotFrame img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  object-position: center;
-}
-
 .sectionHeader {
   max-width: 920px;
 }
 
 .sectionHeader h2,
-.liveCopy h2,
 .workspaceCopy h2,
 .controlSection h2,
 .finalCta h2 {
   font-size: clamp(2.45rem, 4vw, 4.05rem);
 }
 
-.featureGrid {
-  display: grid;
-  gap: 18px;
-  margin-top: 48px;
-}
-
-.featureCard {
-  min-height: 236px;
-  padding: 26px;
-  display: flex;
-  flex-direction: column;
-  border: 1px solid var(--landing-line);
-  border-radius: 28px;
-  background: rgba(10, 18, 31, 0.72);
-  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.06);
-}
-
-.featureCard h3 {
-  margin: 0;
-  color: var(--landing-ink);
-  font-size: 1.35rem;
-  letter-spacing: -0.02em;
-}
-
-.featureCard p,
-.liveCopy p,
 .workspaceCopy p,
 .controlSection p,
 .finalCta p {
@@ -380,18 +448,254 @@
   line-height: 1.7;
 }
 
-.cardLink {
-  display: inline-flex;
-  margin-top: auto;
-  padding-top: 22px;
-  color: var(--landing-teal);
-  font-size: 0.92rem;
-  font-weight: 800;
-  text-decoration: none;
+/* --- Capability ring: nodes orbit a hub that reveals the active card --- */
+.featureRing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.cardLink:hover {
-  color: #a8f5ed;
+/* Phone-only expanded feature list (see the 600px media block) — the ring's
+ * hover/click interaction doesn't earn its keep on touch. */
+.featureList {
+  display: none;
+}
+
+.ringStage {
+  position: relative;
+  width: 100%;
+  max-width: 560px;
+  margin: 0 auto;
+  aspect-ratio: 1 / 1;
+}
+
+/* ReactBits orb behind the nodes — its rim is the new guide circle (the
+ * old 1px dashed ring). Pointer events stay ON so the orb's rotate-on-hover
+ * works; interactive nodes/hub are later siblings and paint above. */
+.ringOrb {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 94%;
+  height: 94%;
+  transform: translate(-50%, -50%);
+}
+
+.ringNode {
+  position: absolute;
+  /* Both dims are % of the square stage → guaranteed equal px (a real circle);
+   * aspect-ratio alone yields to content and drifts oval. */
+  width: 25%;
+  height: 25%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8%;
+  border: 1px solid rgba(52, 230, 196, 0.18);
+  border-radius: 50%;
+  background: linear-gradient(180deg, rgba(15, 34, 31, 0.72), rgba(10, 22, 20, 0.55));
+  color: var(--landing-ink);
+  font-family: var(--font-display-stack);
+  font-size: clamp(0.7rem, 1.35vw, 0.9rem);
+  font-weight: 600;
+  line-height: 1.18;
+  letter-spacing: -0.01em;
+  text-align: center;
+  text-wrap: balance;
+  cursor: pointer;
+  transition:
+    transform 0.28s ease,
+    border-color 0.28s ease,
+    background 0.28s ease,
+    box-shadow 0.28s ease,
+    color 0.28s ease;
+}
+
+/* Icon rides in a mini mint badge pinned to the circle's top edge, keeping
+ * the label alone in the circle so it centers without early line-wraps. */
+.ringNodeIcon {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #2ea78f, #1f7c68);
+  color: #fff;
+  border: 2px solid rgba(7, 16, 15, 0.92);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+.ringNodeIcon svg {
+  flex-shrink: 0;
+}
+
+.ringNodeActive {
+  border-color: rgba(52, 230, 196, 0.75);
+  background: linear-gradient(180deg, rgba(30, 74, 68, 0.95), rgba(18, 44, 40, 0.82));
+  color: #eafff9;
+  box-shadow:
+    0 0 0 4px rgba(52, 230, 196, 0.12),
+    0 14px 32px rgba(0, 0, 0, 0.38);
+  transform: translate(-50%, -50%) scale(1.06);
+}
+
+.ringNode:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(52, 230, 196, 0.55);
+}
+
+.ringHub {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 46%;
+  aspect-ratio: 1 / 1;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7%;
+  border: 1px solid rgba(52, 230, 196, 0.16);
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 38%, rgba(16, 38, 35, 0.92), rgba(8, 18, 17, 0.94));
+  text-align: center;
+}
+
+.ringHubInner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 13px;
+  max-width: 82%;
+  animation: hubFade 0.35s ease;
+}
+
+.ringHubInner p {
+  margin: 0;
+  color: var(--landing-muted);
+  font-size: clamp(0.68rem, 1.3vw, 0.82rem);
+  line-height: 1.48;
+}
+
+.ringButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 16px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #2e9a92 0%, #4ec4ba 100%);
+  color: #06110f;
+  /* Landing links set -webkit-text-fill-color (teal); override it or the
+   * dark label washes out to that fill color on the bright button. */
+  -webkit-text-fill-color: #06110f;
+  font-family: var(--font-mono-stack);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  text-decoration: none;
+  box-shadow: 0 6px 18px rgba(46, 154, 146, 0.35);
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease,
+    filter 0.15s ease;
+}
+
+.ringButton:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+  box-shadow: 0 8px 22px rgba(46, 154, 146, 0.5);
+}
+
+@keyframes hubFade {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ringNode,
+  .ringHubInner,
+  .ringButton {
+    transition: none;
+    animation: none;
+  }
+}
+
+/* A ring can't breathe at phone widths — collapse to a stacked list of title
+ * pills with the active card's panel beneath (tab-list / panel pattern). */
+@media (max-width: 600px) {
+  /* The ring needs hover/click; phones get the expanded .featureList
+   * instead — no cards, thin dividers, icon left / content right. */
+  .featureRing {
+    display: none;
+  }
+
+  .featureList {
+    display: block;
+    max-width: 480px;
+    margin: 8px auto 0;
+  }
+
+  .featureListItem {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: 14px;
+    padding: 18px 2px;
+  }
+
+  .featureListItem + .featureListItem {
+    border-top: 1px solid rgba(52, 230, 196, 0.12);
+  }
+
+  .featureListIcon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: linear-gradient(180deg, #2ea78f, #1f7c68);
+    color: #fff;
+  }
+
+  .featureListItem h3 {
+    margin: 4px 0 6px;
+    color: var(--landing-ink);
+    font-family: var(--font-display-stack);
+    font-size: 1.05rem;
+    font-weight: 600;
+  }
+
+  .featureListItem p {
+    margin: 0 0 8px;
+    color: var(--landing-muted);
+    font-size: 0.94rem;
+    line-height: 1.55;
+  }
+
+  .featureListLink {
+    color: var(--landing-teal);
+    font-family: var(--font-mono-stack);
+    font-size: 0.82rem;
+    text-decoration: none;
+  }
+
+  .featureListLink:hover {
+    text-decoration: underline;
+  }
 }
 
 .workspaceSection {
@@ -406,86 +710,92 @@
   top: 92px;
 }
 
-.featureGrid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin-top: 0;
-}
-
+/* Workspace section above carries 88px bottom padding — no extra gap needed */
 .productShowcase {
-  padding-top: 42px;
+  padding-top: 0;
 }
 
-.productGrid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 18px;
-  margin-top: 42px;
+/* Product-surfaces explorer: side rail + large screenshot stage */
+/* Phone-only scroll-locked surface carousel (see the compound media block at
+ * the end of the file) — desktop and reduced-motion phones never show it. */
+.surfaceScrolly {
+  display: none;
 }
 
-.productCard {
-  overflow: hidden;
-  border: 1px solid var(--landing-line);
-  border-radius: 28px;
-  color: var(--landing-ink);
-  background: rgba(255, 255, 255, 0.055);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
-  text-decoration: none;
+/* Capabilities carousel — same grammar as the showcase reel above (tab
+ * pills, chrome frame, sliding track, arrows). Slides stack an info bar over
+ * the screenshot; clicking the screenshot advances. */
+.surfaceExplorer {
+  margin-top: 10px;
 }
 
-.productCard img {
+.surfaceSlide {
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.surfaceShotButton {
   display: block;
   width: 100%;
-  aspect-ratio: 16 / 10;
-  object-fit: cover;
-  object-position: 34% 44%;
-  border-bottom: 1px solid var(--landing-line);
-  filter: saturate(1.08) brightness(1.04);
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
 }
 
-.productCard:nth-child(2) img {
-  object-position: 72% 45%;
+.surfaceShot {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  /* Viewport-aware ceiling: header + tabs + info bar + nav cost
+   * ~533px, so the shot scales to the largest size that keeps the WHOLE
+   * section on screen — natural aspect ratio, never cropped. */
+  max-height: clamp(230px, calc(100dvh - 533px), 600px);
+  margin: 0 auto;
 }
 
-.productCard:nth-child(3) img {
-  object-position: 50% 20%;
+.surfaceInfo {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 28px;
+  padding: 20px 34px;
+  border-bottom: 1px solid rgba(52, 230, 196, 0.1);
 }
 
-.productCard:nth-child(5) img {
-  object-position: 50% 22%;
+.surfaceInfo .secondaryButton {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
-.productCard:nth-child(7) img,
-.productCard:nth-child(8) img,
-.productCard:nth-child(9) img {
-  object-position: 50% 24%;
-}
-
-.productCard div {
-  padding: 22px;
-}
-
-.productCard h3 {
+.surfaceInfo h3 {
   margin: 0;
-  font-size: 1.22rem;
-  letter-spacing: -0.02em;
+  color: var(--landing-teal);
+  font-family: var(--font-display-stack);
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
-.productCard p {
-  margin: 10px 0 18px;
+.surfaceInfo p {
+  max-width: 62ch;
+  margin: 10px 0 0;
   color: var(--landing-muted);
-  line-height: 1.55;
+  line-height: 1.6;
 }
 
-.productCard:hover {
-  border-color: rgba(127, 232, 223, 0.3);
-  transform: translateY(-2px);
-}
-
+/* "Compound Amplifying Bus" section — the calm mint answer that lands right
+ * after the amber traffic pileup. Left: copy with the giant gradient
+ * "compound"; right: six trust items strung down a vertical spine with
+ * amplifying ripple rings. overflow: hidden keeps the ripples inside the
+ * card at narrow widths. */
 .controlSection {
   display: grid;
-  grid-template-columns: 1fr 0.8fr;
-  gap: 42px;
+  grid-template-columns: 0.95fr 1.05fr;
+  gap: 56px;
   align-items: center;
+  overflow: hidden;
   margin-top: 40px;
   padding: 66px 28px;
   border-radius: 36px;
@@ -502,45 +812,162 @@
   color: rgba(255, 255, 255, 0.72);
 }
 
-.trustList {
-  display: grid;
-  gap: 12px;
+/* The dominant word of the section — combined with .headingAccent in the TSX
+ * for the mint gradient; this class (later in the file, same specificity)
+ * supplies the display-font scale and its own line. */
+.compoundWord {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--font-display-stack);
+  font-size: clamp(3.3rem, 6vw, 5.3rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.02;
+}
+
+/* --- The bus itself. Each .busItem draws its own spine segment (::before,
+ * continuous through row padding; trimmed to the node center on first/last
+ * rows) and a dotted connector out to the text (::after). The node carries
+ * a pulsing ring plus concentric ripple rings on an infinite 3s ease-out
+ * loop — size/count/delays come from static CSS vars set inline in the TSX
+ * and grow toward the bottom of the line. --- */
+.busList {
   margin: 0;
-  padding: 0;
+  padding: 6px 0;
   list-style: none;
 }
 
-.trustList li {
-  padding: 16px 18px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 18px;
-  color: rgba(255, 255, 255, 0.86);
-  background: rgba(255, 255, 255, 0.06);
-  font-weight: 720;
+.busItem {
+  position: relative;
+  padding: 0 0 42px 92px;
 }
 
-.trustList a {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  color: rgba(255, 255, 255, 0.86);
-  text-decoration: none;
+.busItem:last-child {
+  padding-bottom: 0;
 }
 
-.trustLabel {
-  font-weight: 800;
+.busItem::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 12px;
+  width: 2px;
+  background: rgba(52, 230, 196, 0.34);
 }
 
-.trustBody {
+.busItem:first-child::before {
+  top: 16px;
+}
+
+.busItem:last-child::before {
+  bottom: auto;
+  height: 16px;
+}
+
+.busItem::after {
+  content: "";
+  position: absolute;
+  top: 16px;
+  left: 32px;
+  width: 46px;
+  border-top: 1px dashed rgba(52, 230, 196, 0.28);
+}
+
+.busNode {
+  position: absolute;
+  top: 3px;
+  left: 0;
+  width: 26px;
+  height: 26px;
+}
+
+.busNodeDot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border: 2px solid var(--landing-teal);
+  border-radius: 50%;
+  background: rgba(7, 16, 15, 0.9);
+  animation: busPulse 3s ease-in-out infinite;
+}
+
+.busRipple {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--ripple-size, 12px);
+  height: var(--ripple-size, 12px);
+  margin: calc(var(--ripple-size, 12px) / -2) 0 0 calc(var(--ripple-size, 12px) / -2);
+  border: 1px solid rgba(52, 230, 196, 0.5);
+  border-radius: 50%;
+  opacity: 0;
+  animation: busRipple 3s ease-out infinite;
+  animation-delay: var(--ripple-delay, 0ms);
+}
+
+@keyframes busRipple {
+  0% {
+    opacity: 0.65;
+    transform: scale(0.45);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(3);
+  }
+}
+
+@keyframes busPulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 230, 196, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 14px 3px rgba(52, 230, 196, 0.16);
+  }
+}
+
+.busTitle {
+  margin: 0;
+  color: var(--landing-ink);
+  font-family: var(--font-display-stack);
+  font-size: 1.16rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  /* First-line center sits at ~16px from the row top — matches the node
+   * center and the connector's top offset. */
+  line-height: 1.4;
+}
+
+.busDesc {
+  margin-top: 6px;
   color: rgba(255, 255, 255, 0.58);
-  font-size: 0.9rem;
-  font-weight: 500;
-  line-height: 1.5;
+  font-size: 0.92rem;
+  line-height: 1.55;
 }
 
-.trustList li:hover {
-  border-color: rgba(127, 232, 223, 0.28);
-  background: rgba(127, 232, 223, 0.08);
+/* Link-styled button — opens the HubSpot beta modal (not a navigation). */
+.busBetaLink {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--landing-teal);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: rgba(52, 230, 196, 0.45);
+  text-underline-offset: 3px;
+  transition:
+    color 0.25s ease,
+    text-decoration-color 0.25s ease;
+}
+
+.busBetaLink:hover {
+  color: #a8f5ed;
+  text-decoration-color: #a8f5ed;
 }
 
 .finalCta {
@@ -557,93 +984,7 @@
 }
 
 .liveSection {
-  display: grid;
-  grid-template-columns: 1.05fr 0.95fr;
-  gap: 56px;
-  align-items: center;
-}
-
-.liveCopy {
-  max-width: 600px;
-}
-
-.liveHighlights {
-  display: grid;
-  gap: 20px;
-  margin: 30px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.liveHighlights li {
-  display: grid;
-  gap: 4px;
-  padding-left: 18px;
-  border-left: 2px solid rgba(127, 232, 223, 0.4);
-}
-
-.liveHighlights strong {
-  color: var(--landing-ink);
-  font-size: 1.06rem;
-  font-weight: 800;
-  letter-spacing: -0.01em;
-}
-
-.liveHighlights span {
-  color: var(--landing-muted);
-  line-height: 1.6;
-}
-
-.liveCopy .cardLink {
-  margin-top: 30px;
-}
-
-.liveVisual {
-  overflow: hidden;
-  border: 1px solid var(--landing-line);
-  border-radius: 16px;
-  background:
-    radial-gradient(circle at 18% 18%, rgba(127, 232, 223, 0.18), transparent 22rem),
-    radial-gradient(circle at 90% 16%, rgba(241, 39, 17, 0.22), transparent 18rem),
-    rgba(8, 14, 24, 0.78);
-  box-shadow: 0 32px 84px rgba(0, 0, 0, 0.44);
-}
-
-.socialCollage {
-  position: relative;
-  min-height: 520px;
-  padding: 24px;
-}
-
-.socialCollage img {
-  position: absolute;
   display: block;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 18px;
-  box-shadow: 0 26px 70px rgba(0, 0, 0, 0.45);
-  filter: saturate(1.06) brightness(1.04);
-}
-
-.socialMain {
-  z-index: 2;
-  top: 190px;
-  left: 54px;
-  width: 78%;
-}
-
-.socialFacepile {
-  z-index: 3;
-  top: 32px;
-  right: 32px;
-  width: 48%;
-  border-radius: 14px;
-}
-
-.socialCursor {
-  z-index: 4;
-  top: 34px;
-  left: 30px;
-  width: 31%;
 }
 
 .landingFooter {
@@ -665,19 +1006,19 @@
 .footerBrand img {
   width: 44px;
   height: 44px;
-  border-radius: 50%;
 }
 
 .footerBrand strong {
   display: block;
-  color: var(--landing-ink);
+  color: var(--landing-teal);
+  font-family: var(--font-display-stack);
   font-size: 1.15rem;
-  font-weight: 850;
+  font-weight: 600;
 }
 
 .footerBrand p {
   margin: 6px 0 0;
-  max-width: 240px;
+  max-width: 300px;
   color: var(--landing-muted);
   font-size: 0.92rem;
   line-height: 1.5;
@@ -689,11 +1030,12 @@
   gap: 32px;
 }
 
-.footerLinks h4 {
+.footerLinks h3 {
   margin: 0 0 14px;
   color: var(--landing-ink);
+  font-family: var(--font-display-stack);
   font-size: 0.78rem;
-  font-weight: 800;
+  font-weight: 600;
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
@@ -711,52 +1053,1129 @@
   color: var(--landing-teal);
 }
 
+/* Footer entry that opens the beta modal instead of navigating — dressed
+ * exactly like the sibling anchors. */
+.footerLinkButton {
+  display: block;
+  margin-bottom: 10px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--landing-muted);
+  font-family: inherit;
+  font-size: 0.95rem;
+  text-align: left;
+  cursor: pointer;
+  transition: color 140ms ease;
+}
+
+.footerLinkButton:hover {
+  color: var(--landing-teal);
+}
+
+/* "Built by Preset" credit — last line of the footer, spanning both grid
+ * columns. Same dim-to-mint hover register as the footer links. */
+.footerCredit {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 0;
+  color: #6f928c;
+  font-size: 0.85rem;
+}
+
+.footerCreditLogo {
+  width: 18px;
+  height: 17px;
+  /* Preset green reads loud against the muted credit line — dim it slightly. */
+  opacity: 0.8;
+}
+
+.footerCreditLink {
+  color: var(--landing-muted);
+  text-decoration: none;
+  transition: color 140ms ease;
+}
+
+.footerCreditLink:hover {
+  color: var(--landing-teal);
+}
+
 .landingShell [data-reveal] {
   opacity: 0;
   transform: translateY(34px) scale(0.985);
+  /* Hover effects (translate lift, border, shadow) ride along here because
+   * this rule owns the `transition` property for reveal elements — card-level
+   * transition declarations are overridden by it. */
   transition:
     opacity 700ms cubic-bezier(0.22, 1, 0.36, 1) var(--reveal-delay, 0ms),
-    transform 700ms cubic-bezier(0.22, 1, 0.36, 1) var(--reveal-delay, 0ms);
+    transform 700ms cubic-bezier(0.22, 1, 0.36, 1) var(--reveal-delay, 0ms),
+    translate 300ms ease,
+    border-color 300ms ease,
+    box-shadow 300ms ease;
   will-change: opacity, transform;
 }
 
 .landingShell .isVisible {
   opacity: 1;
-  transform: translateY(0) scale(1);
+  /* `none`, not translateY(0), and will-change released: an identity
+   * transform OR a standing will-change: transform would make the section
+   * the containing block for position: fixed descendants (the radar's phone
+   * detail card must pin to the VIEWPORT). Dropping the hint post-reveal
+   * also releases the compositor layer. */
+  transform: none;
+  will-change: auto;
 }
 
 :global(.dark) .landingShell {
   background:
-    radial-gradient(circle at 18% 12%, rgba(46, 154, 146, 0.22), transparent 30rem),
-    radial-gradient(circle at 82% 8%, rgba(35, 136, 242, 0.16), transparent 34rem),
-    linear-gradient(180deg, #05070b 0%, #09111d 36%, #070b12 72%, #05070b 100%);
+    radial-gradient(circle at 82% 8%, rgba(46, 154, 146, 0.12), transparent 34rem),
+    linear-gradient(180deg, #07100f 0%, #0a1614 36%, #081210 72%, #07100f 100%);
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .showcaseTrack {
+    transition: none;
+  }
+
   .landingShell [data-reveal],
-  .landingShell .isVisible,
-  .screenshotCollage {
+  .landingShell .isVisible {
     opacity: 1;
     transform: none;
     transition: none;
   }
 }
 
+/* "See it live" tabbed screenshot showcase */
+.showcaseSection {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 88px 28px 0;
+}
+
+/* Top-edge divider glow — hands off from the problem section's dark band
+ * into the showcase (relocated from the shell's old corner radial). */
+.showcaseSection {
+  position: relative;
+}
+
+/* Mint aurora curtain (same ReactBits shader as the docs pages) hanging just
+ * below the seam with the problem section. Masked so it dissolves at the
+ * strip's edges instead of ending in a hard canvas boundary. */
+.showcaseDivider {
+  position: absolute;
+  top: -30px;
+  left: 50%;
+  /* Full-bleed: the section is max-width-capped, so break out to the
+   * viewport. Only the top/bottom need dissolving — the sides end at the
+   * page edges. */
+  width: 100vw;
+  height: 420px;
+  transform: translateX(-50%);
+  z-index: 0;
+  pointer-events: none;
+  /* Dimmed so the headline stays the loudest thing in the region. */
+  opacity: 0.55;
+  /* Hard top edge — reads as light cast downward from behind the section
+   * above; only the bottom dissolves into the page. */
+  mask-image: linear-gradient(180deg, #000, #000 55%, transparent 96%);
+  -webkit-mask-image: linear-gradient(180deg, #000, #000 55%, transparent 96%);
+}
+
+.showcaseHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.showcaseTabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.showcaseTab {
+  padding: 9px 18px;
+  border: 1px solid rgba(52, 230, 196, 0.16);
+  border-radius: 999px;
+  background: rgba(52, 230, 196, 0.04);
+  color: var(--landing-muted);
+  font-family: var(--font-display-stack);
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    border-color 0.25s,
+    background 0.25s,
+    color 0.25s;
+}
+
+.showcaseTab:hover {
+  border-color: rgba(52, 230, 196, 0.4);
+  color: var(--landing-ink);
+}
+
+.showcaseTabActive,
+.showcaseTabActive:hover {
+  background: var(--landing-teal);
+  border-color: var(--landing-teal);
+  color: #04110e;
+}
+
+.showcaseFrame {
+  position: relative;
+  margin-top: 24px;
+  overflow: hidden;
+  border: 1px solid rgba(52, 230, 196, 0.14);
+  border-radius: 20px;
+  background: #081210;
+  box-shadow: 0 50px 120px -50px rgba(0, 0, 0, 0.8);
+}
+
+/* Invisible click layer over a carousel frame: clicking the media advances.
+ * Arrows sit above it (z-index 2). Hidden on phones (scroll drives). */
+.frameAdvance {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+
+/* Prev/next carousel arrows — circular glass buttons hugging the stage edges.
+ * They sit inside the data-reveal section but not ON the reveal element, so
+ * they own their transition list (hover animates instead of snapping). */
+.showcaseArrow {
+  position: absolute;
+  top: 50%;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(52, 230, 196, 0.25);
+  border-radius: 50%;
+  background: rgba(8, 18, 16, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  color: var(--landing-muted);
+  cursor: pointer;
+  translate: 0 -50%;
+  transition:
+    border-color 0.25s ease,
+    background 0.25s ease,
+    color 0.25s ease,
+    scale 0.25s ease;
+}
+
+.showcaseArrow:hover {
+  border-color: rgba(52, 230, 196, 0.6);
+  background: rgba(10, 24, 21, 0.75);
+  color: var(--landing-teal);
+  scale: 1.07;
+}
+
+.showcaseArrowLeft {
+  left: 14px;
+}
+
+.showcaseArrowRight {
+  right: 14px;
+}
+
+.showcaseViewport {
+  overflow: hidden;
+}
+
+.showcaseTrack {
+  display: flex;
+  width: 400%;
+  transition: transform 0.55s cubic-bezier(0.65, 0, 0.35, 1);
+}
+
+/* Phone-only showcase indicator pieces (styled in the compound media block
+ * at the end of the file) — hidden on desktop, where the tab pills and the
+ * chrome-bar caption do this job. */
+.showcaseStatus,
+.showcaseSlideInfo,
+.showcaseDots {
+  display: none;
+}
+
+.showcaseSlide {
+  width: 25%;
+  min-height: 460px;
+  padding: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(closest-side at 50% 40%, rgba(52, 230, 196, 0.07), transparent);
+}
+
+/* Slide media: a 16:9 demo-video loop inside the browser-frame stage. The
+ * poster is painted as the frame's background image so it doubles as the
+ * reduced-motion / JS-off fallback (the video element hides via the media
+ * query at the end of this file). */
+.slideVideoFrame {
+  position: relative;
+  width: min(940px, 100%);
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid rgba(52, 230, 196, 0.12);
+  border-radius: 12px;
+  background-color: #0b1715;
+  background-position: center;
+  background-size: cover;
+  box-shadow: 0 30px 70px -30px rgba(0, 0, 0, 0.7);
+}
+
+.slideVideo {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Two-tone statement headline + numbered card grid (multiplayer section) */
+.liveStatement {
+  max-width: 32ch;
+  margin: 0;
+  color: var(--landing-ink);
+  font-family: var(--font-body-stack);
+  font-size: clamp(2.2rem, 4.2vw, 3.7rem);
+  font-weight: 100;
+  letter-spacing: -0.03em;
+  line-height: 1.02;
+}
+
+.liveSub {
+  max-width: 64ch;
+  margin: 18px 0 0;
+  color: var(--landing-ink);
+  font-size: clamp(1.05rem, 1.5vw, 1.28rem);
+  line-height: 1.6;
+}
+
+.headingDim {
+  color: #6f928c;
+}
+
+.liveGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 22px;
+  margin-top: 48px;
+}
+
+.numberedCard {
+  padding: 26px;
+  border: 1px solid rgba(52, 230, 196, 0.12);
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(15, 34, 31, 0.7), rgba(10, 22, 20, 0.5));
+  transition:
+    translate 0.3s ease,
+    border-color 0.3s ease;
+}
+
+.numberedCard:hover {
+  translate: 0 -5px;
+  border-color: rgba(52, 230, 196, 0.32);
+}
+
+.numberedCard h3 {
+  margin: 0;
+  color: var(--landing-ink);
+  font-family: var(--font-display-stack);
+  font-size: 1.19rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.numberedCard p {
+  margin: 10px 0 0;
+  color: var(--landing-muted);
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+
+/* --- "The problem" section: scattered "collision" composition. The six
+ * amber cards pile into a loose horizontal band — each .problemSlot carries a
+ * static scatter pose (rotate/translate/negative-margin/z-index from CSS vars
+ * set inline in the TSX) plus the crash entrance animation (triggers live in
+ * the higher-specificity overrides section at the end of the file). The band
+ * bleeds wider than the 1180px text column so six cards fit at desktop; the
+ * shell's overflow: hidden clips any fly-in frames. Mobile falls back to the
+ * tidy grid (see the relocated max-width media blocks at the end). --- */
+.problemScatter {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  width: min(100vw - 80px, 1440px);
+  margin-top: 40px;
+  margin-left: 50%;
+  padding: 72px 0 108px;
+  /* Shared vanishing point for the per-slot rotateX/rotateY "tossed pile"
+   * tilt. No preserve-3d — slots stay flattened so z-index keeps ruling the
+   * overlap order. */
+  perspective: 1200px;
+  transform: translateX(-50%);
+}
+
+/* Slot = static collision pose + animation carrier. `rotate`/`translate` are
+ * the independent CSS properties (NOT transform) so the crash keyframes can
+ * animate `transform` and compose on top without fighting the resting pose.
+ * The subtle 3D toss (rotateX/rotateY) lives in the resting `transform`; the
+ * crash keyframes override `transform` wholesale (flat during travel) and
+ * their final frame restores this exact stack, so animation end and resting
+ * state are pixel-identical — no pop. */
+.problemSlot {
+  position: relative;
+  z-index: var(--slot-z, 1);
+  flex: 0 1 clamp(240px, 18vw, 320px);
+  min-width: 0;
+  margin-left: var(--slot-ml, 0px);
+  rotate: var(--slot-rot, 0deg);
+  translate: 0 var(--slot-y, 0px);
+  transform: rotateX(var(--slot-rx, 0deg)) rotateY(var(--slot-ry, 0deg));
+}
+
+/* Traffic-pileup entrance: all six cards glide in from the RIGHT as one
+ * straight, vertically ALIGNED convoy — every travel keyframe transform
+ * starts with rotate(-slot-rot) to cancel the slot's resting `rotate`, then
+ * translates, so travel is a pure horizontal slide at the shared baseline
+ * (translate's y cancels the resting --slot-y). Cards FADE IN mid-journey:
+ * opacity 0→1 over the first 14.29% (200ms) while already sliding at full
+ * speed, so the convoy materializes together partway to the pile. Shared
+ * 1400ms clock, constant convoy speed 0.75px/ms (enter-x = 450 + 60px per
+ * gap), travel is LINEAR the whole way — no ease-out, no dwell, no
+ * re-acceleration. The lead card brakes hard at the wall (linear to 38.57% /
+ * x=45px, then a velocity-matched decel to a stop at 47.14%); the cards
+ * behind never brake: each runs out of road at full speed exactly one 80ms
+ * beat after the one ahead, slamming at 48.57/54.29/60/65.71/71.43%
+ * (680/760/840/920/1000ms). Card N's slam is the impact that knocks card N-1
+ * into its scattered pose — a single jolt of forward shove + drop/pop to
+ * --slot-y + spring to --slot-rot with overshoot/wobble — so card N's stop %
+ * IS card N-1's jolt %. The same jolt delivers the subtle 3D toss: cards are
+ * FLAT (no rotateX/rotateY) during travel; the impact overshoots the tilt to
+ * 1.32x, recoils to 0.88x, and settles at the resting --slot-rx/--slot-ry,
+ * whose final frame exactly matches .problemSlot's resting transform (no end
+ * pop). The lead's pose comes from card 2's impact; the last card's pose
+ * comes from its own impact, plowing 12px past its mark as it crumples into
+ * the pile. Y offsets, rotations, and tilt only ever appear through the
+ * crash. */
+@keyframes problemCrash1 {
+  0% {
+    opacity: 0;
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(var(--enter-x, 450px), calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: linear;
+  }
+  14.29% {
+    opacity: 1;
+  }
+  38.57% {
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(45px, calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: cubic-bezier(0.25, 0.5, 0.5, 1);
+  }
+  47.14%,
+  48.57% {
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(0px, calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: cubic-bezier(0.2, 0.7, 0.4, 1);
+  }
+  52.86% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 1.32)) rotateY(calc(var(--slot-ry, 0deg) * 1.32))
+      rotate(calc(var(--slot-rot, 0deg) * 0.32)) translate(-9px, calc(var(--slot-y, 0px) * 0.26));
+  }
+  58.57% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 0.88)) rotateY(calc(var(--slot-ry, 0deg) * 0.88))
+      rotate(calc(var(--slot-rot, 0deg) * -0.12)) translate(2px, calc(var(--slot-y, 0px) * -0.08));
+  }
+  64.29%,
+  100% {
+    transform: rotateX(var(--slot-rx, 0deg)) rotateY(var(--slot-ry, 0deg)) rotate(0deg)
+      translate(0px, 0px);
+  }
+}
+
+@keyframes problemCrash2 {
+  0% {
+    opacity: 0;
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(var(--enter-x, 510px), calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: linear;
+  }
+  14.29% {
+    opacity: 1;
+  }
+  48.57%,
+  54.29% {
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(0px, calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: cubic-bezier(0.2, 0.7, 0.4, 1);
+  }
+  58.57% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 1.32)) rotateY(calc(var(--slot-ry, 0deg) * 1.32))
+      rotate(calc(var(--slot-rot, 0deg) * 0.32)) translate(-9px, calc(var(--slot-y, 0px) * 0.26));
+  }
+  64.29% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 0.88)) rotateY(calc(var(--slot-ry, 0deg) * 0.88))
+      rotate(calc(var(--slot-rot, 0deg) * -0.12)) translate(2px, calc(var(--slot-y, 0px) * -0.08));
+  }
+  70%,
+  100% {
+    transform: rotateX(var(--slot-rx, 0deg)) rotateY(var(--slot-ry, 0deg)) rotate(0deg)
+      translate(0px, 0px);
+  }
+}
+
+@keyframes problemCrash3 {
+  0% {
+    opacity: 0;
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(var(--enter-x, 570px), calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: linear;
+  }
+  14.29% {
+    opacity: 1;
+  }
+  54.29%,
+  60% {
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(0px, calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: cubic-bezier(0.2, 0.7, 0.4, 1);
+  }
+  64.29% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 1.32)) rotateY(calc(var(--slot-ry, 0deg) * 1.32))
+      rotate(calc(var(--slot-rot, 0deg) * 0.32)) translate(-9px, calc(var(--slot-y, 0px) * 0.26));
+  }
+  70% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 0.88)) rotateY(calc(var(--slot-ry, 0deg) * 0.88))
+      rotate(calc(var(--slot-rot, 0deg) * -0.12)) translate(2px, calc(var(--slot-y, 0px) * -0.08));
+  }
+  75.71%,
+  100% {
+    transform: rotateX(var(--slot-rx, 0deg)) rotateY(var(--slot-ry, 0deg)) rotate(0deg)
+      translate(0px, 0px);
+  }
+}
+
+@keyframes problemCrash4 {
+  0% {
+    opacity: 0;
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(var(--enter-x, 630px), calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: linear;
+  }
+  14.29% {
+    opacity: 1;
+  }
+  60%,
+  65.71% {
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(0px, calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: cubic-bezier(0.2, 0.7, 0.4, 1);
+  }
+  70% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 1.32)) rotateY(calc(var(--slot-ry, 0deg) * 1.32))
+      rotate(calc(var(--slot-rot, 0deg) * 0.32)) translate(-9px, calc(var(--slot-y, 0px) * 0.26));
+  }
+  75.71% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 0.88)) rotateY(calc(var(--slot-ry, 0deg) * 0.88))
+      rotate(calc(var(--slot-rot, 0deg) * -0.12)) translate(2px, calc(var(--slot-y, 0px) * -0.08));
+  }
+  81.43%,
+  100% {
+    transform: rotateX(var(--slot-rx, 0deg)) rotateY(var(--slot-ry, 0deg)) rotate(0deg)
+      translate(0px, 0px);
+  }
+}
+
+@keyframes problemCrash5 {
+  0% {
+    opacity: 0;
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(var(--enter-x, 690px), calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: linear;
+  }
+  14.29% {
+    opacity: 1;
+  }
+  65.71%,
+  71.43% {
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(0px, calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: cubic-bezier(0.2, 0.7, 0.4, 1);
+  }
+  75.71% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 1.32)) rotateY(calc(var(--slot-ry, 0deg) * 1.32))
+      rotate(calc(var(--slot-rot, 0deg) * 0.32)) translate(-9px, calc(var(--slot-y, 0px) * 0.26));
+  }
+  81.43% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 0.88)) rotateY(calc(var(--slot-ry, 0deg) * 0.88))
+      rotate(calc(var(--slot-rot, 0deg) * -0.12)) translate(2px, calc(var(--slot-y, 0px) * -0.08));
+  }
+  87.14%,
+  100% {
+    transform: rotateX(var(--slot-rx, 0deg)) rotateY(var(--slot-ry, 0deg)) rotate(0deg)
+      translate(0px, 0px);
+  }
+}
+
+/* Last card: its slam IS its own impact — still at full linear speed when it
+ * reaches its mark at 71.43%, it plows 12px past (decel curve's initial
+ * slope continues the travel velocity) while the impact simultaneously
+ * knocks it into its pose, then rebounds and settles. */
+@keyframes problemCrash6 {
+  0% {
+    opacity: 0;
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(var(--enter-x, 750px), calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: linear;
+  }
+  14.29% {
+    opacity: 1;
+  }
+  71.43% {
+    transform: rotate(calc(-1 * var(--slot-rot, 0deg)))
+      translate(0px, calc(-1 * var(--slot-y, 0px)));
+    animation-timing-function: cubic-bezier(0.16, 0.6, 0.3, 1);
+  }
+  75.71% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 1.32)) rotateY(calc(var(--slot-ry, 0deg) * 1.32))
+      rotate(calc(var(--slot-rot, 0deg) * 0.32)) translate(-12px, calc(var(--slot-y, 0px) * 0.26));
+  }
+  81.43% {
+    transform: rotateX(calc(var(--slot-rx, 0deg) * 0.88)) rotateY(calc(var(--slot-ry, 0deg) * 0.88))
+      rotate(calc(var(--slot-rot, 0deg) * -0.12)) translate(3px, calc(var(--slot-y, 0px) * -0.08));
+  }
+  87.14%,
+  100% {
+    transform: rotateX(var(--slot-rx, 0deg)) rotateY(var(--slot-ry, 0deg)) rotate(0deg)
+      translate(0px, 0px);
+  }
+}
+
+.problemCard {
+  border-color: rgba(232, 196, 104, 0.14);
+  background: linear-gradient(180deg, rgba(33, 29, 18, 0.55), rgba(17, 15, 10, 0.4));
+}
+
+.problemCard:hover {
+  border-color: rgba(232, 196, 104, 0.35);
+}
+
+.problemIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  margin-bottom: 14px;
+  border: 1px solid rgba(232, 196, 104, 0.22);
+  border-radius: 10px;
+  background: rgba(232, 196, 104, 0.08);
+  color: #e8c468;
+}
+
+/* Rhetorical hinge ABOVE the pileup — "this operational nightmare" points
+ * down at the cards, so nobody reads it against the next section. */
+.problemPivot {
+  max-width: 30ch;
+  margin: 48px auto 0;
+  color: var(--landing-ink);
+  font-family: var(--font-display-stack);
+  font-size: clamp(1.55rem, 2.7vw, 2.3rem);
+  font-weight: 300;
+  letter-spacing: -0.02em;
+  line-height: 1.18;
+  text-align: center;
+  text-wrap: balance;
+}
+
+.controlActions {
+  margin-top: 26px;
+}
+
+/* Final CTA boxed card with top radial glow (mockup treatment) */
+.ctaCard {
+  position: relative;
+  overflow: hidden;
+  padding: clamp(48px, 7vw, 90px) 40px;
+  border: 1px solid rgba(52, 230, 196, 0.18);
+  border-radius: 26px;
+  background: linear-gradient(180deg, #0c1f1b, #081210);
+}
+
+.ctaCard::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(closest-side at 50% 0%, rgba(52, 230, 196, 0.2), transparent 70%);
+  pointer-events: none;
+}
+
+.ctaCard > * {
+  position: relative;
+}
+
+/* Meet the roster — "Roster Radar": copy column + circular scope where each
+ * assistant is a hoverable blip at a polar position (coords computed in TSX
+ * as percentages of the 560×560 design grid so everything scales). */
+.rosterSection {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 88px 28px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 72px;
+}
+
+.rosterCopy {
+  flex: 1 1 340px;
+  min-width: min(340px, 100%);
+  max-width: 440px;
+}
+
+.rosterBody {
+  margin: 18px 0 0;
+  color: var(--landing-muted);
+  line-height: 1.7;
+}
+
+.rosterStatusLine {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 26px 0 0;
+  color: #6f928c;
+  font-family: var(--font-mono-stack);
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+}
+
+/* "Hover" on pointer devices, "Tap" on touch/narrow screens. */
+.tapWord {
+  display: none;
+}
+
+@media (hover: none), (max-width: 720px) {
+  .hoverWord {
+    display: none;
+  }
+  .tapWord {
+    display: inline;
+  }
+}
+
+.rosterStatusDot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #5fe9d0;
+  box-shadow: 0 0 10px rgba(94, 233, 208, 0.8);
+  animation: radarPulse 2.4s ease-in-out infinite;
+}
+
+.radarScope {
+  position: relative;
+  flex: none;
+  width: min(560px, 92vw);
+  aspect-ratio: 1;
+  /* Query container so tooltip arrows can offset in cqw (% of scope width) */
+  container-type: inline-size;
+  /* No overflow clip: tooltips near the rim must render past the circle.
+   * The sweep clips itself (its own border-radius bounds the gradient). */
+  border: 1px solid rgba(94, 233, 208, 0.18);
+  border-radius: 50%;
+  background: radial-gradient(circle, #0a1c17 0%, #061114 78%);
+}
+
+.radarSvg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.radarSweep {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(
+    rgba(94, 233, 208, 0.3),
+    rgba(94, 233, 208, 0.05) 34%,
+    transparent 48%
+  );
+  animation: sweepSpin 4.5s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes sweepSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Zero-size anchor at the exact crosshairs intersection: the dot centers on
+ * it and the label hangs below WITHOUT shifting the dot (a flex column here
+ * would center dot+label as a group, nudging the dot up half a label). */
+.radarOrigin {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  pointer-events: none;
+}
+
+.radarOriginDot {
+  position: absolute;
+  /* Centered via explicit offsets (not translate): the scale pulse composes
+   * around the pre-translate origin and would drag a translated dot ~0.6px
+   * off the crosshairs at mid-pulse. */
+  top: -7px;
+  left: -7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #5fe9d0;
+  box-shadow: 0 0 18px rgba(94, 233, 208, 0.8);
+  animation: radarPulse 2.4s ease-in-out infinite;
+}
+
+.radarOriginLabel {
+  position: absolute;
+  top: 13px;
+  transform: translateX(-50%);
+  color: rgba(207, 224, 219, 0.7);
+  font-family: var(--font-mono-stack);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  white-space: nowrap;
+}
+
+@keyframes radarPulse {
+  0%,
+  100% {
+    opacity: 1;
+    scale: 1;
+  }
+  50% {
+    opacity: 0.45;
+    scale: 0.82;
+  }
+}
+
+.radarBlip {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-family: inherit;
+  transition: opacity 0.25s ease;
+}
+
+.radarBlipDimmed {
+  opacity: 0.26;
+}
+
+.blipIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(94, 233, 208, 0.4);
+  border-radius: 50%;
+  background: #0e1d19;
+  color: #5fe9d0;
+  transition: box-shadow 0.25s ease;
+}
+
+.blipName {
+  color: #cfe0db;
+  font-family: var(--font-mono-stack);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.radarBlipActive .blipIcon {
+  box-shadow: 0 0 24px rgba(94, 233, 208, 0.5);
+}
+
+/* Hover card floated above the 44px blip circle (22px half-blip + arrow/gap).
+ * The anchor may be clamped away from the blip near the scope's edge; the
+ * arrow slides back over the blip via --tooltip-arrow-dx (set in TSX).
+ * Always rendered; fades via opacity. */
+.radarTooltip {
+  position: absolute;
+  z-index: 3;
+  transform: translate(-50%, calc(-100% - 34px));
+  width: max-content;
+  max-width: 244px;
+  padding: 11px 12px;
+  border: 1px solid rgba(94, 233, 208, 0.3);
+  border-radius: 10px;
+  background: #0b1a16;
+  text-align: left;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+
+/* Rotated-square arrow at the tooltip's bottom center, pointing at the blip */
+.radarTooltip::after {
+  content: "";
+  position: absolute;
+  bottom: -7px;
+  left: calc(50% + var(--tooltip-arrow-dx, 0cqw));
+  width: 12px;
+  height: 12px;
+  transform: translateX(-50%) rotate(45deg);
+  border-right: 1px solid rgba(94, 233, 208, 0.3);
+  border-bottom: 1px solid rgba(94, 233, 208, 0.3);
+  background: #0b1a16;
+}
+
+/* Blips near the scope's top edge have no headroom — drop the card below the
+ * blip (past its name label) and point the arrow up instead. */
+.radarTooltipBelow {
+  transform: translate(-50%, 46px);
+}
+
+.radarTooltipBelow::after {
+  top: -7px;
+  bottom: auto;
+  border-top: 1px solid rgba(94, 233, 208, 0.3);
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 1px solid rgba(94, 233, 208, 0.3);
+}
+
+.radarTooltipVisible {
+  opacity: 1;
+}
+
+.tooltipName {
+  margin: 0;
+  color: #5fe9d0;
+  font-family: var(--font-mono-stack);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tooltipRole {
+  margin: 5px 0 0;
+  max-width: 220px;
+  color: #dcebe7;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.tooltipMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 9px;
+}
+
+.tooltipMem {
+  color: #6f928c;
+  font-family: var(--font-mono-stack);
+  font-size: 10px;
+}
+
+/* Phone-only radar detail panel (shown from the 720px media block) — the
+ * floating tooltips clip against the scope edge on small screens. */
+.radarDetail {
+  display: none;
+}
+
+@media (max-width: 720px) {
+  .rosterSection {
+    padding: 64px 24px;
+    gap: 48px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .radarSweep,
+  .radarOriginDot,
+  .rosterStatusDot {
+    animation: none;
+  }
+}
+
+/* Higher-specificity overrides — kept last so specificity ascends file-wide
+ * (biome noDescendingSpecificity). */
+
+/* Hero copy stacks above the video backdrop. */
+.heroBanner .heroSection {
+  position: relative;
+  z-index: 1;
+}
+
+/* Above sibling sections (which sit at z-index 1): the radar's fixed phone
+ * detail card must never be painted over by the CTA scrolling in beneath it. */
+.landingShell .rosterSection {
+  z-index: 2;
+}
+
+/* Active ring node brightens its icon badge with it. */
+.ringNodeActive .ringNodeIcon {
+  background: linear-gradient(180deg, #34e6c4, #2ea78f);
+  box-shadow:
+    0 0 0 3px rgba(52, 230, 196, 0.18),
+    0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+/* Inline links inside landing body copy (e.g. the AI Enablement Engineer
+ * post) — explicit so they read as links regardless of site theme. */
+.workspaceCopy p a,
+.controlSection p a {
+  color: var(--landing-teal);
+  text-decoration: underline;
+  text-decoration-color: rgba(52, 230, 196, 0.45);
+  text-underline-offset: 3px;
+  transition:
+    color 0.25s ease,
+    text-decoration-color 0.25s ease;
+}
+
+.workspaceCopy p a:hover,
+.controlSection p a:hover {
+  color: #a8f5ed;
+  text-decoration-color: #a8f5ed;
+}
+
+/* Problem-section crash choreography. Slots hold opacity 0 until the
+ * IntersectionObserver stamps .isVisible on the section (it carries
+ * data-reveal); then the six per-slot pile-up timelines run on one shared
+ * 1400ms clock (fill-mode both covers the pre-start hold and the settled
+ * end state; each keyframe's own 0% opacity + final transform match the
+ * gate and resting pose, so there's no flash or double-fade). */
+.problemSection:not(.isVisible) .problemSlot {
+  opacity: 0;
+}
+
+.problemSection.isVisible .problemSlot:nth-child(1) {
+  animation: problemCrash1 1400ms both;
+}
+
+.problemSection.isVisible .problemSlot:nth-child(2) {
+  animation: problemCrash2 1400ms both;
+}
+
+.problemSection.isVisible .problemSlot:nth-child(3) {
+  animation: problemCrash3 1400ms both;
+}
+
+.problemSection.isVisible .problemSlot:nth-child(4) {
+  animation: problemCrash4 1400ms both;
+}
+
+.problemSection.isVisible .problemSlot:nth-child(5) {
+  animation: problemCrash5 1400ms both;
+}
+
+.problemSection.isVisible .problemSlot:nth-child(6) {
+  animation: problemCrash6 1400ms both;
+}
+
+/* --- Viewport media queries — kept AFTER every base rule they override
+ * (equal specificity means source order decides; these blocks once sat
+ * mid-file and several overrides were dead because their base rules came
+ * later — never move a media query above a base rule it overrides). --- */
 @media (max-width: 980px) {
-  .heroGrid,
+  .liveGrid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Problem section: back to the tidy 2-col grid — scatter pose, 3D toss,
+   * and crash animation reset; slots get a simple staggered fade-up instead. */
+  .problemScatter {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 22px;
+    width: auto;
+    margin-top: 48px;
+    margin-left: 0;
+    padding: 0;
+    perspective: none;
+    transform: none;
+  }
+
+  .problemSlot {
+    z-index: auto;
+    margin-left: 0;
+    rotate: none;
+    translate: none;
+    transform: none;
+  }
+
+  .problemSection:not(.isVisible) .problemSlot {
+    opacity: 0;
+    transform: translateY(22px);
+  }
+
+  .problemSection.isVisible .problemSlot {
+    opacity: 1;
+    transform: none;
+    transition:
+      opacity 600ms cubic-bezier(0.22, 1, 0.36, 1) var(--slot-delay, 0ms),
+      transform 600ms cubic-bezier(0.22, 1, 0.36, 1) var(--slot-delay, 0ms);
+  }
+
+  /* :nth-child(n) matches every slot — it's only here to out-rank the
+   * per-slot (0,4,0) desktop animation triggers above. */
+  .problemSection.isVisible .problemSlot:nth-child(n) {
+    animation: none;
+  }
+
+  .surfaceShot {
+    height: clamp(240px, 52vw, 420px);
+  }
+
+  .surfaceInfo {
+    padding: 20px 22px 24px;
+  }
+
+  .showcaseSlide {
+    min-height: 340px;
+  }
+
   .liveSection,
   .workspaceSection,
   .controlSection {
     grid-template-columns: 1fr;
   }
 
-  .liveVisual {
-    max-width: 620px;
-    max-height: none;
+  /* Bus stacks under the copy block: shorter node column + connector. */
+  .busItem {
+    padding-bottom: 34px;
+    padding-left: 58px;
   }
 
-  .socialCollage {
-    min-height: 480px;
+  .busItem::after {
+    width: 14px;
   }
 
   .landingFooter {
@@ -764,25 +2183,8 @@
     gap: 36px;
   }
 
-  .heroGrid {
-    gap: 44px;
-  }
-
-  .screenshotCollage {
-    min-height: 500px;
-  }
-
-  .mainScreenshotFrame {
-    left: 0;
-    width: 100%;
-  }
-
   .workspaceCopy {
     position: static;
-  }
-
-  .productGrid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -792,11 +2194,104 @@
   }
 
   .heroSection,
+  .problemSection,
   .liveSection,
   .workspaceSection,
   .productShowcase,
   .finalCta {
     padding: 64px 24px;
+  }
+
+  /* Problem entries drop the card chrome on phones: icon rides left of the
+   * text so each entry is shorter, and thin dividers replace the boxes. */
+  .problemScatter {
+    grid-template-columns: 1fr;
+    gap: 0;
+    margin-top: 32px;
+  }
+
+  .problemCard {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    column-gap: 14px;
+    row-gap: 2px;
+    padding: 18px 2px;
+    border: 0;
+    border-radius: 0;
+    background: none;
+  }
+
+  .problemIcon {
+    grid-row: 1 / span 2;
+    align-self: start;
+    margin-bottom: 0;
+  }
+
+  .problemCard h3,
+  .problemCard p {
+    grid-column: 2;
+    margin: 0;
+  }
+
+  .problemCard h3 {
+    align-self: center;
+  }
+
+  .problemCard:hover {
+    border-color: rgba(232, 196, 104, 0.14);
+    translate: none;
+  }
+
+  .problemSlot + .problemSlot .problemCard {
+    border-top: 1px solid rgba(232, 196, 104, 0.14);
+  }
+
+  /* Radar: tooltips clip against the scope circle — swap them for the
+   * fixed detail panel below the radar. */
+  .radarTooltip {
+    display: none;
+  }
+
+  /* Fixed bottom overlay so the card is always in reach of the thumb; it
+   * fades in only while the radar is on screen (see radarInView). */
+  .radarDetail {
+    position: fixed;
+    bottom: calc(14px + env(safe-area-inset-bottom));
+    left: 16px;
+    right: 16px;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 96px;
+    padding: 14px 18px;
+    border: 1px solid rgba(94, 233, 208, 0.22);
+    border-radius: 14px;
+    background: rgba(8, 18, 16, 0.92);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    text-align: center;
+    opacity: 0;
+    transform: translateY(14px);
+    pointer-events: none;
+    transition:
+      opacity 280ms ease,
+      transform 280ms ease;
+  }
+
+  .radarDetailVisible {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+
+  .radarDetailHint {
+    margin: 0;
+    color: #6f928c;
+    font-family: var(--font-mono-stack);
+    font-size: 0.78rem;
+    letter-spacing: 0.05em;
   }
 
   .heroSection {
@@ -807,67 +2302,17 @@
     font-size: clamp(3.05rem, 14vw, 4.75rem);
   }
 
-  .heroProvocation {
-    font-size: 1.16rem;
-  }
-
   .heroActions {
     align-items: stretch;
     flex-direction: column;
   }
 
   .primaryButton,
-  .secondaryButton,
-  .textButton {
+  .secondaryButton {
     width: 100%;
-  }
-
-  .screenshotCollage {
-    min-height: 360px;
-  }
-
-  .mainScreenshotFrame {
-    top: 42px;
-    left: 0;
-    width: 100%;
-    border-radius: 10px;
-    transform: none;
-  }
-
-  .mainScreenshotFrame img {
-    object-position: center;
-  }
-
-  .socialCollage {
-    min-height: 430px;
-    padding: 18px;
-  }
-
-  .socialMain {
-    top: 168px;
-    left: 18px;
-    width: 84%;
-  }
-
-  .socialFacepile {
-    top: 18px;
-    right: 14px;
-    width: 58%;
-  }
-
-  .socialCursor {
-    top: 26px;
-    left: 12px;
-    width: 36%;
-  }
-
-  .featureGrid,
-  .productGrid {
-    grid-template-columns: 1fr;
   }
 
   .sectionHeader h2,
-  .liveCopy h2,
   .workspaceCopy h2,
   .controlSection h2,
   .finalCta h2 {
@@ -879,6 +2324,27 @@
     padding: 48px 24px;
   }
 
+  /* Tab pills stay usable at phone widths; the floating arrows would sit on
+   * top of the slide content, so drop them. */
+  .showcaseArrow {
+    display: none;
+  }
+
+  /* The 16:9 video frame is short at phone widths — drop the desktop slide
+   * min-height so the stage hugs the media instead of floating it in a tall
+   * empty well. */
+  .showcaseSlide {
+    min-height: 0;
+    padding: 18px;
+  }
+
+  /* Info row can't fit copy + button side by side — stack them. */
+  .surfaceInfo {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 16px;
+  }
+
   .landingFooter {
     padding: 48px 24px 72px;
   }
@@ -887,7 +2353,269 @@
     gap: 18px;
   }
 
-  .footerLinks h4 {
+  .footerLinks h3 {
     letter-spacing: 0.06em;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* No crash choreography — cards appear instantly in their scattered pose
+   * (independent rotate/translate still apply; transform: none drops the 3D
+   * toss, keeping the pile flat). */
+  .problemSection:not(.isVisible) .problemSlot,
+  .problemSection.isVisible .problemSlot {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+
+  /* Out-ranks the per-slot (0,4,0) desktop animation triggers. */
+  .problemSection.isVisible .problemSlot:nth-child(n) {
+    animation: none;
+  }
+
+  /* Bus: no pulse, no ripple loop — nodes keep a single faint static ring. */
+  .busNodeDot {
+    animation: none;
+  }
+
+  .busRipple {
+    opacity: 0.18;
+    transform: scale(1.6);
+    animation: none;
+  }
+
+  /* Showcase carousel: hide the video loops — the poster frame painted on
+   * .slideVideoFrame's background shows instead (mirrors the hero video). */
+  .slideVideo {
+    display: none;
+  }
+}
+
+/* --- Scroll-locked surface carousel: phones with motion allowed. The tall
+ * wrapper provides the scroll budget (~55dvh per card transition, heights set
+ * inline in the TSX); this block swaps the pill explorer for the pinned
+ * stage. Reduced-motion phones keep the pill explorer above. --- */
+@media (max-width: 720px) and (prefers-reduced-motion: no-preference) {
+  /* Showcase carousel pins too: 4 slides x 55dvh of scroll budget + the
+   * pinned screen itself. Keep the multiplier in sync with
+   * showcaseSlides.length. */
+  .showcaseSection {
+    height: 320dvh;
+    padding-top: 0;
+  }
+
+  .showcaseSticky {
+    position: sticky;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    height: 100dvh;
+    padding-top: 56px;
+    overflow: hidden;
+  }
+
+  /* Match the surface carousel's look: status line + dots instead of tab
+   * pills; the chrome caption moves below the video. */
+  .showcaseTabs {
+    display: none;
+  }
+
+  /* Scroll drives the carousels on phones — no click layer. */
+  .frameAdvance {
+    display: none;
+  }
+
+  .showcaseFrame {
+    margin-top: 12px;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: none;
+    box-shadow: none;
+  }
+
+  .showcaseSlide {
+    padding: 0;
+  }
+
+  .slideVideoFrame {
+    border-radius: 14px;
+  }
+
+  .showcaseStatus {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin: 14px 0 16px;
+  }
+
+  .showcaseSlideInfo {
+    display: block;
+    margin-top: 16px;
+  }
+
+  .showcaseSlideInfo h3 {
+    margin: 0 0 8px;
+    color: var(--landing-ink);
+    font-family: var(--font-display-stack);
+    font-size: 1.35rem;
+    font-weight: 600;
+  }
+
+  .showcaseSlideInfo p {
+    margin: 0;
+    color: var(--landing-muted);
+    font-size: 0.94rem;
+    line-height: 1.55;
+  }
+
+  .showcaseDots {
+    display: flex;
+    justify-content: center;
+    gap: 7px;
+    margin-top: 18px;
+  }
+
+  .surfaceExplorer {
+    display: none;
+  }
+
+  .surfaceScrolly {
+    display: block;
+    position: relative;
+    margin-top: 8px;
+  }
+
+  .scrollySticky {
+    position: sticky;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    height: 100dvh;
+    padding: 76px 0 40px;
+    overflow: hidden;
+  }
+
+  .scrollyStatus {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 0 24px;
+    margin-bottom: 16px;
+  }
+
+  .scrollyStatusCount {
+    color: var(--landing-teal);
+    font-family: var(--font-mono-stack);
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+  }
+
+  .scrollyStatusTitle {
+    color: var(--landing-muted);
+    font-family: var(--font-mono-stack);
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .scrollyTrack {
+    display: flex;
+    will-change: transform;
+  }
+
+  .scrollyCard {
+    flex-shrink: 0;
+    padding: 0 24px;
+  }
+
+  .scrollyShot {
+    width: 100%;
+    max-height: 44dvh;
+    object-fit: cover;
+    object-position: top left;
+    border: 1px solid rgba(52, 230, 196, 0.16);
+    border-radius: 16px;
+    background: #081210;
+  }
+
+  .scrollyCard h3 {
+    margin: 18px 0 8px;
+    color: var(--landing-ink);
+    font-family: var(--font-display-stack);
+    font-size: 1.35rem;
+    font-weight: 600;
+  }
+
+  .scrollyCard p {
+    margin: 0;
+    color: var(--landing-muted);
+    font-size: 0.94rem;
+    line-height: 1.55;
+  }
+
+  .scrollyDots {
+    display: flex;
+    justify-content: center;
+    gap: 7px;
+    margin-top: 22px;
+  }
+
+  .scrollyDot {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: rgba(238, 244, 241, 0.22);
+    transition:
+      width 150ms ease,
+      background 150ms ease;
+  }
+
+  .scrollyDotActive {
+    width: 22px;
+    background: var(--landing-teal);
+  }
+}
+
+/* --- Short desktop viewports: the capability slide goes side-by-side (info
+ * rail left, screenshot right) so the image keeps real size without pushing
+ * the section past one screen. Tall viewports keep info stacked above. --- */
+@media (min-width: 721px) and (max-height: 980px) {
+  .surfaceSlide {
+    display: grid;
+    grid-template-columns: minmax(280px, 0.34fr) 1fr;
+    align-items: stretch;
+  }
+
+  .surfaceInfo {
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 14px;
+    /* Left padding clears the floating prev-arrow at the frame's edge. */
+    padding: 16px 28px 16px 86px;
+    border-bottom: 0;
+    border-right: 1px solid rgba(52, 230, 196, 0.1);
+  }
+
+  .surfaceInfo p {
+    margin-top: 6px;
+  }
+
+  .surfaceShotButton {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+  }
+
+  .surfaceShot {
+    /* Less vertical overhead with the info rail beside the image; the
+     * 300px floor keeps squat windows from shrinking the shot to a stamp
+     * (the section scrolls a little instead). */
+    max-height: max(300px, calc(100dvh - 438px));
   }
 }

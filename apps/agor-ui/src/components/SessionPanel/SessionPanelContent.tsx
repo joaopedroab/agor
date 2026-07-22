@@ -9,7 +9,7 @@ import {
   VerticalAlignBottomOutlined,
   VerticalAlignTopOutlined,
 } from '@ant-design/icons';
-import { Alert, Button, Divider, Flex, Space, Tabs, Tooltip, Typography, theme } from 'antd';
+import { Alert, Button, Divider, Space, Tabs, Tooltip, Typography, theme } from 'antd';
 import React from 'react';
 import { useAppActions } from '../../contexts/AppActionsContext';
 import { useAgorStore } from '../../store/agorStore';
@@ -17,10 +17,10 @@ import { selectMcpServerById, selectRepoById, selectUserById } from '../../store
 import { copyToClipboard } from '../../utils/clipboard';
 import { useThemedMessage } from '../../utils/message';
 import { BranchHeaderPill } from '../BranchHeaderPill';
+import { BranchMetadataRow } from '../BranchMetadataRow';
 import { ConversationView } from '../ConversationView';
 import { EmbeddedTerminal } from '../EmbeddedTerminal/EmbeddedTerminalLazy';
 import { ForkSpawnModal } from '../ForkSpawnModal';
-import { IssuePill, PullRequestPill } from '../Pill';
 
 export interface SessionPanelContentProps {
   client: AgorClient | null;
@@ -136,8 +136,7 @@ export const SessionPanelContent = React.memo<SessionPanelContentProps>(
         >
           {/* Pills section (only shown if there's content) */}
           {branch && (
-            <Flex vertical style={{ flex: '1 1 0', minWidth: 0 }}>
-              {/* Unified Branch Pill — owns the first row so its actions keep priority. */}
+            <BranchMetadataRow branch={branch} repo={repo} style={{ flex: '1 1 0', minWidth: 0 }}>
               {repo && (
                 <BranchHeaderPill
                   repo={repo}
@@ -148,23 +147,10 @@ export const SessionPanelContent = React.memo<SessionPanelContentProps>(
                   onNukeEnvironment={onNukeEnvironment}
                   onViewLogs={onViewLogs}
                   identityLink={sessionPath(session.session_id)}
-                  fluid
+                  truncateToFit
                 />
               )}
-              {(branch.issue_url || branch.pull_request_url) && (
-                <Space size={token.sizeUnit * 2} wrap style={{ marginTop: token.sizeUnit }}>
-                  {branch.issue_url && (
-                    <IssuePill issueUrl={branch.issue_url} currentRepo={repo ?? undefined} />
-                  )}
-                  {branch.pull_request_url && (
-                    <PullRequestPill
-                      prUrl={branch.pull_request_url}
-                      currentRepo={repo ?? undefined}
-                    />
-                  )}
-                </Space>
-              )}
-            </Flex>
+            </BranchMetadataRow>
           )}
           {/* Spacer if no pills */}
           {!branch && <div style={{ flex: 1 }} />}

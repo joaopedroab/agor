@@ -317,6 +317,8 @@ function hasListeningConfig(channel: GatewayChannel): boolean {
         typeof config.bot_token === 'string' &&
         config.bot_token.trim().length > 0
       );
+    case 'shortcut':
+      return !!config.api_token;
     default:
       return false;
   }
@@ -588,6 +590,47 @@ function buildGitHubInitialPrompt(
 }
 
 /**
+ * Build the initial prompt for a new Shortcut-triggered session.
+ *
+ * Mirrors buildGitHubInitialPrompt: prepends story/mention context plus the
+ * channel behavior note (only the last message is posted as a threaded reply).
+ */
+function buildShortcutInitialPrompt(text: string, metadata?: Record<string, unknown>): string {
+  try {
+    const storyId = metadata?.shortcut_story_id;
+    const storyName = metadata?.shortcut_story_name as string | undefined;
+    const storyUrl = metadata?.shortcut_story_url as string | undefined;
+    const userName =
+      (metadata?.shortcut_user_name as string | undefined) ??
+      (metadata?.shortcut_user as string | undefined) ??
+      'a user';
+    const header = storyName
+      ? `[Shortcut] ${userName} mentioned you on "${storyName}"${storyId ? ` (story ${storyId})` : ''}`
+      : `[Shortcut] ${userName} mentioned you${storyId ? ` on story ${storyId}` : ''}`;
+
+    return [
+      header,
+      ...(storyUrl ? [String(storyUrl)] : []),
+      ``,
+      text,
+      ``,
+      `---`,
+      `## Shortcut Channel Behavior`,
+      ``,
+      `This session was triggered from a Shortcut comment mention. Important behavior notes:`,
+      ``,
+      `- Your **last message** will be automatically posted as a threaded reply on the Shortcut story`,
+      `- Only the final message is posted — intermediate messages are visible in the Agor UI only`,
+      `- Keep your final response concise and Shortcut-appropriate (markdown is supported)`,
+      `- To include a video, upload it and put the raw file URL in your message (it renders inline); reference images with ![alt](url)`,
+      `- Be thorough in your work, then provide a clear final summary`,
+    ].join('\n');
+  } catch {
+    return text;
+  }
+}
+
+/**
  * Build a GatewayContext from channel + inbound message data.
  *
  * Maps platform-specific metadata fields onto the platform-agnostic
@@ -680,6 +723,21 @@ function buildGatewayContext(channel: GatewayChannel, data: PostMessageData): Ga
         channelKind: meta.telegram_chat_type === 'private' ? 'DM' : undefined,
         userName,
         userHandle: username ? `@${username}` : undefined,
+      };
+    }
+
+    case 'shortcut': {
+      const storyName = meta.shortcut_story_name as string | undefined;
+      const storyUrl = meta.shortcut_story_url as string | undefined;
+      const extras: string[] = [];
+      if (meta.shortcut_story_id) extras.push(`Story: ${meta.shortcut_story_id}`);
+      if (storyUrl) extras.push(`Link: ${storyUrl}`);
+      return {
+        platform: 'shortcut',
+        channelName: storyName,
+        userName: (meta.shortcut_user_name as string) ?? undefined,
+        userEmail: (meta.shortcut_user_email as string) ?? undefined,
+        extras,
       };
     }
 
@@ -801,7 +859,7 @@ export class GatewayService {
    * the session turn completes (goes idle). Each new message overwrites the
    * previous one — only the final message matters.
    */
-  private githubMessageBuffer = new Map<string, string>();
+  private lastMessageBuffer = new Map<string, string>();
 
   /**
    * Slack status updates are serialized and lightly throttled so concurrent
@@ -858,10 +916,12 @@ export class GatewayService {
     text: string,
     opts?: { suppressSlack?: boolean }
   ): void {
-    // GitHub has its editable Processing comment. Slack keeps durable routing
+    // GitHub and Shortcut have their own editable ack comment (the connector's
+    // "Processing" / "👀 on it" comment that becomes the final reply), so they
+    // suppress all gateway system messages here. Slack keeps durable routing
     // messages (session links/errors) but suppresses transient lifecycle noise
     // like "creating session" and queued/status rows via suppressSlack.
-    if (channel.channel_type === 'github') return;
+    if (channel.channel_type === 'github' || channel.channel_type === 'shortcut') return;
     if (channel.channel_type === 'slack' && opts?.suppressSlack) return;
 
     if (!hasConnector(channel.channel_type as ChannelType)) return;
@@ -1063,6 +1123,55 @@ export class GatewayService {
       });
     }
     return stored;
+  }
+
+  /**
+   * Resolve an aligned Agor user from an external platform identity.
+   *
+   * Two-tier lookup shared by the GitHub and Shortcut alignment branches:
+   *   1. `user_map[externalId]` → Agor email (explicit operator mapping)
+   *   2. the platform-provided email
+   * Returns the matched user row, or null when neither resolves. Callers own
+   * the platform-specific rejection — there is never a fallback to the channel
+   * owner (that would be a privilege-escalation path).
+   */
+  private async resolveAlignedUser(opts: {
+    platform: string;
+    externalId: string | undefined;
+    email: unknown;
+    userMap: Record<string, string> | undefined;
+  }): Promise<Awaited<ReturnType<UsersRepository['findByEmailForAlignment']>>> {
+    const { platform, externalId, email, userMap } = opts;
+
+    // Tier 1: explicit user_map (externalId → Agor email).
+    const mappedEmail =
+      externalId && userMap?.[externalId] ? userMap[externalId].toLowerCase().trim() : null;
+    if (mappedEmail) {
+      const matched = await this.usersRepo.findByEmailForAlignment(mappedEmail);
+      if (matched) {
+        console.log(
+          `[gateway] ${platform} user aligned via user_map: ${externalId} → ${mappedEmail} → Agor user ${shortId(matched.user_id)}`
+        );
+        return matched;
+      }
+      console.warn(
+        `[gateway] user_map entry ${externalId} → ${mappedEmail} but no Agor user with that email`
+      );
+    }
+
+    // Tier 2: platform-provided email → Agor user email match.
+    const normalizedEmail = typeof email === 'string' ? email.toLowerCase().trim() || null : null;
+    if (normalizedEmail) {
+      const matched = await this.usersRepo.findByEmailForAlignment(normalizedEmail);
+      if (matched) {
+        console.log(
+          `[gateway] ${platform} user aligned via email: ${externalId ?? 'unknown'} (${normalizedEmail}) → Agor user ${shortId(matched.user_id)}`
+        );
+        return matched;
+      }
+    }
+
+    return null;
   }
 
   private truncateSlackInline(value: string, maxChars = 70): string {
@@ -2201,12 +2310,15 @@ export class GatewayService {
       (channelConfig.align_github_users === true || data.metadata?.align_github_users === true);
     const alignTelegramUsers =
       channel.channel_type === 'telegram' || data.metadata?.align_telegram_users === true;
+    const alignShortcutUsers =
+      !isTelegramChannel &&
+      (channelConfig.align_shortcut_users === true || data.metadata?.align_shortcut_users === true);
 
     // Only fetch and use channel owner when NO alignment is active.
     // When alignment is ON, agor_user_id may be empty (the "Post messages as"
     // field is hidden in the UI), so we must not fetch it unconditionally.
     let user: User = null as unknown as User;
-    if (!alignSlackUsers && !alignGitHubUsers && !alignTelegramUsers) {
+    if (!alignSlackUsers && !alignGitHubUsers && !alignTelegramUsers && !alignShortcutUsers) {
       if (!channel.agor_user_id) {
         const errMsg =
           'Channel configuration error: no "Post messages as" user set. An admin needs to edit the channel and select a user, or enable user alignment.';
@@ -2345,51 +2457,19 @@ export class GatewayService {
     // Never falls back to channel owner — unmapped users are rejected.
     if (alignGitHubUsers && !alignSlackUsers) {
       const githubLogin = data.metadata?.github_user as string | undefined;
-      let resolved = false;
+      // Read user_map from fresh channel.config (NOT connector metadata, which
+      // can be stale since the connector holds config from construction time).
+      const matchedUser = await this.resolveAlignedUser({
+        platform: 'GitHub',
+        externalId: githubLogin,
+        email: data.metadata?.github_user_email,
+        userMap: channelConfig.user_map as Record<string, string> | undefined,
+      });
 
-      // Tier 1: Explicit user_map (GitHub login → Agor email)
-      // Read user_map from fresh channel.config (NOT from connector metadata,
-      // which can be stale since the connector holds config from construction time).
-      const userMap = channelConfig.user_map as Record<string, string> | undefined;
-      const mappedEmail =
-        githubLogin && userMap?.[githubLogin] ? userMap[githubLogin].toLowerCase().trim() : null;
-
-      if (mappedEmail) {
-        const matchedUser = await this.usersRepo.findByEmailForAlignment(mappedEmail);
-        if (matchedUser) {
-          console.log(
-            `[gateway] GitHub user aligned via user_map: ${githubLogin} → ${mappedEmail} → Agor user ${shortId(matchedUser.user_id)}`
-          );
-          user = await usersService.get(matchedUser.user_id);
-          resolved = true;
-        } else {
-          console.warn(
-            `[gateway] user_map entry ${githubLogin} → ${mappedEmail} but no Agor user with that email`
-          );
-        }
-      }
-
-      // Tier 2: GitHub public email → Agor user email match
-      if (!resolved) {
-        const githubEmail =
-          data.metadata?.github_user_email && typeof data.metadata.github_user_email === 'string'
-            ? data.metadata.github_user_email.toLowerCase().trim()
-            : null;
-
-        if (githubEmail) {
-          const matchedUser = await this.usersRepo.findByEmailForAlignment(githubEmail);
-          if (matchedUser) {
-            console.log(
-              `[gateway] GitHub user aligned via email: ${githubLogin} (${githubEmail}) → Agor user ${shortId(matchedUser.user_id)}`
-            );
-            user = await usersService.get(matchedUser.user_id);
-            resolved = true;
-          }
-        }
-      }
-
-      // Tier 3: Reject — no silent fallback to channel owner
-      if (!resolved) {
+      if (matchedUser) {
+        user = await usersService.get(matchedUser.user_id);
+      } else {
+        // Reject — no silent fallback to channel owner.
         console.log(
           `[gateway] GitHub user alignment failed: no Agor mapping for ${githubLogin ?? 'unknown'} (thread=${data.thread_id})`
         );
@@ -2441,6 +2521,46 @@ export class GatewayService {
         data.thread_id,
         'Starting a fresh Agor session for this Telegram DM.'
       );
+    }
+
+    // --- Shortcut user alignment ---
+    // 3-tier resolution: user_map → Shortcut member email → reject.
+    // Never falls back to channel owner — unmapped users are rejected.
+    if (alignShortcutUsers && !alignSlackUsers && !alignGitHubUsers) {
+      const shortcutMemberId = data.metadata?.shortcut_user as string | undefined;
+      const matchedUser = await this.resolveAlignedUser({
+        platform: 'Shortcut',
+        externalId: shortcutMemberId,
+        email: data.metadata?.shortcut_user_email,
+        userMap: channelConfig.user_map as Record<string, string> | undefined,
+      });
+
+      if (matchedUser) {
+        user = await usersService.get(matchedUser.user_id);
+      } else {
+        // Reject — no silent fallback to channel owner. Deliver the rejection by
+        // editing the "👀 on it" ack (or a fresh comment if the ack is absent).
+        console.log(
+          `[gateway] Shortcut user alignment failed: no Agor mapping for ${shortcutMemberId ?? 'unknown'} (thread=${data.thread_id})`
+        );
+        try {
+          const connector = getConnector(channel.channel_type as ChannelType, channel.config);
+          await connector.sendMessage({
+            threadId: data.thread_id,
+            text: "⚠️ Your Shortcut account isn't linked to an Agor user. Ask an admin to add a user_map entry for your Shortcut member id, or set your Agor account email to match your Shortcut email.",
+            metadata: data.metadata?.processing_comment_id
+              ? { edit_comment_id: data.metadata.processing_comment_id }
+              : undefined,
+          });
+        } catch (err) {
+          console.warn('[gateway] Failed to post Shortcut rejection comment:', err);
+        }
+        return {
+          success: false,
+          sessionId: '',
+          created: false,
+        };
+      }
     }
 
     let sessionId: SessionID;
@@ -2679,6 +2799,22 @@ export class GatewayService {
         }
       }
 
+      // Add Shortcut-specific metadata for richer context
+      if (channel.channel_type === 'shortcut') {
+        if (typeof data.metadata?.shortcut_story_id !== 'undefined') {
+          gatewaySource.shortcut_story_id = data.metadata.shortcut_story_id;
+        }
+        if (typeof data.metadata?.shortcut_story_name === 'string') {
+          gatewaySource.shortcut_story_name = data.metadata.shortcut_story_name;
+        }
+        if (typeof data.metadata?.shortcut_story_url === 'string') {
+          gatewaySource.shortcut_story_url = data.metadata.shortcut_story_url;
+        }
+        gatewaySource.shortcut_thread_id = data.thread_id;
+        // Flag for downstream consumers: only the last message is posted to Shortcut
+        gatewaySource.last_message_only = true;
+      }
+
       const session = await sessionsService.create({
         title: inboundText.substring(0, 100),
         description: inboundText,
@@ -2792,21 +2928,33 @@ export class GatewayService {
         );
       }
 
-      // For GitHub channels: edit the "Processing..." comment to include the session link.
-      // The processing_comment_id was stored in inbound metadata by the GitHub connector.
-      if (channel.channel_type === 'github' && data.metadata?.processing_comment_id) {
+      // GitHub/Shortcut: fold the session link into the connector's editable ack
+      // comment (the "Processing..." / "👀 on it" comment) now the session exists.
+      // The processing_comment_id was stored in inbound metadata by the connector.
+      if (
+        data.metadata?.processing_comment_id &&
+        (channel.channel_type === 'github' || channel.channel_type === 'shortcut')
+      ) {
+        const ackText =
+          channel.channel_type === 'github'
+            ? sessionUrl
+              ? `⏳ Processing... [View session](${sessionUrl})`
+              : `⏳ Processing in session \`${shortId(sessionId)}\`...`
+            : sessionUrl
+              ? `👀 On it — [view session](${sessionUrl})`
+              : `👀 On it (session \`${shortId(sessionId)}\`)`;
         try {
           const connector = getConnector(channel.channel_type as ChannelType, channel.config);
-          const processingText = sessionUrl
-            ? `⏳ Processing... [View session](${sessionUrl})`
-            : `⏳ Processing in session \`${shortId(sessionId)}\`...`;
           await connector.sendMessage({
             threadId: data.thread_id,
-            text: processingText,
+            text: ackText,
             metadata: { edit_comment_id: data.metadata.processing_comment_id },
           });
         } catch (err) {
-          console.warn('[gateway] Failed to update processing comment with session URL:', err);
+          console.warn(
+            `[gateway] Failed to update ${channel.channel_type} ack with session URL:`,
+            err
+          );
         }
       }
     }
@@ -2894,6 +3042,8 @@ export class GatewayService {
         });
       } else if (created && channel.channel_type === 'github') {
         promptText = buildGitHubInitialPrompt(data.thread_id, inboundText, data.metadata);
+      } else if (created && channel.channel_type === 'shortcut') {
+        promptText = buildShortcutInitialPrompt(inboundText, data.metadata);
       }
 
       if (storedInboundAttachments.length > 0) {
@@ -2948,7 +3098,10 @@ export class GatewayService {
       // includes repo/issue/user context and adding both would be redundant.
       const skipContext =
         channel.channel_type === 'slack' ||
-        (created && (channel.channel_type === 'github' || !!outboundSeed));
+        (created &&
+          (channel.channel_type === 'github' ||
+            channel.channel_type === 'shortcut' ||
+            !!outboundSeed));
       if (!skipContext) {
         const gatewayCtx = buildGatewayContext(channel, data);
         const contextPrefix = formatGatewayContext(gatewayCtx);
@@ -3095,15 +3248,16 @@ export class GatewayService {
     await this.threadMapRepo.updateLastMessage(mapping.id);
     await this.channelRepo.updateLastMessage(channel.id);
 
-    // For GitHub channels, buffer the message instead of sending immediately.
-    // Only the last message will be posted when the session goes idle (via flushGitHubBuffer).
-    // This prevents noisy intermediate messages from cluttering PR threads.
-    if (channel.channel_type === 'github') {
-      this.githubMessageBuffer.set(data.session_id, data.message);
+    // GitHub and Shortcut channels buffer the message instead of sending
+    // immediately — only the last message is posted when the session goes idle
+    // (via flushOutboundBuffer). This keeps noisy intermediate agent messages
+    // out of PR/story threads; the agent's final message IS the reply.
+    if (channel.channel_type === 'github' || channel.channel_type === 'shortcut') {
+      this.lastMessageBuffer.set(data.session_id, data.message);
       console.log(
-        `[gateway] Buffered GitHub message for session ${shortId(data.session_id)} (${data.message.length} chars)`
+        `[gateway] Buffered ${channel.channel_type} message for session ${shortId(data.session_id)} (${data.message.length} chars)`
       );
-      return { routed: true, channelType: 'github' };
+      return { routed: true, channelType: channel.channel_type };
     }
 
     // Non-GitHub channels (e.g. Slack, Teams, Telegram): send immediately
@@ -3172,32 +3326,35 @@ export class GatewayService {
   }
 
   /**
-   * Flush the GitHub message buffer for a session.
+   * Flush the buffered last message for a session (GitHub / Shortcut).
    *
-   * Called when a session transitions to idle (turn complete). Posts the
-   * last buffered message as a PR/issue comment by editing the "Processing..."
-   * comment. If no buffered message exists, this is a no-op.
+   * Called when a session transitions to idle (turn complete). Posts the last
+   * buffered message as a PR/issue/story comment by editing the connector's
+   * processing acknowledgement. If no buffered message exists, this is a no-op.
    */
-  async flushGitHubBuffer(sessionId: string): Promise<void> {
-    const bufferedMessage = this.githubMessageBuffer.get(sessionId);
+  async flushOutboundBuffer(sessionId: string): Promise<void> {
+    const bufferedMessage = this.lastMessageBuffer.get(sessionId);
     if (!bufferedMessage) {
       return; // No buffered message — nothing to flush
     }
 
     // Remove from buffer immediately (prevent double-flush)
-    this.githubMessageBuffer.delete(sessionId);
+    this.lastMessageBuffer.delete(sessionId);
 
     // Look up session → thread mapping
     const mapping = await this.threadMapRepo.findBySession(sessionId);
     if (!mapping) {
       console.warn(
-        `[gateway] flushGitHubBuffer: no thread mapping for session ${shortId(sessionId)}`
+        `[gateway] flushOutboundBuffer: no thread mapping for session ${shortId(sessionId)}`
       );
       return;
     }
 
     const channel = await this.channelRepo.findById(mapping.channel_id);
-    if (!channel?.enabled || channel.channel_type !== 'github') {
+    if (
+      !channel?.enabled ||
+      (channel.channel_type !== 'github' && channel.channel_type !== 'shortcut')
+    ) {
       return;
     }
 
@@ -3227,15 +3384,15 @@ export class GatewayService {
       });
 
       console.log(
-        `[gateway] Flushed GitHub buffer for session ${shortId(sessionId)} → ${mapping.thread_id} (${bufferedMessage.length} chars)`
+        `[gateway] Flushed ${channel.channel_type} buffer for session ${shortId(sessionId)} → ${mapping.thread_id} (${bufferedMessage.length} chars)`
       );
     } catch (error) {
       // Re-queue the message so it can be retried on next flush (e.g. session
       // goes idle again, or daemon restarts). Without this, a transient GitHub
       // API error would permanently lose the agent's final response.
-      this.githubMessageBuffer.set(sessionId, bufferedMessage);
+      this.lastMessageBuffer.set(sessionId, bufferedMessage);
       console.error(
-        `[gateway] Failed to flush GitHub buffer for session ${shortId(sessionId)} (re-queued):`,
+        `[gateway] Failed to flush ${channel.channel_type} buffer for session ${shortId(sessionId)} (re-queued):`,
         error
       );
     }

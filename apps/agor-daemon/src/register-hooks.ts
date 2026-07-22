@@ -2744,10 +2744,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           const session = Array.isArray(context.result) ? context.result[0] : context.result;
 
           if (session && shouldRunSessionPostTurnHooks(session)) {
-            // Flush GitHub message buffer (fire-and-forget).
-            // When a GitHub-connected session finishes its turn, post the last
-            // buffered message as a PR/issue comment. Must happen before queue
-            // processing so the response is posted before the next prompt starts.
+            // Flush the gateway outbound buffer (fire-and-forget).
+            // When a GitHub/Shortcut-connected session finishes its turn, post
+            // the last buffered message as a PR/issue/story comment. Must happen
+            // before queue processing so the response posts before the next prompt.
             //
             // Defer outside the just-finished transaction, then re-enter a fresh
             // tenant scope so gateway DB work keeps Cloud RLS context without
@@ -2755,7 +2755,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             deferWithTenantContext(context.params, async () => {
               try {
                 const gatewayService = context.app.service('gateway') as unknown as GatewayService;
-                await gatewayService.flushGitHubBuffer(session.session_id);
+                await gatewayService.flushOutboundBuffer(session.session_id);
                 await gatewayService.updateProgress({
                   session_id: session.session_id,
                   state: 'done',

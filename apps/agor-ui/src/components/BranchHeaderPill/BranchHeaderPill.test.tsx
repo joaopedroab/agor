@@ -13,7 +13,14 @@ vi.mock('antd', async () => {
       ...props
     }: React.ButtonHTMLAttributes<HTMLButtonElement> & { icon?: React.ReactNode }) =>
       React.createElement('button', props, icon, children),
-    Spin: () => React.createElement('span', null, 'loading'),
+    Spin: ({
+      indicator,
+      size: _size,
+      ...props
+    }: React.HTMLAttributes<HTMLSpanElement> & {
+      indicator?: React.ReactNode;
+      size?: string;
+    }) => React.createElement('span', props, indicator ?? 'loading'),
     Tooltip: ({
       children,
       trigger,
@@ -100,8 +107,8 @@ const defaultProps = {
 };
 
 describe('BranchHeaderPill', () => {
-  it('keeps compact fluid actions at the default width and hides the destructive action', () => {
-    render(<BranchHeaderPill {...defaultProps} compact fluid />);
+  it('keeps compact truncateToFit actions at the default width and hides the destructive action', () => {
+    render(<BranchHeaderPill {...defaultProps} compact truncateToFit />);
 
     expect(
       screen.getByRole('button', {
@@ -160,9 +167,13 @@ describe('BranchHeaderPill', () => {
     expect(link).toHaveAttribute('href', '/ui/s/abc123/');
   });
 
-  it('keeps a fluid identity accessible and selects the narrow action-button variant', () => {
+  it('keeps a truncateToFit identity accessible and selects the narrow action-button variant', () => {
     render(
-      <BranchHeaderPill {...defaultProps} identityLink="https://agor.example/ui/s/abc123/" fluid />
+      <BranchHeaderPill
+        {...defaultProps}
+        identityLink="https://agor.example/ui/s/abc123/"
+        truncateToFit
+      />
     );
 
     const identity = screen.getByRole('link', {
@@ -173,10 +184,13 @@ describe('BranchHeaderPill', () => {
       flex: '1 1 auto',
       minWidth: '0',
     });
+    // Content-sized pill: capped at the row width, never stretched to fill it.
     expect(identity.parentElement).toHaveStyle({
-      width: '100%',
+      display: 'inline-flex',
+      maxWidth: '100%',
       minWidth: '0',
     });
+    expect(identity.parentElement?.style.width).toBe('');
 
     expect(screen.getByText(repo.slug)).toHaveStyle({
       overflow: 'hidden',
@@ -210,5 +224,25 @@ describe('BranchHeaderPill', () => {
         minWidth: '20px',
       });
     }
+  });
+
+  it('renders the starting-environment spinner as an icon aligned with sibling status icons', () => {
+    render(
+      <BranchHeaderPill
+        {...defaultProps}
+        branch={{ ...branch, environment_instance: { status: 'starting' } } as Branch}
+      />
+    );
+
+    // Spin uses a LoadingOutlined indicator sized like the other status icons.
+    const indicator = screen.getByRole('img', { name: 'loading' });
+    expect(indicator.className).toContain('anticon-spin');
+    expect(indicator).toHaveStyle({ fontSize: '11px' });
+    // The Spin wrapper centers the indicator instead of leaving it on the
+    // inherited 22px text baseline.
+    expect(indicator.parentElement).toHaveStyle({
+      display: 'inline-flex',
+      alignItems: 'center',
+    });
   });
 });

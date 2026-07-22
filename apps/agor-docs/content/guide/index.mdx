@@ -1,31 +1,34 @@
 ---
 title: agor Documentation
-description: Team command center for all things agentic. A shared canvas for coding agents and long-lived AI teammates, anchored on git branches, with real-time multiplayer and an MCP surface agents drive themselves.
+description: The command center for AI enablement. A shared canvas for coding agents and long-lived AI teammates, anchored on git branches, with real-time multiplayer and an MCP surface agents drive themselves.
 ---
 
-import { LOGO_PATH } from '../../lib/siteMetadata';
+import { LOGO_MARK_PATH } from '../../lib/siteMetadata';
 
 <div style={{ textAlign: 'center', marginTop: '2rem', marginBottom: '2rem' }}>
   <img
-    src={LOGO_PATH}
-    alt="agor logo - team command center for all things agentic"
-    style={{ width: '135px', height: '135px', borderRadius: '50%', opacity: 0.9 }}
+    src={LOGO_MARK_PATH}
+    alt="agor logo - the command center for AI enablement"
+    style={{ width: '135px', height: '135px', opacity: 0.9 }}
   />
 </div>
 
 # <span className="gradient-text">agor</span>
 
-**Team command center for all things agentic.**
+**The command center for AI enablement.**
 
-Agor is a shared canvas where coding agents (Claude Code, Codex, Gemini) and long-lived AI teammates run side-by-side on isolated git branches — the anchor entity where sessions, dev environments, prompts, and PRs converge. Your whole team rallies around the same live work in real time, and the agents themselves drive Agor over MCP.
+Agor is a shared canvas where coding agents (Claude Code, Codex, Gemini) and long-lived AI teammates run side-by-side on isolated git branches, the anchor entity where sessions, dev environments, prompts, and PRs converge. Your whole team rallies around the same live work in real time, and the agents themselves drive Agor over MCP.
 
-import { GifGallery } from '../../components';
+import { GifGallery, YouTubeEmbed } from '../../components';
+import { ScreenshotGallery } from '../../components/ScreenshotGallery';
 
 ## In Action
 
 <GifGallery />
 
-**▶️ [Watch 13-minute walkthrough on YouTube](https://www.youtube.com/watch?v=3in0qh7ZH0g)** — Unscripted demo showing Agor's core features
+<YouTubeEmbed id="3in0qh7ZH0g" title="Agor 13-minute walkthrough" />
+
+**13-minute walkthrough.** Unscripted demo showing Agor's core features
 
 ---
 
@@ -44,9 +47,9 @@ Prefer Homebrew on macOS or Linux? See the [Getting Started Guide](/guide/gettin
 
 **Then dive in:**
 
-- **[Features Overview](/guide/features-overview)** — A map of what Agor does, starting with branches, sessions, and boards
-- **[Architecture](/guide/architecture)** — System design and the typed TypeScript client
-- **[Development Guide](/guide/development)** — Run Agor in Agor and contribute
+- **[Features Overview](/guide/features-overview).** A map of what Agor does, starting with branches, sessions, and boards
+- **[Architecture](/guide/architecture).** System design and the typed TypeScript client
+- **[Development Guide](/guide/development).** Run Agor in Agor and contribute
 
 ---
 
@@ -56,96 +59,50 @@ Prefer Homebrew on macOS or Linux? See the [Getting Started Guide](/guide/gettin
 
 _Multiplayer spatial canvas with zones, branches, live cursors, notes, and agent-built dashboards_
 
-<div
-  style={{
-    display: 'grid',
-    gridTemplateColumns: '1fr 1fr',
-    gap: '16px',
-    marginTop: '24px',
-    marginBottom: '24px',
-  }}
->
-  <div>
-    <img
-      src="/screenshots/conversation_full_page.png"
-      alt="Agor task-centric conversation UI showing AI agent messages, tool calls, and file changes in a structured timeline"
-      style={{ width: '100%', borderRadius: '8px' }}
-    />
-    <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Task-centric conversation UI</em>
-    </p>
-  </div>
-  <div>
-    <img
-      src="/screenshots/settings_modal.png"
-      alt="Agor settings modal for configuring MCP servers, managing branches, and agent preferences"
-      style={{ width: '100%', borderRadius: '8px' }}
-    />
-    <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>MCP server and branch management</em>
-    </p>
-  </div>
-  <div>
-    <img
-      src="/screenshots/zone-trigger.png"
-      alt="Agor zone trigger modal showing a templated prompt with mustache placeholders ({{ branch.name }}, {{ branch.pull_request_url }}) and Prompt/Fork/Spawn action choices"
-      style={{ width: '100%', borderRadius: '8px' }}
-    />
-    <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Zone trigger with templated prompt</em>
-    </p>
-  </div>
-  <div>
-    <img
-      src="/screenshots/tool-blocks.png"
-      alt="Agor chat showing structured tool blocks: collapsible thinking, Grep with pattern badge, Edit with red/green inline diff, and Bash with expandable output"
-      style={{ width: '100%', borderRadius: '8px' }}
-    />
-    <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Structured tool blocks with inline diffs</em>
-    </p>
-  </div>
-  <div>
-    <img
-      src="/screenshots/env-variants-full.png"
-      alt="Agor branch environment tab showing YAML config with named variants (docs, full, sqlite, postgres) and Docker compose commands"
-      style={{ width: '100%', borderRadius: '8px' }}
-    />
-    <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Branch environment with named variants</em>
-    </p>
-  </div>
-  <div>
-    <img
-      src="/screenshots/create-session-modal.png"
-      alt="Agor create session modal showing five agent runtime cards side-by-side: Claude Code, Codex, Gemini, OpenCode (BETA), GitHub Copilot (BETA)"
-      style={{ width: '100%', borderRadius: '8px' }}
-    />
-    <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Pick any SDK: Claude, Codex, Gemini, OpenCode, Copilot</em>
-    </p>
-  </div>
-  <div>
-    <img
-      src="/screenshots/baked_in_terminal.png"
-      alt="Agor built-in terminal with automatic branch context and environment variable injection"
-      style={{ width: '100%', borderRadius: '8px' }}
-    />
-    <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Built-in terminal with branch context</em>
-    </p>
-  </div>
-  <div>
-    <img
-      src="/screenshots/onboarding.png"
-      alt="Agor onboarding welcome screen showing team status, recent activity, and quick start guide"
-      style={{ width: '100%', borderRadius: '8px' }}
-    />
-    <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Welcome screen showing team status</em>
-    </p>
-  </div>
-</div>
+<ScreenshotGallery
+  shots={[
+    {
+      src: '/screenshots/conversation_full_page.png',
+      alt: "Agor task-centric conversation UI showing AI agent messages, tool calls, and file changes in a structured timeline",
+      caption: 'Task-centric conversation UI',
+    },
+    {
+      src: '/screenshots/settings_modal.png',
+      alt: "Agor settings modal for configuring MCP servers, managing branches, and agent preferences",
+      caption: 'MCP server and branch management',
+    },
+    {
+      src: '/screenshots/zone-trigger.png',
+      alt: "Agor zone trigger modal showing a templated prompt with mustache placeholders ({{ branch.name }}, {{ branch.pull_request_url }}) and Prompt/Fork/Spawn action choices",
+      caption: 'Zone trigger with templated prompt',
+    },
+    {
+      src: '/screenshots/tool-blocks.png',
+      alt: "Agor chat showing structured tool blocks: collapsible thinking, Grep with pattern badge, Edit with red/green inline diff, and Bash with expandable output",
+      caption: 'Structured tool blocks with inline diffs',
+    },
+    {
+      src: '/screenshots/env-variants-full.png',
+      alt: "Agor branch environment tab showing YAML config with named variants (docs, full, sqlite, postgres) and Docker compose commands",
+      caption: 'Branch environment with named variants',
+    },
+    {
+      src: '/screenshots/create-session-modal.png',
+      alt: "Agor create session modal showing five agent runtime cards side-by-side: Claude Code, Codex, Gemini, OpenCode (BETA), GitHub Copilot (BETA)",
+      caption: 'Pick any SDK: Claude, Codex, Gemini, OpenCode, Copilot',
+    },
+    {
+      src: '/screenshots/baked_in_terminal.png',
+      alt: "Agor built-in terminal with automatic branch context and environment variable injection",
+      caption: 'Built-in terminal with branch context',
+    },
+    {
+      src: '/screenshots/onboarding.png',
+      alt: "Agor onboarding welcome screen showing team status, recent activity, and quick start guide",
+      caption: 'Welcome screen showing team status',
+    },
+  ]}
+/>
 
 ---
 
@@ -170,4 +127,4 @@ Read the [Development Guide](/guide/development) for the local development workf
 
 ## License
 
-Business Source License 1.1 — see the [GitHub repository](https://github.com/preset-io/agor/blob/main/LICENSE) for details
+Business Source License 1.1. See the [GitHub repository](https://github.com/preset-io/agor/blob/main/LICENSE) for details

@@ -9,6 +9,7 @@
 import type { ChannelType } from '../types/gateway';
 import type { GatewayConnector } from './connector';
 import { GitHubConnector } from './connectors/github';
+import { ShortcutConnector } from './connectors/shortcut';
 import { SlackConnector } from './connectors/slack';
 import { TeamsConnector } from './connectors/teams';
 import { TelegramConnector } from './connectors/telegram';
@@ -22,6 +23,7 @@ connectors.set('slack', (config) => new SlackConnector(config));
 connectors.set('github', (config) => new GitHubConnector(config));
 connectors.set('teams', (config) => new TeamsConnector(config));
 connectors.set('telegram', (config) => new TelegramConnector(config));
+connectors.set('shortcut', (config) => new ShortcutConnector(config));
 
 /**
  * Get a connector instance for the given channel type

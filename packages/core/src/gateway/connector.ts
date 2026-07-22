@@ -5,7 +5,12 @@
  * sending messages to and receiving messages from messaging platforms.
  */
 
-import type { ChannelType, SlackAppInfo, SlackTestResult } from '../types/gateway';
+import type {
+  ChannelType,
+  GatewayConnectionTestResult,
+  GatewayEnvVar,
+  SlackAppInfo,
+} from '../types/gateway';
 
 /**
  * Provider-normalized file/media metadata carried with an inbound gateway
@@ -164,7 +169,17 @@ export interface GatewayConnector {
    * a structured report. `result.notVerifiable` lists what the probe cannot
    * prove, so a green result is never mistaken for full verification.
    */
-  testConnection?(): Promise<SlackTestResult>;
+  testConnection?(): Promise<GatewayConnectionTestResult>;
+
+  /**
+   * Environment variables the connector's platform skills need inside a
+   * gateway-created session — e.g. an API token + base URL so the agent can
+   * fetch the platform's attachments (Shortcut media-intake reads
+   * `SHORTCUT_API_TOKEN`). The daemon merges these into the session env at
+   * spawn; operator-set `agentic_config.envVars` take precedence, so a
+   * connector should return safe service defaults.
+   */
+  sessionEnv?(): GatewayEnvVar[];
 
   /**
    * Best-effort resolution of the platform app behind the channel's stored

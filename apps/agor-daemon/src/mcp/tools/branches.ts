@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { isBranchRbacEnabled, loadConfig } from '@agor/core/config';
 import { BranchRepository, shortId } from '@agor/core/db';
 import type {
+  Board,
   BoardID,
   Branch,
   BranchID,
@@ -16,7 +17,11 @@ import { computeZoneRelativePosition } from '@agor/core/utils/board-placement';
 import { normalizeOptionalHttpUrl } from '@agor/core/utils/url';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { BranchesServiceImpl, ReposServiceImpl } from '../../declarations.js';
+import type {
+  BoardsServiceImpl,
+  BranchesServiceImpl,
+  ReposServiceImpl,
+} from '../../declarations.js';
 import type { BranchParams } from '../../services/branches.js';
 import { isSuperAdmin } from '../../utils/branch-authorization.js';
 import {
@@ -419,7 +424,12 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
         'For zone trigger behavior (prompt templates), use agor_branches_set_zone after creation. ' +
         'To create a long-lived Agor teammate (a persistent AI teammate that manages other branches ' +
         'and maintains memory), pass the teammate object — this is the ONLY supported way to make a ' +
-        'teammate via MCP. Teammate status cannot be toggled later with agor_branches_update.',
+        'teammate via MCP. Teammate status cannot be toggled later with agor_branches_update. ' +
+        'Agor follows a soft 1:1 teammate↔board convention: when creating a teammate, boardId is ' +
+        'optional — omit it (or pass createBoard=true) to spin up a dedicated board for the teammate ' +
+        'and wire it as that board primary teammate. If you pass a boardId that already has a ' +
+        'different primary teammate, the branch is still created but a warning is returned (the ' +
+        'convention is not hard-enforced).',
       inputSchema: z.object({
         repoId: mcpRequiredId(
           'repoId',
@@ -432,11 +442,20 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
             'If the name conflicts with an existing branch, a numeric suffix is auto-appended (e.g., "my-feature-2"). ' +
             'Set autoSuffix=false to get an error on conflict instead.'
         ),
-        boardId: mcpRequiredId(
+        boardId: mcpOptionalId(
           'boardId',
           'Board',
-          'Board ID to place the branch on (positions to default coordinates). Required to ensure branches are visible in the UI.'
+          'Board ID to place the branch on (positions to default coordinates). Required for normal branches to ensure they are visible in the UI. ' +
+            'Optional when the teammate object is provided: omit it (or pass createBoard=true) to auto-create a dedicated board for the teammate.'
         ),
+        createBoard: z
+          .boolean()
+          .optional()
+          .describe(
+            'Teammate branches only. When true, create a fresh board for this teammate and wire it as ' +
+              'the board primary teammate (soft 1:1 teammate↔board convention). Mutually exclusive with boardId. ' +
+              'For a teammate, omitting both boardId and createBoard also auto-creates a board.'
+          ),
         ref: mcpOptionalString(
           'ref',
           'Git ref name to create or checkout. Defaults to branchName when creating a new git branch. ' +
@@ -551,8 +570,14 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
       const repoId = await resolveRepoId(ctx, coerceString(args.repoId)!);
       let branchName = coerceString(args.branchName)!;
       const originalName = branchName;
-      const boardId = await resolveBoardId(ctx, coerceString(args.boardId)!);
-      if (!boardId) throw new Error('boardId is required');
+      const boardIdArg = coerceString(args.boardId);
+      // Resolve the board up front only when one was passed. For teammate
+      // branches the board is optional (we may auto-create one below), so the
+      // required-board check is deferred to the board-strategy block.
+      let boardId: BoardID | undefined = boardIdArg
+        ? await resolveBoardId(ctx, boardIdArg)
+        : undefined;
+      const createBoardArg = typeof args.createBoard === 'boolean' ? args.createBoard : undefined;
       const zoneId = coerceString(args.zoneId);
       const autoSuffix = typeof args.autoSuffix === 'boolean' ? args.autoSuffix : true;
 
@@ -603,6 +628,79 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           createdViaOnboarding: teammateInput.createdViaOnboarding === true,
         };
       }
+
+      // Board strategy + soft 1:1 teammate<->board coupling.
+      //
+      // Convention (deliberately not hard-enforced): every teammate has a
+      // primary board and every board has a primary teammate. We reflect that
+      // on the tool surface without forcing it:
+      //   - teammate + no board  -> auto-create a dedicated board (becomes primary)
+      //   - teammate + createBoard=true -> same, explicit
+      //   - teammate + existing board that already has a *different* primary
+      //     teammate -> still create, but return a warning (do not block)
+      //   - normal branch -> boardId stays required (UI visibility invariant)
+      let createdBoard: Board | undefined;
+      let primaryTeammateWarning: string | undefined;
+
+      if (teammateConfig) {
+        if (boardId && createBoardArg === true) {
+          throw new Error(
+            'Pass either boardId (place the teammate on an existing board) or createBoard=true ' +
+              '(create a dedicated board), not both.'
+          );
+        }
+
+        if (!boardId) {
+          if (createBoardArg === false) {
+            throw new Error(
+              'boardId is required, or set createBoard=true (or omit createBoard) to auto-create ' +
+                'a dedicated board for this teammate.'
+            );
+          }
+
+          // No board given (or createBoard explicitly requested): spin up a
+          // dedicated board for this teammate. BranchesService.create then wires
+          // it as the board primary teammate via setPrimaryTeammateIfUnset.
+          const boardsService = ctx.app.service('boards') as unknown as BoardsServiceImpl;
+          createdBoard = (await boardsService.create(
+            {
+              name: teammateConfig.displayName,
+              created_by: ctx.userId,
+              ...(teammateConfig.emoji ? { icon: teammateConfig.emoji } : {}),
+            } as Partial<Board>,
+            ctx.baseServiceParams
+          )) as Board;
+          boardId = createdBoard.board_id;
+        } else {
+          // Existing board: honour the 1:1 convention softly. If the board
+          // already has a (different) primary teammate, warn — the new teammate
+          // will join the board but will NOT become its primary.
+          try {
+            const boardsService = ctx.app.service('boards') as unknown as BoardsServiceImpl;
+            const board = (await boardsService.get(boardId, ctx.baseServiceParams)) as Board;
+            if (board?.primary_teammate_id) {
+              primaryTeammateWarning =
+                `Board ${boardId} already has a primary teammate (${board.primary_teammate_id}). ` +
+                `Agor follows a soft 1:1 teammate↔board convention, so this teammate will be added ` +
+                `to the board but will NOT become its primary teammate. Omit boardId or pass ` +
+                `createBoard=true to give this teammate its own board.`;
+            }
+          } catch {
+            // resolveBoardId already validated the board exists; ignore any
+            // transient lookup failure here rather than block creation.
+          }
+        }
+      } else {
+        if (createBoardArg === true) {
+          throw new Error('createBoard is only supported when creating a teammate branch.');
+        }
+        if (!boardId) {
+          throw new Error('boardId is required');
+        }
+      }
+
+      // By here boardId is always resolved (passed, auto-created, or threw above).
+      if (!boardId) throw new Error('boardId is required');
 
       // Auto-suffix: resolve name conflicts by appending -2, -3, etc.
       // Uses direct DB query to bypass Feathers pagination limits
@@ -687,12 +785,32 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
       }
 
       if (teammateConfig) {
-        const teammateResult = {
+        // No warning => this teammate is the sole/first primary on its board
+        // (freshly auto-created board, or an existing board with no prior
+        // primary). A warning means the board already had a different primary.
+        const becamePrimary = !primaryTeammateWarning;
+        response._teammate = {
           created: true,
           display_name: teammateConfig.displayName,
-          note: 'Created as a long-lived Agor teammate. The board primary teammate pointer and the teammate Knowledge namespace were provisioned automatically.',
+          primary_board_id: boardId,
+          is_board_primary_teammate: becamePrimary,
+          note: becamePrimary
+            ? 'Created as a long-lived Agor teammate and wired as the board primary teammate. The teammate Knowledge namespace was provisioned automatically.'
+            : 'Created as a long-lived Agor teammate. Its Knowledge namespace was provisioned, but the target board already had a primary teammate so this teammate is NOT the board primary.',
         };
-        response._teammate = teammateResult;
+
+        if (createdBoard) {
+          response._board = {
+            created: true,
+            board_id: createdBoard.board_id,
+            name: createdBoard.name,
+            note: 'A dedicated board was auto-created for this teammate (soft 1:1 teammate↔board convention).',
+          };
+        }
+
+        if (primaryTeammateWarning) {
+          response._warning = primaryTeammateWarning;
+        }
       }
 
       if (zoneId) {

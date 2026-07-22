@@ -29,7 +29,14 @@ export type GatewayOutboundMessageID = UUID;
 // ============================================================================
 
 /** Supported messaging platform types */
-export type ChannelType = 'slack' | 'discord' | 'whatsapp' | 'telegram' | 'github' | 'teams';
+export type ChannelType =
+  | 'slack'
+  | 'discord'
+  | 'whatsapp'
+  | 'telegram'
+  | 'github'
+  | 'teams'
+  | 'shortcut';
 
 /** Thread lifecycle status */
 export type ThreadStatus = 'active' | 'archived' | 'paused';
@@ -42,6 +49,7 @@ export const GATEWAY_SENSITIVE_CONFIG_FIELDS = [
   'private_key',
   'webhook_secret',
   'app_password',
+  'api_token',
 ] as const;
 
 /** Sentinel value used by gateway APIs/tools to represent a redacted secret. */
@@ -83,6 +91,10 @@ export function getRequiredSecretFields(
       return ['app_password'];
     case 'telegram':
       return ['bot_token'];
+    case 'shortcut':
+      // Shortcut is poll-based over the REST API — the API token is always
+      // required for an enabled channel (there is no outbound-only mode).
+      return ['api_token'];
     default:
       return [];
   }
@@ -166,12 +178,11 @@ export function resolveSlackAgentTools(raw: unknown): Record<SlackAgentToolCapab
 /**
  * A single capability that a connection probe could not establish.
  *
- * `capability` names the thing that failed (e.g. `bot_token`, `app_token`,
- * `channel_access`). `needed`/`provided` carry Slack's verbatim
- * `missing_scope` detail when present so the UI can tell the operator exactly
- * which OAuth scope to add rather than a generic "permission denied".
+ * `capability` names the thing that failed (e.g. `api_token`, `bot_token`, or
+ * `channel_access`). The optional Slack fields preserve verbatim
+ * `missing_scope` detail when that connector can provide it.
  */
-export interface SlackTestFailure {
+export interface GatewayConnectionTestFailure {
   capability: string;
   reason: string;
   slackError?: string;
@@ -180,22 +191,27 @@ export interface SlackTestFailure {
 }
 
 /**
- * Result of a best-effort Slack connection probe.
+ * Result of a best-effort gateway connector connection probe.
  *
- * The probe exercises real Slack API calls (bot token auth, app-token Socket
- * Mode handshake, sampled channel access) but cannot prove everything about a
- * working installation — `notVerifiable` enumerates what green does NOT
- * guarantee so the result is never read as "fully verified".
+ * Probes exercise real platform calls but cannot prove everything about a
+ * working installation. `notVerifiable` enumerates what green does NOT
+ * guarantee; connector-specific optional fields carry richer details.
  */
-export interface SlackTestResult {
+export interface GatewayConnectionTestResult {
   ok: boolean;
   team?: { id: string; name: string };
   bot?: { userId: string; name: string };
   appTokenValid?: boolean;
   channelAccess?: { channelId: string; ok: boolean }[];
-  failures: SlackTestFailure[];
+  failures: GatewayConnectionTestFailure[];
   notVerifiable: string[];
 }
+
+/** @deprecated Use {@link GatewayConnectionTestFailure}. */
+export type SlackTestFailure = GatewayConnectionTestFailure;
+
+/** @deprecated Use {@link GatewayConnectionTestResult}. */
+export type SlackTestResult = GatewayConnectionTestResult;
 
 /**
  * Identity of the Slack app behind a channel's bot token, resolved server-side

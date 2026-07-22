@@ -16,6 +16,13 @@ export type {
 export { normalizeOutbound } from './connector';
 export { getConnector, hasConnector, registerConnector } from './connector-registry';
 export { GitHubConnector, parseThreadId as parseGitHubThreadId } from './connectors/github';
+export {
+  buildThreadId as buildShortcutThreadId,
+  commentMentionsAgent as shortcutCommentMentionsAgent,
+  parseThreadId as parseShortcutThreadId,
+  ShortcutConnector,
+  stripAgentMention as stripShortcutAgentMention,
+} from './connectors/shortcut';
 export type {
   SlackChannelHistoryRequest,
   SlackChannelHistoryResult,

@@ -13,11 +13,21 @@
 import { GatewayChannelRepository, type TenantScopeAwareDatabase } from '@agor/core/db';
 import { NotFound } from '@agor/core/feathers';
 import { getConnector } from '@agor/core/gateway';
-import type { AuthenticatedParams, ChannelType, SlackTestResult } from '@agor/core/types';
+import type {
+  AuthenticatedParams,
+  ChannelType,
+  GatewayConnectionTestResult,
+} from '@agor/core/types';
 import { GATEWAY_REDACTED_SENTINEL, GATEWAY_SENSITIVE_CONFIG_FIELDS } from '@agor/core/types';
 
 export interface GatewayChannelTestInput {
   gatewayChannelId?: string;
+  /**
+   * Connector type to probe when the channel does not exist yet (create wizard).
+   * Ignored when `gatewayChannelId` is provided — the stored channel's type wins.
+   * Defaults to `slack` for backward compatibility.
+   */
+  channelType?: ChannelType;
   config?: Record<string, unknown>;
 }
 
@@ -55,8 +65,10 @@ export function createGatewayChannelsTestService(db: TenantScopeAwareDatabase) {
     async create(
       data: GatewayChannelTestInput,
       _params?: AuthenticatedParams
-    ): Promise<SlackTestResult> {
-      let channelType: ChannelType = 'slack';
+    ): Promise<GatewayConnectionTestResult> {
+      // Create wizard: no channel exists yet, so the caller states the type.
+      // Edit: the stored channel's type is authoritative and overrides it below.
+      let channelType: ChannelType = data.channelType ?? 'slack';
       let storedConfig: Record<string, unknown> = {};
 
       if (data.gatewayChannelId) {

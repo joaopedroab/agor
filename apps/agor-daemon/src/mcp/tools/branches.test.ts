@@ -355,6 +355,213 @@ describe('agor_branches_create', () => {
     const passed = createBranch.mock.calls[0][1] as Record<string, unknown>;
     expect(passed).not.toHaveProperty('custom_context');
   });
+
+  it('auto-creates a dedicated board for a teammate when no boardId is given', async () => {
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'teammate-branch',
+      created_by: 'user-a',
+      ...(data as Record<string, unknown>),
+    }));
+    const reposGet = vi.fn(async () => ({
+      repo_id: 'repo-1',
+      slug: 'siebel-crm',
+      default_branch: 'main',
+    }));
+    const boardsCreate = vi.fn(async (data: Record<string, unknown>) => ({
+      board_id: 'board-auto',
+      name: data.name,
+      icon: data.icon,
+    }));
+    const boardsGet = vi.fn(async () => {
+      throw new Error('boards.get should not be called when auto-creating a board');
+    });
+    const app = {
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: boardsGet, create: boardsCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    const result = await create({
+      repoId: 'repo-1',
+      branchName: 'siebel-crm',
+      autoSuffix: false,
+      teammate: { displayName: 'Siebel CRM', emoji: '🤖' },
+    });
+
+    // A board named after the teammate is created and used for placement.
+    expect(boardsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'Siebel CRM', icon: '🤖', created_by: 'user-a' }),
+      {}
+    );
+    expect(createBranch).toHaveBeenCalledWith(
+      'repo-1',
+      expect.objectContaining({ boardId: 'board-auto' }),
+      {}
+    );
+
+    const payload = JSON.parse(result.content[0].text) as {
+      _teammate?: Record<string, unknown>;
+      _board?: Record<string, unknown>;
+      _warning?: string;
+    };
+    expect(payload._board).toMatchObject({ created: true, board_id: 'board-auto' });
+    expect(payload._teammate).toMatchObject({
+      created: true,
+      is_board_primary_teammate: true,
+      primary_board_id: 'board-auto',
+    });
+    expect(payload._warning).toBeUndefined();
+  });
+
+  it('auto-creates a board when createBoard=true is passed explicitly', async () => {
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'teammate-branch',
+      ...(data as Record<string, unknown>),
+    }));
+    const reposGet = vi.fn(async () => ({ repo_id: 'repo-1', slug: 's', default_branch: 'main' }));
+    const boardsCreate = vi.fn(async () => ({ board_id: 'board-auto', name: 'Helper' }));
+    const app = {
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: vi.fn(), create: boardsCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    await create({
+      repoId: 'repo-1',
+      branchName: 'helper',
+      autoSuffix: false,
+      createBoard: true,
+      teammate: { displayName: 'Helper' },
+    });
+
+    expect(boardsCreate).toHaveBeenCalledTimes(1);
+    expect(createBranch).toHaveBeenCalledWith(
+      'repo-1',
+      expect.objectContaining({ boardId: 'board-auto' }),
+      {}
+    );
+  });
+
+  it('warns (does not block) when the target board already has a different primary teammate', async () => {
+    const createBranch = vi.fn(async (_repoId: string, data: unknown) => ({
+      branch_id: 'teammate-branch',
+      ...(data as Record<string, unknown>),
+    }));
+    const reposGet = vi.fn(async () => ({ repo_id: 'repo-1', slug: 's', default_branch: 'main' }));
+    const boardsCreate = vi.fn();
+    // resolveBoardId and the warning lookup both call boards.get; the board
+    // already has a *different* primary teammate.
+    const boardsGet = vi.fn(async () => ({
+      board_id: 'board-1',
+      primary_teammate_id: 'other-teammate',
+    }));
+    const app = {
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch };
+        if (name === 'boards') return { get: boardsGet, create: boardsCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    const result = await create({
+      repoId: 'repo-1',
+      branchName: 'second-teammate',
+      boardId: 'board-1',
+      autoSuffix: false,
+      teammate: { displayName: 'Second Teammate' },
+    });
+
+    // Still created on the passed board — the convention is soft, not enforced.
+    expect(boardsCreate).not.toHaveBeenCalled();
+    expect(createBranch).toHaveBeenCalledWith(
+      'repo-1',
+      expect.objectContaining({ boardId: 'board-1' }),
+      {}
+    );
+
+    const payload = JSON.parse(result.content[0].text) as {
+      _teammate?: Record<string, unknown>;
+      _board?: Record<string, unknown>;
+      _warning?: string;
+    };
+    expect(payload._warning).toContain('already has a primary teammate');
+    expect(payload._board).toBeUndefined();
+    expect(payload._teammate).toMatchObject({ is_board_primary_teammate: false });
+  });
+
+  it('rejects passing both boardId and createBoard=true', async () => {
+    const reposGet = vi.fn(async () => ({ repo_id: 'repo-1', slug: 's', default_branch: 'main' }));
+    const app = {
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch: vi.fn() };
+        if (name === 'boards')
+          return { get: vi.fn(async () => ({ board_id: 'board-1' })), create: vi.fn() };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    await expect(
+      create({
+        repoId: 'repo-1',
+        branchName: 'teammate-x',
+        boardId: 'board-1',
+        createBoard: true,
+        autoSuffix: false,
+        teammate: { displayName: 'X' },
+      })
+    ).rejects.toThrow(/either boardId .* or createBoard/i);
+  });
+
+  it('still requires boardId for a normal (non-teammate) branch', async () => {
+    const reposGet = vi.fn(async () => ({ repo_id: 'repo-1', slug: 's', default_branch: 'main' }));
+    const boardsCreate = vi.fn();
+    const app = {
+      service(name: string) {
+        if (name === 'repos') return { get: reposGet, createBranch: vi.fn() };
+        if (name === 'boards') return { get: vi.fn(), create: boardsCreate };
+        throw new Error(`Unexpected service call: ${name}`);
+      },
+    };
+
+    const create = registerAndCaptureHandler('agor_branches_create', {
+      app,
+      userId: 'user-a',
+      baseServiceParams: {},
+    });
+
+    await expect(
+      create({ repoId: 'repo-1', branchName: 'plain', autoSuffix: false })
+    ).rejects.toThrow('boardId is required');
+    expect(boardsCreate).not.toHaveBeenCalled();
+  });
 });
 
 describe('branch MCP input schemas', () => {
@@ -420,6 +627,32 @@ describe('branch MCP input schemas', () => {
         branchName: 'siebel-crm',
         boardId: 'board-1',
         teammate: { displayName: '   ' },
+      }).success
+    ).toBe(false);
+  });
+
+  it('allows omitting boardId (teammate flow) and accepts a boolean createBoard', () => {
+    const config = registerAndCaptureConfig('agor_branches_create', {
+      app: {},
+      userId: 'user-1',
+    });
+
+    // boardId is now optional at the schema level (required-ness for non-teammate
+    // branches is enforced in the handler).
+    expect(
+      config.inputSchema?.safeParse({
+        repoId: 'repo-1',
+        branchName: 'siebel-crm',
+        createBoard: true,
+        teammate: { displayName: 'Siebel CRM' },
+      }).success
+    ).toBe(true);
+
+    expect(
+      config.inputSchema?.safeParse({
+        repoId: 'repo-1',
+        branchName: 'siebel-crm',
+        createBoard: 'yes',
       }).success
     ).toBe(false);
   });

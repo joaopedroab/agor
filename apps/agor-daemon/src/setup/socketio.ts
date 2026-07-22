@@ -28,6 +28,7 @@ import type {
 import jwt from 'jsonwebtoken';
 import type { Server, Socket } from 'socket.io';
 import { RUNTIME_JWT_AUDIENCE, RUNTIME_JWT_ISSUER } from '../auth/runtime-tokens.js';
+import { isTerminalExecutorIdentity } from '../auth/terminal-executor-guard.js';
 import { leaveAllSessionStreamChannels } from '../utils/realtime-publish.js';
 import type { BuildInfo } from './build-info.js';
 import type { CorsOrigin } from './cors.js';
@@ -61,6 +62,8 @@ interface FeathersSocket extends Socket {
   };
   data: {
     isService?: boolean;
+    /** Terminal user scope for handshake-token service sockets (see SocketAuthState). */
+    terminalUserId?: string;
     currentBoardId?: string;
     lastPresenceEmitAt?: number;
     tenant?: TenantContext;
@@ -117,14 +120,25 @@ export interface SocketAuthState {
   userId: string | null;
   isService: boolean;
   tenant?: TenantContext;
+  /**
+   * For terminal executor service sockets: the single user this executor is
+   * allowed to act for (bound into its token as `terminal_user_id` at spawn
+   * time). Undefined for generic (non-terminal) service tokens and for user
+   * sockets. Terminal handlers require the payload's userId to match this.
+   */
+  terminalUserId?: string;
 }
 
 function socketAuthState(
   userId: string | null,
   isService: boolean,
-  tenant?: TenantContext
+  tenant?: TenantContext,
+  terminalUserId?: string
 ): SocketAuthState {
-  return tenant ? { userId, isService, tenant } : { userId, isService };
+  const state: SocketAuthState = { userId, isService };
+  if (tenant) state.tenant = tenant;
+  if (terminalUserId) state.terminalUserId = terminalUserId;
+  return state;
 }
 
 /**
@@ -151,6 +165,14 @@ function socketAuthState(
 export function getSocketAuthState(socket: Socket): SocketAuthState {
   const s = socket as FeathersSocket;
   const user = s.feathers?.user;
+  // Terminal-scoped executor identity: a service identity for TERMINAL socket
+  // auth only (join/output/etc.), NOT a full RBAC-bypassing service account.
+  // Checked first and never carries `isService` privilege onto REST paths —
+  // those read `user._isServiceAccount`, which this identity lacks by design.
+  const terminalUserId = user?.terminal_user_id ?? s.data?.terminalUserId;
+  if (typeof terminalUserId === 'string' && terminalUserId) {
+    return socketAuthState(null, true, s.data?.tenant, terminalUserId);
+  }
   if (user?._isServiceAccount === true) {
     return socketAuthState(null, true, s.data?.tenant);
   }
@@ -339,7 +361,7 @@ export function createSocketIOConfig(
         const decoded = jwt.verify(token, jwtSecret, {
           issuer: RUNTIME_JWT_ISSUER,
           audience: RUNTIME_JWT_AUDIENCE,
-        }) as { sub: string; type?: string; role?: string };
+        }) as { sub: string; type?: string; role?: string; terminal_user_id?: string };
 
         // Allow user tokens and service tokens (used by executor)
         // - undefined/access: User tokens (SessionTokenService doesn't set type claim)
@@ -364,21 +386,36 @@ export function createSocketIOConfig(
           // a service socket (trusted, no user) from an anonymous socket that
           // simply hasn't authenticated yet (untrusted, no user).
           const fs = socket as FeathersSocket;
-          // Attach synthetic service user so getSocketAuthState returns
-          // isService=true via the canonical `_isServiceAccount` path. This
-          // mirrors what ServiceJWTStrategy.getEntity does on the Feathers
-          // side for sockets that authenticate post-connect.
+          const terminalUserId =
+            typeof decoded.terminal_user_id === 'string' ? decoded.terminal_user_id : undefined;
+          // Mirror ServiceJWTStrategy: a terminal-scoped token is a RESTRICTED
+          // identity (no `_isServiceAccount`, no `role: 'service'`, so no RBAC
+          // bypass on REST paths); a plain service token is a full service
+          // account. See getSocketAuthState + service-jwt-strategy.ts.
           fs.feathers = {
-            user: {
-              user_id: 'executor-service',
-              email: 'executor@agor.internal',
-              role: 'service',
-              _isServiceAccount: true,
-            },
+            user: terminalUserId
+              ? {
+                  user_id: 'executor-service',
+                  email: 'executor@agor.internal',
+                  role: 'terminal-executor',
+                  _isTerminalExecutor: true,
+                  terminal_user_id: terminalUserId,
+                }
+              : {
+                  user_id: 'executor-service',
+                  email: 'executor@agor.internal',
+                  role: 'service',
+                  _isServiceAccount: true,
+                },
           };
-          // Keep the handshake fast-path marker too — older code and any
-          // future callers that only look at socket.data still see it.
-          fs.data.isService = true;
+          if (terminalUserId) {
+            fs.data.terminalUserId = terminalUserId;
+          } else {
+            // Handshake fast-path marker ONLY for full service accounts — older
+            // code that looks at socket.data.isService must not see a terminal
+            // token as a full service account.
+            fs.data.isService = true;
+          }
           if (tenant) {
             (fs as FeathersSocket & { tenant?: TenantContext }).tenant = tenant;
             if (fs.data) fs.data.tenant = tenant;
@@ -435,8 +472,12 @@ export function createSocketIOConfig(
       }
 
       // Auto-join per-user room for user-scoped events (OAuth prompts, notifications)
-      // Try at connection time (for sockets that authenticate via handshake token)
-      if (user?.user_id) {
+      // Try at connection time (for sockets that authenticate via handshake token).
+      // Terminal-executor identities are excluded from ALL room/channel joins —
+      // they only ever consume raw `terminal:*` events on their own
+      // `user/<id>/terminal` room, never Feathers channel broadcasts, so channel
+      // membership would just hand them a firehose subscription they must not have.
+      if (user?.user_id && !isTerminalExecutorIdentity(user)) {
         socket.join(userRoomName(user.user_id));
         console.log(
           `🏠 Socket ${socket.id} joined user room at connection: user:${shortId(user.user_id)}`
@@ -459,9 +500,18 @@ export function createSocketIOConfig(
         return user?.user_id || 'unknown';
       };
 
+      // A terminal-executor identity has zero non-terminal daemon visibility:
+      // it must not watch board presence rooms or emit/receive cursor+presence
+      // activity (it would otherwise spoof presence and observe collaborators).
+      // Presence/cursor events run outside Feathers hooks, so they're guarded
+      // here directly, consistent with the channel-join exclusions.
+      const isTerminalExecutorSocket = () =>
+        isTerminalExecutorIdentity((socket as FeathersSocket).feathers?.user);
+
       socket.on('presence:watch-board', (boardId: string) => {
         const auth = getSocketAuthState(socket);
-        if (!isAuthenticated(auth) || typeof boardId !== 'string' || !boardId.trim()) return;
+        if (!isAuthenticated(auth) || isTerminalExecutorSocket()) return;
+        if (typeof boardId !== 'string' || !boardId.trim()) return;
         socket.join(boardPresenceRoomName(boardId));
       });
 
@@ -472,6 +522,7 @@ export function createSocketIOConfig(
 
       // Handle cursor movement events
       socket.on('cursor-move', (data: CursorMoveEvent) => {
+        if (isTerminalExecutorSocket()) return;
         const userId = getUserId();
         const fs = socket as FeathersSocket;
         const previousBoardId = fs.data.currentBoardId;
@@ -517,6 +568,7 @@ export function createSocketIOConfig(
 
       // Handle cursor leave events (user navigates away from board)
       socket.on('cursor-leave', (data: CursorLeaveEvent) => {
+        if (isTerminalExecutorSocket()) return;
         const userId = getUserId();
         const fs = socket as FeathersSocket;
 
@@ -610,6 +662,43 @@ export function createSocketIOConfig(
         return auth.userId;
       };
 
+      // Common preflight for executor-emitted terminal events
+      // (output/exit/tab/ready/error). Requires a service socket whose token is
+      // terminal-scoped (`terminalUserId`, bound at spawn time) AND whose scope
+      // matches the payload userId. The scope is required unconditionally: the
+      // only legitimate emitter of these events is the terminal executor, which
+      // always carries it, so a generic/unscoped service token has no business
+      // driving another user's terminal. Returns true when the event may
+      // proceed.
+      const requireServiceForOwnUserId = (event: string, payloadUserId: unknown): boolean => {
+        if (!webTerminalEnabled) {
+          rejectTerminal(event, 'web terminal disabled (allow_web_terminal=false)');
+          return false;
+        }
+        const auth = getSocketAuthState(socket);
+        if (!auth.isService) {
+          rejectTerminal(event, `only service tokens may emit ${event}`);
+          return false;
+        }
+        if (typeof payloadUserId !== 'string' || !payloadUserId) {
+          rejectTerminal(event, 'missing userId');
+          return false;
+        }
+        if (!auth.terminalUserId) {
+          rejectTerminal(event, 'service token is not scoped to a terminal user');
+          return false;
+        }
+        if (auth.terminalUserId !== payloadUserId) {
+          rejectTerminal(
+            event,
+            `service token scoped to ${shortId(auth.terminalUserId)}… may not act for ` +
+              `${shortId(payloadUserId)}…`
+          );
+          return false;
+        }
+        return true;
+      };
+
       // Handle explicit channel joins (for terminal channels)
       socket.on('join', (channel: string) => {
         if (!webTerminalEnabled) {
@@ -626,10 +715,21 @@ export function createSocketIOConfig(
           rejectTerminal('join', `unauthenticated socket cannot join ${channel}`);
           return;
         }
-        // Service sockets (executor) are allowed to join any user's terminal
-        // channel — that's how they relay PTY I/O for the user they're
-        // proxying. User sockets may only join their OWN channel.
-        if (!auth.isService && auth.userId !== target) {
+        // Channel membership determines who RECEIVES a user's terminal traffic
+        // (output/input/resize), so it must be scoped to that user. A terminal
+        // executor's service token is bound to a single user (`terminalUserId`)
+        // and may only join THAT user's channel — not any user's. A service
+        // token with no terminal scope has no business on a terminal channel at
+        // all. User sockets may only join their own channel.
+        if (auth.isService) {
+          if (!auth.terminalUserId || auth.terminalUserId !== target) {
+            rejectTerminal(
+              'join',
+              `service token scoped to ${auth.terminalUserId ? shortId(auth.terminalUserId) : 'nothing'}… may not join ${shortId(target)}…'s channel`
+            );
+            return;
+          }
+        } else if (auth.userId !== target) {
           rejectTerminal(
             'join',
             `user ${auth.userId ? shortId(auth.userId) : 'unknown'}… tried to join ${shortId(target)}…'s channel`
@@ -640,9 +740,9 @@ export function createSocketIOConfig(
         socket.join(channel);
       });
 
-      // Handle explicit channel leaves. Same auth model as join: service
-      // sockets can leave any channel, users can only leave their own. We
-      // also reject for unauthenticated sockets to prevent noise / probing.
+      // Handle explicit channel leaves. Same scoping as join: a terminal
+      // executor may only leave its own user's channel, users only their own.
+      // We also reject for unauthenticated sockets to prevent noise / probing.
       socket.on('leave', (channel: string) => {
         const target = parseTerminalChannel(channel);
         if (target) {
@@ -651,7 +751,15 @@ export function createSocketIOConfig(
             rejectTerminal('leave', `unauthenticated socket cannot leave ${channel}`);
             return;
           }
-          if (!auth.isService && auth.userId !== target) {
+          if (auth.isService) {
+            if (!auth.terminalUserId || auth.terminalUserId !== target) {
+              rejectTerminal(
+                'leave',
+                `service token scoped to ${auth.terminalUserId ? shortId(auth.terminalUserId) : 'nothing'}… may not leave ${shortId(target)}…'s channel`
+              );
+              return;
+            }
+          } else if (auth.userId !== target) {
             rejectTerminal(
               'leave',
               `user ${auth.userId ? shortId(auth.userId) : 'unknown'}… tried to leave ${shortId(target)}…'s channel`
@@ -669,21 +777,13 @@ export function createSocketIOConfig(
       // arbitrary output (e.g. fake "permission granted" prompts) into
       // another user's terminal.
       socket.on('terminal:output', (data: { userId: string; data: string }) => {
-        if (!webTerminalEnabled) {
-          rejectTerminal('terminal:output', 'web terminal disabled');
-          return;
-        }
-        const auth = getSocketAuthState(socket);
-        if (!auth.isService) {
-          rejectTerminal('terminal:output', 'only service tokens may emit terminal:output');
-          return;
-        }
-        if (typeof data?.userId !== 'string' || !data.userId) {
-          rejectTerminal('terminal:output', 'missing userId');
-          return;
-        }
+        if (!requireServiceForOwnUserId('terminal:output', data?.userId)) return;
         const channel = `user/${data.userId}/terminal`;
-        io.to(channel).emit('terminal:output', data);
+        // `socket.to` (not `io.to`) excludes the sender. The executor joins
+        // its own `user/<id>/terminal` channel to relay I/O, so `io.to` would
+        // bounce every output frame straight back to the executor that just
+        // produced it — a wasted round trip on the hottest path.
+        socket.to(channel).emit('terminal:output', data);
       });
 
       // Route terminal input from browser to executor.
@@ -724,22 +824,7 @@ export function createSocketIOConfig(
       socket.on(
         'terminal:tab',
         (data: { userId: string; action: string; tabName: string; cwd?: string }) => {
-          if (!webTerminalEnabled) {
-            rejectTerminal('terminal:tab', 'web terminal disabled');
-            return;
-          }
-          const auth = getSocketAuthState(socket);
-          if (!auth.isService) {
-            rejectTerminal(
-              'terminal:tab',
-              'only service tokens may emit terminal:tab (browsers must use HTTP terminals.create)'
-            );
-            return;
-          }
-          if (typeof data?.userId !== 'string' || !data.userId) {
-            rejectTerminal('terminal:tab', 'missing userId');
-            return;
-          }
+          if (!requireServiceForOwnUserId('terminal:tab', data?.userId)) return;
           const channel = `user/${data.userId}/terminal`;
           io.to(channel).emit('terminal:tab', data);
         }
@@ -749,22 +834,31 @@ export function createSocketIOConfig(
       // Executor-only — a forged exit would let a member terminate or
       // confuse another user's terminal session.
       socket.on('terminal:exit', (data: { userId: string; exitCode: number; signal?: number }) => {
-        if (!webTerminalEnabled) {
-          rejectTerminal('terminal:exit', 'web terminal disabled');
-          return;
-        }
-        const auth = getSocketAuthState(socket);
-        if (!auth.isService) {
-          rejectTerminal('terminal:exit', 'only service tokens may emit terminal:exit');
-          return;
-        }
-        if (typeof data?.userId !== 'string' || !data.userId) {
-          rejectTerminal('terminal:exit', 'missing userId');
-          return;
-        }
+        if (!requireServiceForOwnUserId('terminal:exit', data?.userId)) return;
         const channel = `user/${data.userId}/terminal`;
         io.to(channel).emit('terminal:exit', data);
         console.log(`🖥️  Terminal exited for user ${data.userId}: code=${data.exitCode}`);
+      });
+
+      // Executor readiness ack: the PTY exists and zellij is attached.
+      // Executor-only — a forged ready could trick the daemon into driving
+      // tab choreography (and the browser into showing "connected") against a
+      // terminal that isn't actually up. Relayed to the TerminalsService via
+      // an app event so it can gate its choreography on this instead of a
+      // blind timer; the service is the sole authority that then notifies the
+      // browser channel.
+      socket.on(
+        'terminal:ready',
+        (data: { userId: string; sessionName?: string; tabName?: string }) => {
+          if (!requireServiceForOwnUserId('terminal:ready', data?.userId)) return;
+          app.emit('terminal:ready', data);
+        }
+      );
+
+      // Executor attach-failure ack. Same user-scoped service trust as ready.
+      socket.on('terminal:error', (data: { userId: string; message?: string }) => {
+        if (!requireServiceForOwnUserId('terminal:error', data?.userId)) return;
+        app.emit('terminal:error', data);
       });
 
       // Track disconnections
@@ -791,6 +885,8 @@ export function createSocketIOConfig(
       const result = authResult as { user?: { user_id?: string } };
       const userId = result.user?.user_id;
       if (!userId) return;
+      // Terminal-executor identities get no user room (see connection handler).
+      if (isTerminalExecutorIdentity(result.user)) return;
 
       // Find the socket whose feathers connection matches this login
       for (const [, socket] of io.sockets.sockets) {
@@ -859,6 +955,14 @@ export function configureChannels(
         authentication?: { payload?: unknown };
       };
       console.debug('✅ Login event fired:', result.user?.user_id, result.user?.email);
+
+      // A terminal-executor identity must NOT receive broadcast events. It only
+      // consumes raw `terminal:*` events on its own `user/<id>/terminal` room,
+      // never Feathers channel broadcasts — joining `authenticated`/tenant
+      // channels would give the long-lived terminal token a read-everything
+      // subscription to the realtime firehose. Keyed on `_isTerminalExecutor`
+      // specifically so full service accounts KEEP their channel membership.
+      if (isTerminalExecutorIdentity(result.user)) return;
 
       const connection = context.connection as FeathersSocket & { tenant?: TenantContext };
       const loginParams =

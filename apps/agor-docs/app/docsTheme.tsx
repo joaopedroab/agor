@@ -1,18 +1,21 @@
+import { DiscordIcon } from 'nextra/icons';
 import { Footer, Navbar } from 'nextra-theme-docs';
 import { NavbarCloudCTA } from '../components/NavbarCloudCTA';
 import { DISCORD_INVITE_URL, GITHUB_REPO_URL } from '../lib/links';
-import { BRAND_NAME, getBasePath, LOGO_PATH } from '../lib/siteMetadata';
+import { getBasePath, LOGO_MARK_PATH } from '../lib/siteMetadata';
 
 const basePath = getBasePath();
 
 export const logo = (
   <span style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+    {/* alt="": decorative — the adjacent wordmark text names the link, and a
+        non-empty alt would be flagged as redundant by screen readers/axe. */}
     {/* eslint-disable-next-line @next/next/no-img-element */}
     {/* biome-ignore lint/performance/noImgElement: Using img for static assets in docs */}
     <img
-      src={`${basePath}${LOGO_PATH}`}
-      alt={BRAND_NAME}
-      style={{ height: '42px', width: '42px', borderRadius: '50%' }}
+      src={`${basePath}${LOGO_MARK_PATH}`}
+      alt=""
+      style={{ height: '42px', width: '42px' }}
       suppressHydrationWarning
     />
     <strong
@@ -30,7 +33,14 @@ export const logo = (
 );
 
 export const navbar = (
-  <Navbar logo={logo} projectLink={GITHUB_REPO_URL} chatLink={DISCORD_INVITE_URL}>
+  <Navbar
+    logo={logo}
+    projectLink={GITHUB_REPO_URL}
+    chatLink={DISCORD_INVITE_URL}
+    // Default chat icon ships without an accessible name (axe: link-name);
+    // role="img" + aria-label makes the icon-only link announce as "Discord".
+    chatIcon={<DiscordIcon width="24" role="img" aria-label="Discord" />}
+  >
     <NavbarCloudCTA />
   </Navbar>
 );
@@ -42,7 +52,7 @@ export const sharedLayoutProps = {
   navigation: { prev: true, next: true },
   sidebar: { defaultMenuCollapseLevel: 1, toggleButton: true },
   toc: { backToTop: true },
-  editLink: <>Edit this page on GitHub →</>,
-  feedback: { content: 'Question? Give us feedback →', labels: 'feedback' },
+  editLink: <>Edit this page on GitHub</>,
+  feedback: { content: 'Question? Give us feedback', labels: 'feedback' },
   nextThemes: { defaultTheme: 'dark' },
 };
